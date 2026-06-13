@@ -1,0 +1,3022 @@
+"""Boot sequence orchestration for the gateway."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import os
+import secrets
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from opensquilla.engine.usage import UsageTracker
+    from opensquilla.memory.manager import MemoryManager
+    from opensquilla.memory.store import LongTermMemoryStore
+    from opensquilla.memory.sync_manager import (
+        MemorySyncManager as MemoryFileWatcher,  # SyncManager replaces watcher
+    )
+    from opensquilla.provider.model_catalog import ModelCatalog
+    from opensquilla.provider.selector import ModelSelector
+    from opensquilla.scheduler import SchedulerEngine
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.skills.loader import SkillLoader
+    from opensquilla.tools.registry import ToolRegistry
+
+import structlog
+import uvicorn
+from starlette.applications import Starlette
+
+from opensquilla.agents.scope import resolve_agent_model, resolve_agent_workspace_dir
+from opensquilla.asyncio_utils import create_background_task
+from opensquilla.engine.usage import UsageTracker as _UsageTracker
+from opensquilla.gateway.app import create_gateway_app
+from opensquilla.gateway.config import GatewayConfig, is_public_bind
+from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.rpc import get_dispatcher
+from opensquilla.gateway.session_events import build_sessions_changed_payload
+from opensquilla.gateway.session_lifecycle import (
+    TaskLifecycleEvent,
+    apply_task_lifecycle_to_session,
+    session_status_for_task_status,
+)
+from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.session_streams import get_session_streams
+from opensquilla.gateway.websocket import get_registry
+from opensquilla.paths import default_opensquilla_home
+from opensquilla.permissions import configured_default_elevated
+from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
+
+log = structlog.get_logger(__name__)
+
+
+class _FlushReceiptSessionStorage(Protocol):
+    async def get_session(self, session_key: str) -> Any | None: ...
+
+    async def list_memory_durable_receipts(self, **kwargs: Any) -> list[Any]: ...
+
+    async def upsert_memory_durable_receipt(self, receipt: Any) -> Any: ...
+
+_AUTO_PROPOSE_TOOL_ALLOWLIST = frozenset(
+    {
+        "emit_text",
+        "meta_skill_fill_slots",
+        "meta_skill_assemble",
+        "meta_skill_lint_run",
+        "meta_skill_smoke_run",
+        "meta_skill_runtime_e2e_run",
+        "meta_skill_persist_proposal",
+    }
+)
+_DEBUG_FILE_HANDLER_ATTR = "_opensquilla_debug_file_handler"
+_ENABLED_VALUES = {"1", "true", "yes", "on"}
+_DISABLED_VALUES = {"0", "false", "no", "off"}
+_LOG_LEVELS = {
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.FATAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "TRACE": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+
+
+def _make_auto_propose_tool_invoker(
+    registry: ToolRegistry,
+    *,
+    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
+) -> Callable[[str, dict[str, Any]], Any]:
+    """Build the unattended auto-propose tool invoker through dispatch policy."""
+
+    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
+    from opensquilla.tools.dispatch import build_tool_handler
+    ctx = _make_auto_propose_tool_context(allowed_tools=allowed_tools)
+    return make_tool_invoker_from_handler(
+        tool_handler=build_tool_handler(registry, ctx),
+    )
+
+
+def _make_auto_propose_tool_context(
+    *,
+    agent_id: str = "auto_propose",
+    workspace_dir: str | None = None,
+    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
+) -> Any:
+    """Policy context for unattended meta-skill auto-propose work."""
+
+    from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
+
+    return ToolContext(
+        is_owner=False,
+        caller_kind=CallerKind.CRON,
+        interaction_mode=InteractionMode.UNATTENDED,
+        agent_id=agent_id,
+        workspace_dir=workspace_dir,
+        workspace_strict=bool(workspace_dir),
+        allowed_tools=set(allowed_tools),
+        surfaced_tools=set(allowed_tools),
+    )
+
+
+def _resolve_migrations_dir() -> Path:
+    """Locate yoyo migrations in env override, installed package, or checkout."""
+
+    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
+    if env_dir:
+        candidate = Path(env_dir)
+        if any(candidate.glob("V*.py")):
+            return candidate
+
+    try:
+        from importlib import resources as importlib_resources
+
+        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
+        if package_dir.is_dir():
+            path = Path(str(package_dir))
+            if any(path.glob("V*.py")):
+                return path
+    except Exception:
+        pass
+
+    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
+    if any(repo_dir.glob("V*.py")):
+        return repo_dir
+
+    raise RuntimeError(
+        "opensquilla migrations directory not found "
+        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
+        "and repo migrations/)"
+    )
+
+
+class TaskRuntimeStreamError(RuntimeError):
+    """Terminal error raised after a turn stream emits an error event."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        terminal_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.terminal_reason = terminal_reason
+
+
+# fmt: off
+def _make_channel_rpc_context_factory(svc: ServiceContainer, config: GatewayConfig, *, subscription_manager: Any, channel_manager_ref: Any, turn_runner: Any, heartbeat_service: Any, diagnostics_state: Any | None = None) -> Any:  # noqa: E501
+    from opensquilla.channels.command_registry import build_channel_rpc_context
+
+    def _factory(envelope: Any) -> Any:
+        names = ("session_manager", "provider_selector", "tool_registry", "usage_tracker", "skill_loader", "cron_scheduler", "task_runtime", "flush_service", "heartbeat_loop", "agent_registry", "memory_managers", "memory_stores", "memory_retrievers")  # noqa: E501
+        return build_channel_rpc_context(
+            envelope,
+            gateway_config=config,
+            **{name: getattr(svc, name) for name in names},
+            subscription_manager=subscription_manager,
+            channel_manager=channel_manager_ref(),
+            turn_runner=turn_runner,
+            heartbeat_service=heartbeat_service,
+            diagnostics_state=diagnostics_state,
+        )
+
+    return _factory
+# fmt: on
+
+
+def _interval_h_to_schedule(interval_h: int) -> tuple[Any, str]:
+    """Map an hour interval to a structured (kind, value) schedule pair.
+
+    Aligns to a clean cron expression when 24 divides evenly; otherwise falls
+    back to a raw interval-in-seconds for the EVERY kind.
+    """
+    from opensquilla.scheduler.types import ScheduleKind
+
+    if interval_h > 0 and 24 % interval_h == 0:
+        return ScheduleKind.CRON, f"0 */{interval_h} * * *"
+    return ScheduleKind.EVERY, str(interval_h * 3600)
+
+
+async def _list_scheduler_jobs(scheduler: Any) -> list[Any]:
+    list_jobs = getattr(scheduler, "list_jobs", None)
+    if not callable(list_jobs):
+        return []
+    try:
+        result = list_jobs()
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception as exc:  # noqa: BLE001
+        log.warning("boot.dream.list_jobs_failed", error=str(exc))
+        return []
+    return result if isinstance(result, list) else []
+
+
+async def _register_dream_crons(
+    *,
+    scheduler: Any,
+    memory_config: Any,
+    agent_ids: list[str],
+) -> None:
+    """Register a `memory_dream` cron per agent when enabled.
+
+    Respects the ``OPENSQUILLA_MEMORY_DREAM_DISABLED=1`` kill switch.
+    Prefers ``memory_config.dream.cron`` if set, else derives a structured
+    ``(kind, value)`` pair from ``interval_h``.
+    """
+    import os
+
+    from opensquilla.scheduler.types import ScheduleKind, SessionTarget
+
+    dream_cfg = getattr(memory_config, "dream", None)
+    existing_jobs = await _list_scheduler_jobs(scheduler)
+    existing_by_name = {
+        getattr(job, "name", ""): job
+        for job in existing_jobs
+        if getattr(job, "name", "").startswith("memory_dream:")
+    }
+    disabled_reason = None
+    if os.getenv("OPENSQUILLA_MEMORY_DREAM_DISABLED") == "1":
+        disabled_reason = "kill_switch"
+    elif dream_cfg is None or not getattr(dream_cfg, "enabled", False):
+        disabled_reason = "disabled"
+    elif not getattr(dream_cfg, "auto_schedule", False):
+        disabled_reason = "auto_schedule_disabled"
+
+    if disabled_reason is not None:
+        await _pause_dream_crons(
+            scheduler=scheduler,
+            jobs=list(existing_by_name.values()),
+            reason=disabled_reason,
+        )
+        return
+
+    assert dream_cfg is not None
+    if getattr(dream_cfg, "cron", None):
+        schedule_kind, schedule_value = ScheduleKind.CRON, dream_cfg.cron
+    else:
+        schedule_kind, schedule_value = _interval_h_to_schedule(dream_cfg.interval_h)
+    for agent_id in agent_ids:
+        name = f"memory_dream:{agent_id}"
+        existing = existing_by_name.get(name)
+        if existing is not None:
+            patch: dict[str, Any] = {}
+            existing_kind = getattr(existing, "schedule_kind", None)
+            existing_value = getattr(existing, "cron_expr", "") or ""
+            if (existing_kind, existing_value) != (schedule_kind, schedule_value):
+                patch["schedule_kind"] = schedule_kind
+                patch["schedule_value"] = schedule_value
+            if getattr(existing, "payload", {}).get("agent_id") != agent_id:
+                patch["payload"] = {"agent_id": agent_id}
+            if getattr(existing, "session_target", None) != SessionTarget.ISOLATED:
+                patch["session_target"] = SessionTarget.ISOLATED
+            update_job = getattr(scheduler, "update_job", None)
+            if patch and callable(update_job):
+                result = update_job(getattr(existing, "id"), **patch)
+                if inspect.isawaitable(result):
+                    await result
+            log.info(
+                "boot.dream.already_registered",
+                agent_id=agent_id,
+                schedule_kind=schedule_kind.value,
+                schedule_value=schedule_value,
+            )
+            continue
+
+        await scheduler.add_job(
+            name=name,
+            handler_key="memory_dream",
+            payload={"agent_id": agent_id},
+            session_target=SessionTarget.ISOLATED,
+            schedule_kind=schedule_kind,
+            schedule_value=schedule_value,
+        )
+        log.info(
+            "boot.dream.registered",
+            agent_id=agent_id,
+            schedule_kind=schedule_kind.value,
+            schedule_value=schedule_value,
+        )
+
+
+async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) -> None:
+    """Pause managed Dream cron jobs so persisted rows cannot bypass config."""
+    pause_job = getattr(scheduler, "pause_job", None)
+    update_job = getattr(scheduler, "update_job", None)
+    for job in jobs:
+        status = getattr(getattr(job, "status", None), "value", getattr(job, "status", ""))
+        if status in {"paused", "disabled", "deleted"}:
+            continue
+        job_id = getattr(job, "id", None)
+        if not job_id:
+            continue
+        try:
+            if callable(pause_job):
+                result = pause_job(job_id)
+            elif callable(update_job):
+                result = update_job(job_id, enabled=False)
+            else:
+                continue
+            if inspect.isawaitable(result):
+                await result
+            log.info(
+                "boot.dream.paused",
+                job_id=job_id,
+                name=getattr(job, "name", ""),
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "boot.dream.pause_failed",
+                job_id=job_id,
+                reason=reason,
+                error=str(exc),
+            )
+
+
+async def _pause_auto_propose_crons(
+    *,
+    scheduler: Any,
+    agent_ids: list[str],
+) -> None:
+    """Pause per-agent auto-propose jobs without deleting persisted rows."""
+
+    existing_jobs = await _list_scheduler_jobs(scheduler)
+    target_names = {f"auto_propose:{agent_id}" for agent_id in agent_ids}
+    pause_job = getattr(scheduler, "pause_job", None)
+    update_job = getattr(scheduler, "update_job", None)
+    for job in existing_jobs:
+        if getattr(job, "name", "") not in target_names:
+            continue
+        status = getattr(getattr(job, "status", None), "value", getattr(job, "status", ""))
+        if status in {"paused", "disabled", "deleted"}:
+            continue
+        job_id = getattr(job, "id", None)
+        if not job_id:
+            continue
+        try:
+            if callable(pause_job):
+                result = pause_job(job_id)
+            elif callable(update_job):
+                result = update_job(job_id, enabled=False)
+            else:
+                continue
+            if inspect.isawaitable(result):
+                await result
+            log.info("boot.auto_propose.paused", job_id=job_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("boot.auto_propose.pause_failed", job_id=job_id, error=str(exc))
+
+
+async def _register_auto_propose_crons(
+    *,
+    scheduler: Any,
+    auto_cfg: Any,
+    agent_ids: list[str],
+) -> None:
+    """Register or resume one isolated auto-propose cron per configured agent."""
+
+    from opensquilla.scheduler.types import ScheduleKind, SessionTarget
+
+    schedule_raw = auto_cfg.cron
+    existing_jobs = await _list_scheduler_jobs(scheduler)
+    existing_by_name = {
+        getattr(job, "name", ""): job
+        for job in existing_jobs
+        if getattr(job, "name", "").startswith("auto_propose:")
+    }
+    allowed_agent_ids = set(getattr(auto_cfg, "agent_ids", []) or [])
+    if allowed_agent_ids:
+        agent_ids = [agent_id for agent_id in agent_ids if agent_id in allowed_agent_ids]
+
+    update_job = getattr(scheduler, "update_job", None)
+    resume_job = getattr(scheduler, "resume_job", None)
+    for agent_id in agent_ids:
+        name = f"auto_propose:{agent_id}"
+        existing = existing_by_name.get(name)
+        if existing is not None:
+            patch: dict[str, Any] = {}
+            if getattr(existing, "schedule_raw", "") != schedule_raw:
+                patch["schedule_kind"] = ScheduleKind.CRON
+                patch["schedule_value"] = schedule_raw
+            if getattr(existing, "payload", {}).get("agent_id") != agent_id:
+                patch["payload"] = {"agent_id": agent_id}
+            if getattr(existing, "session_target", None) != SessionTarget.ISOLATED:
+                patch["session_target"] = SessionTarget.ISOLATED
+            if patch and callable(update_job):
+                result = update_job(getattr(existing, "id"), **patch)
+                if inspect.isawaitable(result):
+                    await result
+
+            status = getattr(
+                getattr(existing, "status", None),
+                "value",
+                getattr(existing, "status", ""),
+            )
+            if status == "paused" and callable(resume_job):
+                result = resume_job(getattr(existing, "id"))
+                if inspect.isawaitable(result):
+                    await result
+            log.info("boot.auto_propose.already_registered", agent_id=agent_id)
+            continue
+
+        await scheduler.add_job(
+            name=name,
+            schedule_kind=ScheduleKind.CRON,
+            schedule_value=schedule_raw,
+            handler_key="auto_propose",
+            payload={"agent_id": agent_id},
+            session_target=SessionTarget.ISOLATED,
+        )
+        log.info("boot.auto_propose.registered", agent_id=agent_id, schedule=schedule_raw)
+
+
+@dataclass
+class ServiceContainer:
+    """Typed container for initialized services. Returned by build_services().
+
+    WARNING: build_services() mutates module-level state:
+    - tools.builtin.memory_tools (create_memory_tools)
+    - tools.builtin.skill_tools (create_skill_tools)
+    - tools.builtin.admin (set_gateway_config, set_scheduler)
+    - search.providers (configure_search)
+    Do not call build_services() twice in the same process without
+    understanding these side effects.
+    """
+
+    config: GatewayConfig
+    provider_selector: ModelSelector | None = None
+    tool_registry: ToolRegistry | None = None
+    session_manager: SessionManager | None = None
+    skill_loader: SkillLoader | None = None
+    usage_tracker: UsageTracker | None = None
+    cron_scheduler: SchedulerEngine | None = None
+    model_catalog: ModelCatalog | None = None
+    agent_registry: Any = None
+    memory_managers: dict[str, MemoryManager] = field(default_factory=dict)
+    # Legacy per-tier dicts. These are derived views over
+    # `memory_managers` populated in build_services(); direct ServiceContainer
+    # constructors (e.g. tests) may still set them independently. Once all
+    # consumers use `memory_managers`, these legacy fields can be removed.
+    memory_stores: dict[str, LongTermMemoryStore] = field(default_factory=dict)
+    memory_sync_managers: dict[str, MemoryFileWatcher] = field(default_factory=dict)
+    memory_watchers: list[MemoryFileWatcher] = field(default_factory=list)
+    memory_retrievers: dict[str, Any] = field(default_factory=dict)
+    turn_capture_services: dict[str, Any] = field(default_factory=dict)
+    flush_service: Any = None  # SessionFlushService | None (gated by OPENSQUILLA_SESSION_FLUSH)
+    memory_repair_service: Any = None
+    meta_run_writer: Any = None
+    task_runtime: Any = None
+    heartbeat_loop: Any = None
+    heartbeat_watcher: Any = None
+    subagent_supervisor: Any = None
+    _compaction_listener_remove: Callable[[], None] | None = None
+
+    # Backward-compat alias — returns the "main" store (or None).
+    @property
+    def memory_store(self) -> LongTermMemoryStore | None:
+        return self.memory_stores.get("main")
+
+    async def close(self) -> None:
+        """Teardown async resources. Idempotent — safe to call twice.
+
+        Ordering rule: scheduled producers (heartbeat watcher/loop and the
+        cron scheduler) MUST stop before the memory tier closes; otherwise
+        an in-flight cron job or heartbeat tick can drive TurnRunner ->
+        TurnCaptureService.capture_turn against an already-closed store.
+        """
+        remove_compaction_listener = getattr(self, "_compaction_listener_remove", None)
+        if callable(remove_compaction_listener):
+            try:
+                remove_compaction_listener()
+            except Exception:
+                pass
+            self._compaction_listener_remove = None
+
+        # ── 1. Stop scheduled producers (no further writes after this) ──
+        if self.heartbeat_watcher is not None:
+            try:
+                await self.heartbeat_watcher.stop()
+            except Exception:
+                pass
+        if self.heartbeat_loop is not None:
+            try:
+                await self.heartbeat_loop.stop()
+            except Exception:
+                pass
+        if self.cron_scheduler is not None:
+            try:
+                await self.cron_scheduler.stop()
+            except Exception:
+                pass
+            store = getattr(self.cron_scheduler, "_store", None)
+            if store is not None and hasattr(store, "close"):
+                try:
+                    await store.close()
+                except Exception:
+                    pass
+        if self.task_runtime is not None:
+            try:
+                await self.task_runtime.shutdown()
+            except Exception:
+                pass
+            try:
+                from opensquilla.tools.builtin.sessions import set_task_runtime
+
+                set_task_runtime(None)
+            except Exception:
+                pass
+
+        if self.memory_repair_service is not None:
+            try:
+                await self.memory_repair_service.stop()
+            except Exception:
+                pass
+        if self.meta_run_writer is not None:
+            try:
+                self.meta_run_writer.close()
+            except Exception:
+                pass
+        try:
+            from opensquilla.gateway.auto_propose_bridge import reset_runtime
+
+            reset_runtime()
+        except Exception:
+            pass
+
+        # ── 2. Tear down memory tier through MemoryManager ──
+        # In real boot, the legacy `memory_watchers` / `memory_stores` below
+        # are the SAME object identities as those reachable via memory_managers,
+        # so the subsequent loops are no-op double-stops/closes (both sync_manager
+        # and store close are idempotent — see memory/store.py:642 and
+        # memory/sync_manager.py:104). Direct ServiceContainer constructors that
+        # only populate the legacy fields (e.g. tests) still get torn down by the
+        # legacy paths.
+        #
+        # Retrievers run BEFORE managers so any in-flight search cleanup runs
+        # before the underlying DB connection is closed. Per-retriever timeout
+        # prevents one wedged retriever from stalling the entire shutdown.
+        for retriever in self.memory_retrievers.values():
+            try:
+                await asyncio.wait_for(retriever.close(), timeout=5.0)
+            except (TimeoutError, Exception) as e:  # noqa: BLE001 — fail-open shutdown
+                log.warning("retriever_close_failed_or_timed_out", error=str(e))
+        for mgr in self.memory_managers.values():
+            try:
+                await mgr.close()
+            except Exception:
+                pass
+        for watcher in self.memory_watchers:
+            try:
+                await watcher.stop()
+            except Exception:
+                pass
+        for store in self.memory_stores.values():
+            try:
+                await store.close()
+            except Exception:
+                pass
+        if self.session_manager is not None:
+            storage = get_session_storage(self.session_manager)
+            if storage and hasattr(storage, "close"):
+                try:
+                    await storage.close()
+                except Exception:
+                    pass
+
+
+# Server boot timestamp (set once at first start)
+_boot_time_ms: int = 0
+
+
+def _configured_agent_ids(
+    config: GatewayConfig,
+    extra: list[str] | None = None,
+) -> list[str]:
+    """Return agent ids declared by config plus the default main agent.
+
+    ``extra`` lets a caller (e.g. the one-shot CLI runner) opt in additional
+    runtime agent ids that are not declared in ``config.channels`` so the
+    memory manager / workspace seeding still build per-agent resources for
+    them. Legacy ``default`` aliases to the canonical ``main`` agent.
+    """
+    from opensquilla.session.keys import normalize_agent_id
+
+    declared = {
+        normalize_agent_id(getattr(e, "agent_id", "main")) for e in config.channels.channels
+    }
+    declared.add("main")
+    for entry in getattr(config, "agents", []):
+        if getattr(entry, "enabled", True):
+            declared.add(normalize_agent_id(getattr(entry, "id", "")))
+    if extra:
+        declared.update(normalize_agent_id(a) for a in extra if a)
+    return sorted(declared)
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolved_path(raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+
+
+def _warn_workspace_state_mismatch(config: GatewayConfig) -> None:
+    workspace = _resolved_path(getattr(config, "workspace_dir", None))
+    if workspace is None:
+        return
+
+    expected_roots: dict[str, Path] = {}
+    env_state = _resolved_path(os.environ.get("OPENSQUILLA_STATE_DIR"))
+    if env_state is not None:
+        expected_roots["OPENSQUILLA_STATE_DIR"] = env_state
+    env_config = _resolved_path(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+    if env_config is not None:
+        expected_roots["OPENSQUILLA_GATEWAY_CONFIG_PATH"] = env_config.parent
+    config_state = _resolved_path(getattr(config, "state_dir", None))
+    if config_state is not None:
+        expected_roots["config.state_dir"] = config_state.parent
+    config_path = _resolved_path(getattr(config, "config_path", None))
+    if config_path is not None:
+        expected_roots["config.config_path"] = config_path.parent
+
+    mismatches = {
+        source: str(root)
+        for source, root in expected_roots.items()
+        if not _path_is_relative_to(workspace, root)
+    }
+    if not mismatches:
+        return
+    log.warning(
+        "build_services.workspace_state_mismatch",
+        workspace=str(workspace),
+        state_dir=getattr(config, "state_dir", None),
+        config_path=getattr(config, "config_path", None),
+        expected_roots=mismatches,
+    )
+
+
+def _ensure_configured_agent_workspaces(
+    config: GatewayConfig,
+    *,
+    extra_agent_ids: list[str] | None = None,
+) -> None:
+    """Seed bootstrap templates for explicitly configured agent workspaces."""
+    if not config.workspace_dir:
+        return
+
+    from opensquilla.identity.bootstrap import ensure_agent_workspace
+
+    for agent_id in _configured_agent_ids(config, extra_agent_ids):
+        result = ensure_agent_workspace(resolve_agent_workspace_dir(agent_id, config))
+        log.info(
+            "build_services.agent_workspace_ready",
+            agent_id=agent_id,
+            workspace=str(result.workspace_dir),
+            created_files=list(result.created_files),
+            bootstrap_seeded=result.bootstrap_seeded,
+            bootstrap_completed=result.bootstrap_completed,
+        )
+
+
+def _state_path(config: GatewayConfig, filename: str) -> Path:
+    state_root = Path(config.state_dir or default_opensquilla_home() / "state")
+    return state_root / filename
+
+
+def _gateway_home(config: GatewayConfig) -> Path:
+    state_root = _resolved_path(getattr(config, "state_dir", None))
+    if state_root is not None:
+        return state_root.parent
+
+    config_path = _resolved_path(getattr(config, "config_path", None))
+    if config_path is not None:
+        return config_path.parent
+
+    return default_opensquilla_home()
+
+
+def _task_runtime_max_concurrency(config: GatewayConfig) -> int:
+    return int(config.task_runtime.max_concurrency)
+
+
+def _task_runtime_max_pending_per_session(config: GatewayConfig) -> int:
+    return int(config.task_runtime.max_pending_per_session)
+
+
+def _task_runtime_turn_hard_deadline_s(config: GatewayConfig) -> float | None:
+    configured = getattr(config.task_runtime, "turn_hard_deadline_s", None)
+    if configured is None:
+        return None
+    return float(configured)
+
+
+def _task_runtime_envelope_owner(envelope: Any) -> bool:
+    """Resolve owner privileges from authenticated route metadata."""
+    from opensquilla.gateway.routing import SourceKind
+
+    principal_is_owner = getattr(envelope, "metadata", {}).get("principal_is_owner")
+    if isinstance(principal_is_owner, bool):
+        return principal_is_owner
+    return getattr(envelope, "source_kind", None) == SourceKind.CLI
+
+
+async def dispatch_task_runtime_turn(
+    run: Any,
+    *,
+    config: Any,
+    session_manager: Any,
+    turn_runner: Any,
+    event_emitter: Any,
+) -> None:
+    """Drive ``turn_runner.run`` for one ``TaskRun``.
+
+    Pure coroutine extracted from ``build_services``'s
+    ``_task_runtime_turn_handler`` closure. Module-level so a
+    boot-wiring regression test can drive it with a fake ``turn_runner``
+    and capture every kwarg actually flowing into ``turn_runner.run``
+    (including the ``semantic_message`` regression surface).
+    """
+    from opensquilla.gateway.routing import tool_context_from_envelope
+    workspace_dir = resolve_agent_workspace_dir(run.agent_id, config)
+    workspace_strict = getattr(config, "workspace_strict", None)
+    if not isinstance(workspace_strict, bool):
+        workspace_strict = bool(workspace_dir)
+    is_owner = _task_runtime_envelope_owner(run.envelope)
+    tool_context = tool_context_from_envelope(
+        run.envelope,
+        is_owner=is_owner,
+        workspace_dir=str(workspace_dir),
+        workspace_strict=workspace_strict,
+        default_elevated=configured_default_elevated(config),
+    )
+    tool_context.task_id = run.task_id
+    session = None
+    if session_manager is not None and hasattr(session_manager, "get_session"):
+        session = await session_manager.get_session(run.session_key)
+    run_kwargs = build_task_runtime_run_kwargs(
+        run,
+        tool_context=tool_context,
+        model=resolve_agent_model(
+            run.agent_id,
+            config,
+            session_model=getattr(session, "model", None),
+        ),
+    )
+    raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+    stream_idle_timeout = _optional_positive_timeout(
+        config, "agent_stream_idle_timeout_seconds", 600.0
+    )
+    heartbeat_interval = _optional_positive_timeout(
+        config, "agent_stream_heartbeat_interval_seconds", 15.0
+    )
+    try:
+        await _emit_task_runtime_stream_events(
+            raw_stream,
+            run.session_key,
+            event_emitter,
+            idle_timeout=stream_idle_timeout,
+            heartbeat_interval=heartbeat_interval,
+            stream_event_sink=getattr(run, "stream_event_sink", None),
+        )
+    except TaskRuntimeStreamError as exc:
+        if exc.code in {
+            "provider_request_budget_exhausted",
+            "provider_request_too_large",
+            "current_turn_context_exhausted",
+        }:
+            message_id = getattr(run, "persisted_user_message_id", None)
+            remove_message = getattr(session_manager, "remove_message", None)
+            if isinstance(message_id, str) and message_id and callable(remove_message):
+                try:
+                    removed = remove_message(run.session_key, message_id)
+                    if inspect.isawaitable(removed):
+                        removed = await removed
+                    if removed:
+                        log.info(
+                            "task_runtime.user_message_rolled_back",
+                            session_key=run.session_key,
+                            message_id=message_id,
+                            reason=exc.code,
+                        )
+                except Exception as rb_exc:  # noqa: BLE001 - preserve terminal error
+                    log.warning(
+                        "task_runtime.user_message_rollback_failed",
+                        session_key=run.session_key,
+                        message_id=message_id,
+                        reason=exc.code,
+                        error=str(rb_exc),
+                    )
+        raise
+
+
+def build_task_runtime_run_kwargs(
+    run: Any,
+    *,
+    tool_context: Any,
+    model: str | None,
+) -> dict[str, Any]:
+    """Build kwargs for ``turn_runner.run`` from a ``TaskRun``.
+
+    Pure helper extracted from ``_task_runtime_turn_handler`` so the
+    boot-level link of semantic message forwarding is directly
+    testable: a regression that drops ``semantic_message`` forwarding
+    here is caught by ``test_boot_task_runtime_kwargs.py`` without
+    requiring a live gateway.
+    """
+    ingress_steps = list(run.ingress_pipeline_steps) or None
+    kwargs: dict[str, Any] = {
+        "tool_context": tool_context,
+        "agent_id": run.agent_id,
+        "model": model,
+        "attachments": run.attachments,
+        "input_provenance": run.input_provenance,
+        "run_kind": run.run_kind,
+        "no_memory_capture": run.no_memory_capture,
+        "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
+        "ingress_pipeline_steps": ingress_steps,
+    }
+    if run.semantic_message is not None:
+        # Prefetch query shape: channels carry the raw user text
+        # separately from the (potentially stamped) persisted message.
+        # Only forward when set so web/CLI legacy paths keep
+        # ``TurnRunner.run`` falling back to ``message`` as semantic input.
+        kwargs["semantic_message"] = run.semantic_message
+    return kwargs
+
+
+def build_cron_result_payload(
+    origin_session_key: str,
+    text: str,
+    entry: Any,
+) -> dict[str, Any]:
+    """Build the WS payload for a ``session.event.cron_result`` broadcast.
+
+    Pure helper extracted from the cron-forwarder closure so the wire
+    contract is testable by gate 4 without spinning up a live gateway.
+    The web frontend at ``chat.js:727`` and any other ``cron_result``
+    subscriber relies on these exact keys.
+    """
+    return {
+        "sessionKey": origin_session_key,
+        "message": {
+            "role": "assistant",
+            "text": text,
+            "timestamp": getattr(entry, "created_at", None),
+            "provenanceKind": getattr(entry, "provenance_kind", None),
+            "provenanceSourceTool": getattr(entry, "provenance_source_tool", None),
+            "provenanceSourceSessionKey": getattr(entry, "provenance_source_session_key", None),
+        },
+    }
+
+
+def _task_run_status_for_session_change(event: TaskLifecycleEvent) -> str:
+    status = getattr(event.task_status, "value", str(event.task_status))
+    if event.phase == "running":
+        return "running"
+    if status == "succeeded":
+        return "idle"
+    if status == "abandoned":
+        return "interrupted"
+    if status in {"failed", "timeout", "cancelled"}:
+        return status
+    return "idle"
+
+
+def _task_state_for_session_change(event: TaskLifecycleEvent) -> dict[str, Any]:
+    status = getattr(event.task_status, "value", str(event.task_status))
+    task: dict[str, Any] = {
+        "task_id": event.task_id,
+        "status": "running" if event.phase == "running" else status,
+    }
+    if event.terminal_reason:
+        task["terminal_reason"] = event.terminal_reason
+    if event.phase == "terminal" and status != "succeeded":
+        task["terminal_message"] = build_terminal_reply(
+            {
+                "status": status,
+                "terminal_reason": event.terminal_reason,
+                "error_class": event.error_class,
+                "error_message": event.error_message,
+            }
+        )
+    return task
+
+
+def _make_task_session_lifecycle_listener(
+    *,
+    session_manager: Any,
+    event_emitter: Any,
+    task_runtime_holder: list[Any] | None = None,
+    supervisor_holder: list[Any | None] | None = None,
+) -> Any:
+    async def _listener(event: TaskLifecycleEvent) -> None:
+        if event.run_kind == "subagent":
+            return
+        # Auto-close any open spawn group owned by this parent task. This
+        # guarantees that subsequent subagent terminal events fire their
+        # parent wake even if the LLM never called sessions_yield.  Best
+        # effort: a failure here must not break the session-state path
+        # below.  ``task_runtime_holder`` is read at execution time
+        # because the holder is filled in by ``build_services`` after the
+        # ``TaskRuntime`` constructor returns.
+        if (
+            event.phase == "terminal"
+            and task_runtime_holder is not None
+            and task_runtime_holder
+        ):
+            try:
+                from opensquilla.gateway.subagent_announce import (
+                    close_subagent_spawn_group,
+                )
+
+                await close_subagent_spawn_group(
+                    event.session_key,
+                    event.task_id,
+                    session_manager=session_manager,
+                    task_runtime=task_runtime_holder[0],
+                )
+            except Exception:
+                log.warning(
+                    "lifecycle.auto_close_spawn_group_failed",
+                    session_key=event.session_key,
+                    task_id=event.task_id,
+                    exc_info=True,
+                )
+        # Drop the supervisor's per-group bookkeeping for this parent
+        # task now that the task is terminal, so future ticks skip the
+        # group entirely. Best effort: a failure here must not block
+        # the rest of the lifecycle path. ``supervisor_holder`` is read
+        # at execution time because the supervisor is constructed later
+        # in the boot sequence (after the task_runtime above).
+        if (
+            event.phase == "terminal"
+            and supervisor_holder is not None
+            and supervisor_holder
+            and supervisor_holder[0] is not None
+        ):
+            try:
+                await supervisor_holder[0].forget_parent_task(
+                    event.session_key, event.task_id
+                )
+            except Exception:
+                log.warning(
+                    "lifecycle.supervisor_forget_failed",
+                    session_key=event.session_key,
+                    task_id=event.task_id,
+                    exc_info=True,
+                )
+        changed = await apply_task_lifecycle_to_session(
+            event,
+            session_manager=session_manager,
+        )
+        if not changed:
+            return
+        reason = "task_running" if event.phase == "running" else "task_terminal"
+        session_status = session_status_for_task_status(event.task_status)
+        task_state = _task_state_for_session_change(event)
+        state_field = "active_task" if event.phase == "running" else "last_task"
+        await event_emitter(
+            event.session_key,
+            "sessions.changed",
+            build_sessions_changed_payload(
+                event.session_key,
+                reason,
+                status=getattr(session_status, "value", session_status),
+                run_status=_task_run_status_for_session_change(event),
+                **{state_field: task_state},
+            ),
+        )
+
+    return _listener
+
+
+def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
+    raw = getattr(config, attr, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return value if value > 0 else None
+
+
+async def _emit_task_runtime_stream_events(
+    raw_stream: Any,
+    session_key: str,
+    event_emitter: Any,
+    *,
+    idle_timeout: float | None = 180.0,
+    heartbeat_interval: float | None = None,
+    stream_event_sink: Any = None,
+) -> None:
+    """Emit turn events and fail the task if the stream reports an error."""
+    from dataclasses import asdict, is_dataclass
+
+    from opensquilla.engine.stream_wrappers import wrap_stream
+
+    error_message: str | None = None
+    error_code: str | None = None
+    terminal_reason: str | None = None
+    async for event in wrap_stream(
+        raw_stream,
+        idle_timeout=idle_timeout,
+        heartbeat_interval=heartbeat_interval,
+        heartbeat_message="Agent run is still active",
+    ):
+        if stream_event_sink is not None:
+            try:
+                result = stream_event_sink(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                log.debug(
+                    "task_runtime.stream_event_sink_failed",
+                    session_key=session_key,
+                    event_kind=getattr(event, "kind", event.__class__.__name__),
+                    exc_info=True,
+                )
+        if is_dataclass(event):
+            event_dict = asdict(event)
+        else:
+            event_dict = {
+                key: value
+                for key, value in getattr(event, "__dict__", {}).items()
+                if not key.startswith("_")
+            }
+        event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        if event_kind == "error":
+            raw_message = event_dict.get("message")
+            error_message = (
+                raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
+            )
+            code = event_dict.get("code")
+            error_code = str(code) if code else None
+            code_text = str(code or "").lower()
+            is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
+            is_output_truncated = code_text == "provider_output_truncated"
+            terminal_reason = (
+                "timeout"
+                if is_timeout
+                else "output_truncated"
+                if is_output_truncated
+                else "error"
+            )
+            terminal_payload = {
+                "status": "timeout" if is_timeout else "failed",
+                "terminal_reason": terminal_reason,
+                "error_class": code,
+                "error_message": error_message,
+            }
+            safe_error_code, safe_error_message = sanitize_agent_error(
+                terminal_payload,
+                fallback_error_class=error_code,
+                fallback_error_message=error_message,
+            )
+            if safe_error_code == "provider_request_too_large":
+                error_code = safe_error_code
+                event_dict["code"] = safe_error_code
+                terminal_payload["error_class"] = safe_error_code
+                terminal_payload["error_message"] = safe_error_message
+            terminal_message = build_terminal_reply(terminal_payload)
+            event_dict["message"] = terminal_message
+            event_dict["terminal_message"] = terminal_message
+            event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
+            event_dict["error_message"] = safe_error_message
+        await event_emitter(
+            session_key,
+            f"session.event.{event_kind}",
+            event_dict,
+        )
+        if event_kind == "error":
+            message = event_dict.get("error_message")
+            error_message = message if isinstance(message, str) and message else "Agent error"
+    if error_message is not None:
+        raise TaskRuntimeStreamError(
+            error_message,
+            code=error_code,
+            terminal_reason=terminal_reason,
+        )
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _ENABLED_VALUES:
+        return True
+    if value in _DISABLED_VALUES:
+        return False
+    return None
+
+
+def _resolve_log_level(config: GatewayConfig) -> int:
+    raw = os.environ.get("OPENSQUILLA_LOG_LEVEL") or config.log_level
+    return _LOG_LEVELS.get(str(raw).strip().upper(), logging.DEBUG)
+
+
+def _remove_debug_file_handlers(root: logging.Logger) -> None:
+    opensquilla_logger = logging.getLogger("opensquilla")
+    for handler in list(root.handlers):
+        if getattr(handler, _DEBUG_FILE_HANDLER_ATTR, False):
+            previous_level = getattr(handler, "_opensquilla_previous_logger_level", None)
+            root.removeHandler(handler)
+            handler.close()
+            if isinstance(previous_level, int):
+                opensquilla_logger.setLevel(previous_level)
+
+
+def _setup_file_logging(config: GatewayConfig | None = None) -> None:
+    """Configure structlog + stdlib logging to write to a debug.log file."""
+    config = config or GatewayConfig()
+    root = logging.getLogger()
+    _remove_debug_file_handlers(root)
+
+    enabled = _env_bool("OPENSQUILLA_LOG_FILE_ENABLED")
+    if enabled is None:
+        enabled = config.log_file_enabled
+    if not enabled:
+        return
+
+    log_dir = Path(os.environ.get("OPENSQUILLA_LOG_DIR", str(default_opensquilla_home() / "logs")))
+    log_level = _resolve_log_level(config)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "debug.log"
+        file_handler = RotatingFileHandler(
+            str(log_file),
+            maxBytes=config.log_file_max_bytes,
+            backupCount=config.log_file_backup_count,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logging.getLogger(__name__).warning("file logging disabled: %s", exc)
+        return
+    setattr(file_handler, _DEBUG_FILE_HANDLER_ATTR, True)
+    opensquilla_logger = logging.getLogger("opensquilla")
+    setattr(file_handler, "_opensquilla_previous_logger_level", opensquilla_logger.level)
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+
+    root.addHandler(file_handler)
+    opensquilla_logger.setLevel(log_level)
+
+
+@dataclass
+class GatewayServer:
+    """Handle returned after gateway startup. Provides close() method."""
+
+    app: Starlette
+    config: GatewayConfig
+    _server: uvicorn.Server | None = field(default=None, repr=False)
+    _task: asyncio.Task | None = field(default=None, repr=False)
+    _channel_manager: Any = field(default=None, repr=False)
+    _services: ServiceContainer | None = field(default=None, repr=False)
+    _background_completion_manager: Any = field(default=None, repr=False)
+
+    async def close(self, reason: str = "shutdown") -> None:
+        """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
+        # Drain in-flight turns FIRST so replies are not lost.
+        # task_runtime.shutdown() waits for all running turns to complete before
+        # returning; only then do we stop channel delivery.
+        if self._services is not None and self._services.task_runtime is not None:
+            try:
+                await self._services.task_runtime.shutdown(
+                    graceful=True, graceful_timeout=30.0
+                )
+            except Exception:
+                pass
+
+        if self._background_completion_manager is not None:
+            try:
+                await self._background_completion_manager.close(timeout=30.0)
+            except Exception:
+                log.debug("gateway.background_completion_close_failed", exc_info=True)
+            try:
+                from opensquilla.gateway.subagent_announce import set_background_completion_manager
+
+                set_background_completion_manager(None)
+            except Exception:
+                pass
+            self._background_completion_manager = None
+
+        # Stop channels after task_runtime is drained (no in-flight turns remain)
+        if self._channel_manager is not None:
+            await self._channel_manager.stop_all()
+            log.info("gateway.channels_stopped")
+
+        registry = get_registry()
+        await registry.broadcast("shutdown", {"reason": reason})
+
+        # Close all active WS connections
+        for conn in registry.all():
+            await conn.close()
+
+        # Close MCP clients
+        try:
+            from opensquilla.mcp.discovery import close_active_clients
+
+            await close_active_clients()
+            log.info("gateway.mcp_clients_closed")
+        except ImportError:
+            pass
+
+        if self._server is not None:
+            self._server.should_exit = True
+
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=5.0)
+            except TimeoutError:
+                self._task.cancel()
+
+        if self._services is not None:
+            await self._services.close()
+
+        log.info("gateway.stopped", reason=reason)
+
+
+def build_flush_service(
+    *,
+    tool_registry: Any,
+    provider_selector: Any,
+    config: GatewayConfig | None = None,
+    session_manager: Any | None = None,
+    memory_managers: Mapping[str, Any] | None = None,
+) -> Any:
+    """Construct a :class:`SessionFlushService` gated by flush config.
+
+    Returns ``None`` when the kill-switch env var is disabled or gateway memory
+    config does not explicitly enable flush. Otherwise returns a service wired to the gateway's tool
+    registry and provider selector. ``agent_id`` is threaded through the
+    callable signature for future multi-agent support, but today OpenSquilla
+    uses a single ModelSelector so we just call its ``resolve()`` and ignore
+    the agent id.
+    """
+    from opensquilla.memory.flush_config import is_session_flush_enabled
+
+    if not is_session_flush_enabled():
+        return None
+    memory_cfg = getattr(config, "memory", None)
+    if memory_cfg is None or not getattr(memory_cfg, "flush_enabled", False):
+        return None
+
+    from opensquilla.memory.session_flush import SessionFlushService
+    from opensquilla.tools.dispatch import build_tool_handler
+
+    tool_handler = build_tool_handler(tool_registry)
+    raw_session_storage = get_session_storage(session_manager)
+    session_storage: _FlushReceiptSessionStorage | None = None
+    if (
+        raw_session_storage is not None
+        and callable(getattr(raw_session_storage, "get_session", None))
+        and callable(getattr(raw_session_storage, "list_memory_durable_receipts", None))
+        and callable(getattr(raw_session_storage, "upsert_memory_durable_receipt", None))
+    ):
+        session_storage = cast(_FlushReceiptSessionStorage, raw_session_storage)
+
+    def _resolve_provider(_agent_id: str) -> Any:
+        if provider_selector is None:
+            return None
+        resolver = getattr(provider_selector, "resolve", None)
+        if resolver is None:
+            return None
+        try:
+            return resolver()
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _resolve_flush_session_id(session_key: str) -> str | None:
+        if session_storage is None:
+            return None
+        session = await session_storage.get_session(session_key)
+        if session is None:
+            return None
+        return str(getattr(session, "session_id", "") or "") or None
+
+    async def _resolve_flush_checkpoint_exists(
+        session_key: str,
+        session_id: str | None,
+    ) -> bool:
+        if session_storage is None or not session_id:
+            return False
+        rows = await session_storage.list_memory_durable_receipts(
+            session_key=session_key,
+            session_id=session_id,
+            scope="checkpoint",
+            status="checkpoint_saved",
+            limit=1,
+        )
+        return bool(rows)
+
+    async def _write_durable_flush_receipt(receipt: Any, **row: Any) -> None:
+        if session_storage is None:
+            return
+
+        from opensquilla.session.models import MemoryDurableReceipt
+
+        session_key = str(row.get("session_key") or "")
+        if not session_key:
+            return
+        captured_session_id = str(row.get("session_id") or "")
+        if not captured_session_id:
+            log.warning(
+                "session_flush.receipt_write_skipped",
+                reason="session_id_missing",
+                session_key=session_key,
+                result_status=getattr(receipt, "result_status", None),
+            )
+            return
+        current_session = await session_storage.get_session(session_key)
+        current_session_id = (
+            str(getattr(current_session, "session_id", "") or "")
+            if current_session is not None
+            else ""
+        )
+        if current_session_id and current_session_id != captured_session_id:
+            log.warning(
+                "session_flush.receipt_session_mismatch",
+                session_key=session_key,
+                captured_session_id=captured_session_id,
+                current_session_id=current_session_id,
+                result_status=getattr(receipt, "result_status", None),
+            )
+
+        scope = str(row.get("scope") or "")
+        status = str(row.get("status") or "")
+        reason = row.get("reason")
+        target_path = row.get("target_path")
+        target_path = str(target_path) if target_path else None
+        source_path = row.get("source_path")
+        source_path = str(source_path) if source_path else None
+        turn_id = row.get("turn_id")
+        turn_id = str(turn_id) if turn_id else None
+        content_hash = row.get("content_hash")
+        content_hash = str(content_hash) if content_hash else None
+        idempotency_key = ":".join(
+            [
+                "flush-receipt",
+                scope,
+                session_key,
+                captured_session_id,
+                turn_id or "",
+                status,
+                str(reason or ""),
+                source_path or "",
+                target_path or "",
+                content_hash or "",
+                str(getattr(receipt, "input_message_count", 0) or 0),
+                str(getattr(receipt, "first_included_message", "") or ""),
+                str(getattr(receipt, "last_included_message", "") or ""),
+            ]
+        )
+        await session_storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key=session_key,
+                session_id=captured_session_id,
+                turn_id=turn_id,
+                scope=scope,
+                source_path=source_path,
+                target_path=target_path,
+                content_hash=content_hash,
+                idempotency_key=idempotency_key,
+                status=status,
+                reason=str(reason) if reason else None,
+                attempt_count=1,
+            )
+        )
+
+    def _resolve_archive_workspace(agent_id: str) -> Path | None:
+        if not memory_managers:
+            return None
+        managers = [memory_managers.get(agent_id), memory_managers.get("main")]
+        for attr_name in ("workspace_dir", "memory_dir"):
+            for manager in managers:
+                if manager is None:
+                    continue
+                path_value = getattr(manager, attr_name, None)
+                if path_value is not None:
+                    return Path(path_value).expanduser()
+        return None
+
+    service_kwargs: dict[str, Any] = {}
+    if memory_cfg is not None:
+        service_kwargs["default_timeout"] = getattr(
+            memory_cfg,
+            "flush_background_timeout_seconds",
+            30.0,
+        )
+        service_kwargs["raw_archive_max_chars"] = getattr(
+            memory_cfg,
+            "flush_archive_max_bytes",
+            800_000,
+        )
+    if session_storage is not None:
+        service_kwargs["receipt_writer"] = _write_durable_flush_receipt
+        service_kwargs["session_identity_resolver"] = _resolve_flush_session_id
+        service_kwargs["checkpoint_exists_resolver"] = _resolve_flush_checkpoint_exists
+
+    return SessionFlushService(
+        provider_selector=_resolve_provider,
+        tool_registry=tool_registry,
+        tool_handler=tool_handler,
+        archive_workspace_resolver=_resolve_archive_workspace,
+        **service_kwargs,
+    )
+
+
+def emit_skill_filter_banner(skills_cfg: Any) -> None:
+    """One-line startup warning when the ONNX embedding backend is
+    unreachable but a non-lexical filter strategy is configured.
+
+    Required runtime: ``onnxruntime`` + ``tokenizers`` +
+    the bundled v4 BGE ONNX dir (or a configured override). All three
+    ship via ``uv sync --extra recommended``. The previous non-ONNX
+    fallback was removed — there is now exactly one backend.
+
+    The banner fires only when filter_enabled=true, strategy ≠ lexical,
+    AND the ONNX path is incomplete. Uses stdlib :mod:`logging` so
+    operators see it on the standard ``WARNING`` logger and so tests
+    can assert on it via ``caplog``.
+    """
+    import importlib.util
+    import logging
+
+    log_std = logging.getLogger("opensquilla.gateway.boot")
+
+    if not getattr(skills_cfg, "filter_enabled", False):
+        return
+    if getattr(skills_cfg, "filter_strategy", "lexical") == "lexical":
+        return
+
+    onnx_ok = False
+    try:
+        if importlib.util.find_spec("onnxruntime") is not None and importlib.util.find_spec(
+            "tokenizers"
+        ) is not None:
+            from opensquilla.memory.embedding import LocalEmbeddingProvider
+
+            model_name = getattr(
+                skills_cfg, "filter_embedding_model", LocalEmbeddingProvider.DEFAULT_MODEL
+            )
+            onnx_ok = LocalEmbeddingProvider._bundled_onnx_dir(model_name) is not None
+    except ImportError:
+        onnx_ok = False
+
+    if onnx_ok:
+        return
+
+    log_std.warning(
+        "ONNX embedding backend not available; filter_strategy=%r will run "
+        "lexical-only. Install via `uv sync --extra recommended` to get "
+        "onnxruntime + tokenizers, and verify the bundled BGE ONNX dir "
+        "is present.",
+        getattr(skills_cfg, "filter_strategy", "lexical"),
+    )
+
+
+def _squilla_router_bundle_dir(router_cfg: Any) -> Path:
+    configured = getattr(router_cfg, "v4_bundle_dir", None)
+    if configured:
+        return Path(configured).expanduser()
+    return (
+        Path(__file__).resolve().parents[1]
+        / "squilla_router"
+        / "models"
+        / "v4.2_phase3_inference"
+    )
+
+
+def validate_squilla_router_runtime(config: GatewayConfig) -> None:
+    """Validate router assets without loading the heavy ML runtime."""
+    router_cfg = getattr(config, "squilla_router", None)
+    if router_cfg is None or not getattr(router_cfg, "enabled", False):
+        return
+
+    strategy = getattr(router_cfg, "strategy", "v4_phase3")
+    if strategy != "v4_phase3":
+        log.warning("build_services.squilla_router_removed_strategy", strategy=strategy)
+
+    bundle_dir = _squilla_router_bundle_dir(router_cfg)
+    required = ("runtime_src", "router.runtime.yaml")
+    missing = [name for name in required if not (bundle_dir / name).exists()]
+    if missing:
+        message = f"missing V4 bundle files in {bundle_dir}: {missing}"
+        if getattr(router_cfg, "require_router_runtime", False):
+            raise RuntimeError(message)
+        log.warning(
+            "build_services.squilla_router_bundle_missing",
+            bundle_dir=str(bundle_dir),
+            missing=missing,
+        )
+        return
+    log.info("build_services.squilla_router_bundle_ready", bundle_dir=str(bundle_dir))
+
+
+def _preload_squilla_router_strategy(router_cfg: Any) -> object:
+    from opensquilla.engine.steps.squilla_router import preload_strategy
+
+    return preload_strategy(router_cfg)
+
+
+async def preload_squilla_router_runtime(config: GatewayConfig) -> None:
+    router_cfg = getattr(config, "squilla_router", None)
+    if router_cfg is None or not getattr(router_cfg, "enabled", False):
+        return
+
+    bundle_dir = _squilla_router_bundle_dir(router_cfg)
+    try:
+        log.info("gateway.squilla_router_preload_started", bundle_dir=str(bundle_dir))
+        strategy = await asyncio.to_thread(_preload_squilla_router_strategy, router_cfg)
+        if getattr(strategy, "_available", False):
+            log.info("gateway.squilla_router_preloaded", bundle_dir=str(bundle_dir))
+            return
+        if getattr(router_cfg, "require_router_runtime", False):
+            raise RuntimeError("V4 Phase 3 router did not become available")
+        log.warning("gateway.squilla_router_preload_unavailable", bundle_dir=str(bundle_dir))
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "gateway.squilla_router_preload_failed",
+            bundle_dir=str(bundle_dir),
+            error=str(exc),
+        )
+
+
+async def build_services(
+    config: GatewayConfig | None = None,
+    session_manager: Any = None,
+    provider_selector: Any = None,
+    tool_registry: Any = None,
+    usage_tracker: Any = None,
+    session_db_path: str = ":memory:",
+    extra_agent_ids: list[str] | None = None,
+    seed_agent_workspaces: bool = True,
+) -> ServiceContainer:
+    """Initialize reusable services without any gateway-specific side effects.
+
+    This is the standalone entry point for service construction. It builds
+    all the pieces that both the ASGI gateway and the CLI ``--standalone``
+    path need: session storage, provider selector, tool registry, memory,
+    skills, scheduler, search, and MCP discovery.
+
+    Parameters that are *None* are auto-constructed from *config* defaults.
+    Pass explicit instances to override (useful for tests and embedding).
+
+    Returns a populated :class:`ServiceContainer`.
+    """
+    # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
+    from opensquilla.env import load_env
+
+    load_env()
+
+    # ── Config ──────────────────────────────────────────────────────
+    if config is None:
+        config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+        if config.config_path:
+            log.info("build_services.config_loaded", path=config.config_path)
+    _warn_workspace_state_mismatch(config)
+
+    validate_squilla_router_runtime(config)
+    from opensquilla.memory.embedding_resolver import resolve_memory_embedding
+
+    resolve_memory_embedding(config.memory, local_available=lambda *_: False)
+    if seed_agent_workspaces:
+        _ensure_configured_agent_workspaces(config, extra_agent_ids=extra_agent_ids)
+
+    # Inject config into admin tool (needed by both gateway and standalone)
+    from opensquilla.tools.builtin.admin import set_gateway_config
+
+    set_gateway_config(config)
+
+    from opensquilla.tools.ssrf import configure_trusted_fake_ip_cidrs
+
+    configure_trusted_fake_ip_cidrs(config.tools.trusted_fake_ip_cidrs)
+
+    # ── Sandbox runtime ─────────────────────────────────────────────
+    # validate_combination emits structured warnings; configure_runtime
+    # assembles the backend + gate + ledger so tool handlers can call
+    # through the ``@sandboxed`` decorator.
+    try:
+        from opensquilla.sandbox.integration import configure_runtime
+
+        effective = configure_runtime(
+            config.sandbox,
+            workspace=Path(config.workspace_dir) if config.workspace_dir else None,
+        )
+        log.info(
+            "build_services.sandbox_ready",
+            **effective.effective.as_dict(),
+        )
+    except Exception as e:  # pragma: no cover - boot diagnostics only
+        log.exception("build_services.sandbox_configure_failed", error=str(e))
+        raise
+
+    # ── Schema migrations (before any DB connects) ──────────────────
+    # Runs pending migrations on the session DB before SessionStorage opens it,
+    # so SQLModel-backed tables (SessionNode, TranscriptEntry, SessionSummary)
+    # see the expected columns. Skipped for in-memory DBs (CLI standalone) —
+    # yoyo would operate on a separate in-memory connection from storage.
+    # Migration failures propagate: code ships behind the migration, never
+    # ahead of it — silently booting on an out-of-date schema is worse than
+    # failing loud.
+    if session_db_path != ":memory:":
+        from opensquilla.persistence.migrator import apply_pending
+
+        if "://" not in session_db_path:
+            Path(session_db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        migrations_dir = _resolve_migrations_dir()
+        applied = apply_pending(session_db_path, migrations_dir)
+        if applied:
+            log.info("build_services.migrations_applied", count=len(applied), ids=applied)
+
+    # ── Agent registry (built early so SessionManager can resolve agent configs) ─
+    from opensquilla.agents.registry import AgentRegistry
+
+    agent_registry = AgentRegistry(config)
+
+    # ── Session manager ─────────────────────────────────────────────
+    if session_manager is None:
+        from opensquilla.session.manager import SessionManager
+        from opensquilla.session.storage import SessionStorage
+
+        Path(session_db_path).parent.mkdir(parents=True, exist_ok=True)
+        storage = SessionStorage(session_db_path)
+        await storage.connect()
+        session_manager = SessionManager(
+            storage,
+            agent_registry=agent_registry,
+            checkpoint_workspace_dir=config.workspace_dir,
+        )
+
+    # Wire session manager into tool layer (like set_scheduler, set_gateway_config)
+    from opensquilla.tools.builtin.sessions import (
+        set_gateway_config as _set_sessions_gateway_config,
+    )
+    from opensquilla.tools.builtin.sessions import set_session_manager
+
+    set_session_manager(session_manager)
+    _set_sessions_gateway_config(config)
+    session_storage = get_session_storage(session_manager)
+
+    # Wire agent registry into the agents_list tool surface.
+    from opensquilla.tools.builtin.agents import set_agent_registry as _set_agent_registry_tool
+
+    _set_agent_registry_tool(agent_registry)
+
+    # ── Provider selector ───────────────────────────────────────────
+    llm_runtime = resolve_llm_runtime_config(config)
+    api_key = llm_runtime.api_key
+    resolved_base = llm_runtime.base_url
+    proxy = llm_runtime.proxy
+    if provider_selector is None:
+        if api_key:
+            from opensquilla.provider.selector import (
+                ModelSelector,
+                ProviderConfig,
+                SelectorConfig,
+            )
+
+            if resolved_base.endswith("/v1"):
+                resolved_base = resolved_base[:-3]
+            provider_selector = ModelSelector(
+                SelectorConfig(
+                    primary=ProviderConfig(
+                        provider=llm_runtime.provider,
+                        model=llm_runtime.model,
+                        api_key=api_key,
+                        base_url=resolved_base,
+                        proxy=proxy,
+                        provider_routing=llm_runtime.provider_routing,
+                    )
+                )
+            )
+            log.info(
+                "build_services.provider_ready",
+                provider=llm_runtime.provider,
+                model=llm_runtime.model,
+            )
+
+    # ── Model catalog (boot order: after provider selector) ──────────
+    # Keep a catalog for every provider so direct-provider runtime paths still
+    # get static fallback capabilities (for example DeepSeek v4 thinking
+    # replay) even when only OpenRouter performs a remote model-list fetch.
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    model_catalog = ModelCatalog()
+    if api_key and config.llm.provider == "openrouter":
+        try:
+            await asyncio.wait_for(
+                model_catalog.fetch_openrouter(api_key, resolved_base, proxy),
+                timeout=5.0,
+            )
+            log.info("build_services.model_catalog_ready", count=len(model_catalog))
+        except Exception as e:
+            log.warning("build_services.model_catalog_failed", error=str(e))
+
+        try:
+            from opensquilla.engine.pricing import refresh_live_prices
+
+            pricing_models = {str(config.llm.model)} if config.llm.model else set()
+            router_cfg = getattr(config, "squilla_router", None)
+            if router_cfg is not None:
+                for tier_cfg in getattr(router_cfg, "tiers", {}).values():
+                    model_id = tier_cfg.get("model") if isinstance(tier_cfg, dict) else None
+                    if model_id:
+                        pricing_models.add(str(model_id))
+            await asyncio.to_thread(
+                refresh_live_prices,
+                pricing_models,
+                f"{resolved_base.rstrip('/')}/v1",
+            )
+            log.info("build_services.pricing_cache_ready", count=len(pricing_models))
+        except Exception as e:
+            log.warning("build_services.pricing_cache_failed", error=str(e))
+
+    # ── Tool registry ───────────────────────────────────────────────
+    if tool_registry is None:
+        from opensquilla.tools.registry import get_default_registry
+
+        tool_registry = get_default_registry()
+
+    try:
+        from opensquilla.tools.builtin.session_search import create_session_search_tool
+
+        if session_storage is not None:
+            create_session_search_tool(session_storage, registry=tool_registry)
+            log.info("build_services.session_search_tool_registered")
+        else:
+            log.warning("build_services.session_search_tool_skipped", reason="storage_unavailable")
+    except Exception as e:
+        log.warning("build_services.session_search_tool_failed", error=str(e))
+
+    try:
+        from opensquilla.tools.builtin.media import configure_audio, configure_image_generation
+
+        configure_image_generation(
+            config.image_generation,
+            llm_config=config.llm,
+            squilla_router_config=config.squilla_router,
+        )
+        configure_audio(config.audio)
+    except Exception as e:
+        log.warning("build_services.image_generation_config_failed", error=str(e))
+
+    # ── Memory tools (boot order 18) — per-agent stores ──────────────
+    # Pre-bind to empty defaults so the ServiceContainer init below and
+    # the deferred TurnRunner-ref callback both work even if the try
+    # block aborts.
+    memory_managers: dict[str, MemoryManager] = {}
+    memory_stores: dict[str, Any] = {}
+    memory_retrievers: dict[str, Any] = {}
+    memory_sync_managers: dict[str, Any] = {}
+    turn_capture_services: dict[str, Any] = {}
+    memory_watchers: list[Any] = []
+    _turn_runner_ref: list = []
+    try:
+        from opensquilla.memory.manager import build_memory_managers
+        from opensquilla.tools.builtin.memory_tools import create_memory_tools
+
+        agent_ids = _configured_agent_ids(config, extra_agent_ids)
+        memory_managers = await build_memory_managers(
+            config,
+            agent_ids,
+            session_storage=session_storage,
+        )
+
+        # Derive legacy per-tier views from the managers. These remain in
+        # `ServiceContainer` until downstream consumers
+        # (TurnRunner, CLI, memory_tools) onto `memory_managers` directly.
+        memory_stores = {aid: m.store for aid, m in memory_managers.items()}
+        memory_retrievers = {aid: m.retriever for aid, m in memory_managers.items()}
+        memory_sync_managers = {aid: m.sync_manager for aid, m in memory_managers.items()}
+        turn_capture_services = {aid: m.turn_capture for aid, m in memory_managers.items()}
+        memory_watchers = [m.sync_manager for m in memory_managers.values()]
+
+        # Deferred callback: TurnRunner doesn't exist yet, so we capture a
+        # mutable list ref that start_gateway_server() will populate later.
+        def _on_memory_write(agent_id: str) -> None:
+            if _turn_runner_ref:
+                _turn_runner_ref[0].refresh_memory_snapshot(agent_id)
+
+        if memory_stores and memory_retrievers:
+            create_memory_tools(
+                stores=memory_stores,
+                retrievers=memory_retrievers,
+                memory_base=config.state_dir,
+                registry=tool_registry,
+                memory_source=getattr(config.memory, "source", "state"),
+                on_memory_write=_on_memory_write,
+                memory_config=config.memory,
+                workspace_base=config.workspace_dir
+                if getattr(config.memory, "source", "state") == "workspace"
+                else None,
+            )
+            log.info("build_services.memory_tools_registered", agents=list(memory_stores))
+    except Exception as e:
+        log.warning("build_services.memory_tools_failed", error=str(e))
+
+    # ── Skill loader (boot order 19) ────────────────────────────────
+    skill_loader = None
+    try:
+        from opensquilla.skills.loader import SkillLoader
+        from opensquilla.skills.paths import resolve_skill_layer_dirs
+
+        workspace_root_raw = getattr(config, "workspace_dir", None)
+        workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
+        workspace_override = (
+            Path(config.skills.workspace_dir) if config.skills.workspace_dir else None
+        )
+        layer_dirs = resolve_skill_layer_dirs(
+            allow_bundled=config.skills.allow_bundled,
+            workspace_root=workspace_root,
+            workspace_override=workspace_override,
+            managed_override=config.skills.managed_dir,
+            extra_dirs=[Path(d) for d in config.skills.extra_dirs],
+        )
+        skill_loader = SkillLoader(
+            bundled_dir=layer_dirs.bundled_dir,
+            workspace_dir=layer_dirs.workspace_dir,
+            managed_dir=layer_dirs.managed_dir,
+            personal_agents_dir=layer_dirs.personal_agents_dir,
+            project_agents_dir=layer_dirs.project_agents_dir,
+            extra_dirs=layer_dirs.extra_dirs,
+        )
+        log.info(
+            "build_services.skill_loader_initialized",
+            bundled_dir=str(layer_dirs.bundled_dir),
+        )
+
+        # Register skill_list and skill_view tools
+        from opensquilla.tools.builtin.skill_tools import create_skill_tools
+
+        create_skill_tools(skill_loader)
+        log.info("build_services.skill_tools_registered")
+    except Exception as e:
+        log.warning("build_services.skill_loader_failed", error=str(e))
+
+    # ── Cron scheduler (boot order 20) ──────────────────────────────
+    cron_scheduler = None
+    try:
+        from opensquilla.scheduler import JobStore, SchedulerEngine
+
+        scheduler_db = Path(
+            os.environ.get("OPENSQUILLA_SCHEDULER_DB", str(_state_path(config, "scheduler.db")))
+        )
+        scheduler_db.parent.mkdir(parents=True, exist_ok=True)
+        job_store = JobStore(db_path=str(scheduler_db))
+        await job_store.open()
+        cron_scheduler = SchedulerEngine(
+            store=job_store,
+            session_store=storage,  # SessionStorage instance from session manager boot
+            config={
+                "max_concurrent_runs": int(os.environ.get("OPENSQUILLA_CRON_MAX_CONCURRENT", "3")),
+                "max_catchup_jobs": int(os.environ.get("OPENSQUILLA_CRON_MAX_CATCHUP", "5")),
+                "session_retention": int(
+                    os.environ.get("OPENSQUILLA_CRON_SESSION_RETENTION", "86400")
+                ),
+            },
+        )
+        await cron_scheduler.start()
+        # Inject into admin tool so `cron` tool can dispatch to the scheduler
+        from opensquilla.tools.builtin.admin import set_scheduler
+
+        set_scheduler(cron_scheduler)
+        log.info("build_services.cron_scheduler_started")
+    except Exception as e:
+        log.warning("build_services.cron_scheduler_failed", error=str(e))
+
+    # ── Usage tracker ───────────────────────────────────────────────
+    if usage_tracker is None:
+        usage_tracker = _UsageTracker()
+
+    # ── Search provider (brave > duckduckgo fallback) ───────────────
+    try:
+        import opensquilla.search.providers.brave  # noqa: F401 — registers provider
+        import opensquilla.search.providers.duckduckgo  # noqa: F401 — registers provider
+        from opensquilla.search.registry import get_provider_spec
+        from opensquilla.tools.builtin.web import configure_search
+
+        provider = config.search_provider
+        search_api_key = config.search_api_key
+        if not search_api_key:
+            env_key = config.search_api_key_env or get_provider_spec(provider).env_key
+            search_api_key = os.environ.get(env_key, "") if env_key else ""
+        # Auto-select: use brave if key is available and provider is default
+        if provider == "duckduckgo":
+            if search_api_key or os.environ.get("BRAVE_SEARCH_API_KEY"):
+                provider = "brave"
+
+        configure_search(
+            provider_name=provider,
+            max_results=config.search_max_results,
+            api_key=search_api_key,
+            proxy=config.search_proxy,
+            use_env_proxy=config.search_use_env_proxy,
+            fallback_policy=config.search_fallback_policy,
+            diagnostics=config.search_diagnostics,
+        )
+        log.info("build_services.search_provider_initialized", provider=provider)
+    except Exception as e:
+        log.warning("build_services.search_provider_failed", error=str(e))
+
+    # ── MCP discovery (boot order 22) ───────────────────────────────
+    if config.mcp.enabled and config.mcp.servers:
+        from opensquilla.mcp.discovery import discover_and_register
+        from opensquilla.mcp.types import MCPServerConfig
+
+        timeout = config.mcp.connect_timeout_seconds
+        for entry in config.mcp.servers:
+            try:
+                mcp_cfg = MCPServerConfig(
+                    name=entry.name,
+                    transport=entry.transport,
+                    command=entry.command,
+                    args=entry.args,
+                    url=entry.url,
+                    env=entry.env,
+                    tool_timeout_seconds=entry.tool_timeout_seconds,
+                )
+                names = await asyncio.wait_for(
+                    discover_and_register(mcp_cfg, tool_registry),
+                    timeout=timeout,
+                )
+                log.info(
+                    "build_services.mcp_server_registered",
+                    server=entry.name,
+                    tools=len(names),
+                )
+            except TimeoutError:
+                log.warning(
+                    "build_services.mcp_server_timeout",
+                    server=entry.name,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                log.warning(
+                    "build_services.mcp_server_failed",
+                    server=entry.name,
+                    error=str(e),
+                )
+    elif config.mcp.enabled:
+        log.info("build_services.mcp_enabled_no_servers")
+
+    flush_service = build_flush_service(
+        tool_registry=tool_registry,
+        provider_selector=provider_selector,
+        config=config,
+        session_manager=session_manager,
+        memory_managers=memory_managers,
+    )
+    if flush_service is not None:
+        log.info("build_services.session_flush_service_ready")
+    else:
+        log.info("build_services.session_flush_service_disabled")
+
+    memory_repair_service = None
+    if (
+        bool(getattr(config.memory, "repair_enabled", True))
+        and flush_service is not None
+        and session_manager is not None
+    ):
+        try:
+            from opensquilla.gateway.memory_repair_service import MemoryRepairService
+
+            memory_roots = {
+                agent_id: Path(root)
+                for agent_id, manager in memory_managers.items()
+                for root in [
+                    getattr(manager, "workspace_dir", None)
+                    or getattr(manager, "memory_dir", None)
+                ]
+                if root is not None
+            }
+            memory_repair_service = MemoryRepairService(
+                session_manager=session_manager,
+                flush_service=flush_service,
+                memory_roots=memory_roots,
+                agent_ids=tuple(_configured_agent_ids(config, extra_agent_ids)),
+                interval_seconds=float(getattr(config.memory, "repair_interval_seconds", 60.0)),
+                max_items_per_tick=int(
+                    getattr(config.memory, "repair_max_items_per_tick", 5)
+                ),
+            )
+            log.info("build_services.memory_repair_service_ready")
+        except Exception as e:
+            log.warning("build_services.memory_repair_service_failed", error=str(e))
+
+    meta_run_writer = None
+    try:
+        from opensquilla.skills.meta.enabled import is_meta_skill_enabled
+
+        persistence_cfg = getattr(getattr(config, "meta_skill", None), "persistence", None)
+        if (
+            is_meta_skill_enabled(config)
+            and persistence_cfg is not None
+            and getattr(persistence_cfg, "enabled", False)
+        ):
+            meta_storage = get_session_storage(session_manager)
+            db_path = (
+                getattr(meta_storage, "_db_path", None)
+                if meta_storage is not None
+                else None
+            )
+            if db_path and db_path != ":memory:":
+                from opensquilla.persistence.meta_run_writer import open_meta_run_writer
+
+                meta_run_writer = open_meta_run_writer(db_path)
+                if meta_storage is not None and hasattr(meta_storage, "_meta_run_writer"):
+                    meta_storage._meta_run_writer = meta_run_writer
+                meta_run_writer.mark_orphans_failed(
+                    age_ms=int(
+                        getattr(persistence_cfg, "orphan_cleanup_age_seconds", 3600)
+                    )
+                    * 1000,
+                )
+    except Exception as e:  # noqa: BLE001 - meta traces must not block boot.
+        log.warning("build_services.meta_run_writer_failed", error=str(e))
+        meta_run_writer = None
+
+    svc = ServiceContainer(
+        config=config,
+        provider_selector=provider_selector,
+        tool_registry=tool_registry,
+        session_manager=session_manager,
+        skill_loader=skill_loader,
+        usage_tracker=usage_tracker,
+        cron_scheduler=cron_scheduler,
+        model_catalog=model_catalog,
+        agent_registry=agent_registry,
+        memory_managers=memory_managers,
+        memory_stores=memory_stores,
+        memory_sync_managers=memory_sync_managers,
+        memory_watchers=memory_watchers,
+        memory_retrievers=memory_retrievers,
+        turn_capture_services=turn_capture_services,
+        flush_service=flush_service,
+        memory_repair_service=memory_repair_service,
+        meta_run_writer=meta_run_writer,
+    )
+    # Attach deferred callback ref so start_gateway_server can wire TurnRunner
+    svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
+    return svc
+
+
+def build_turn_runner_from_services(
+    svc: Any,
+    *,
+    config: GatewayConfig | None = None,
+    diagnostics_state: Any | None = None,
+) -> Any:
+    """Build a TurnRunner with every service-backed memory integration wired.
+
+    Provides a standalone per-session lock dict for CLI/standalone paths (no
+    TaskRuntime).  When the caller is the gateway boot path, the boot wiring
+    overrides ``task_runtime._get_session_lock_for_turn`` so both classes
+    share a single lock per session.
+    """
+    import asyncio as _asyncio
+
+    from opensquilla.engine.runtime import TurnRunner
+
+    resolved_config = config if config is not None else svc.config
+    # Standalone lock dict for CLI / test paths (no TaskRuntime involved).
+    # Gateway path replaces this with task_runtime._get_session_lock_for_turn
+    # immediately after task_runtime is constructed.
+    _standalone_locks: dict[str, _asyncio.Lock] = {}
+
+    def _standalone_lock_provider(session_key: str) -> _asyncio.Lock:
+        return _standalone_locks.setdefault(session_key, _asyncio.Lock())
+
+    return TurnRunner(
+        provider_selector=svc.provider_selector,
+        tool_registry=svc.tool_registry,
+        session_manager=svc.session_manager,
+        skill_loader=svc.skill_loader,
+        usage_tracker=svc.usage_tracker,
+        config=resolved_config,
+        memory_sync_managers=getattr(svc, "memory_sync_managers", None) or None,
+        model_catalog=getattr(svc, "model_catalog", None),
+        memory_retrievers=getattr(svc, "memory_retrievers", None) or None,
+        turn_capture_services=getattr(svc, "turn_capture_services", None) or None,
+        session_flush_service=getattr(svc, "flush_service", None),
+        session_lock_provider=_standalone_lock_provider,
+        diagnostics_state=diagnostics_state,
+        # Hook registries forwarded from services when present so any future
+        # user-registered TurnHook / CompactionHook instance flows through to
+        # TurnRunner without another boot edit.
+        # None today (no production services expose either registry); the
+        # plumbing stays here so the path is wired end-to-end.
+        turn_hooks=getattr(svc, "turn_hooks", None),
+        compaction_hooks=getattr(svc, "compaction_hooks", None),
+        meta_run_writer=getattr(svc, "meta_run_writer", None),
+    )
+
+
+async def start_gateway_server(
+    port: int | None = None,
+    config: GatewayConfig | None = None,
+    session_manager: Any = None,
+    provider_selector: Any = None,
+    tool_registry: Any = None,
+    subscription_manager: Any = None,
+    channel_manager: Any = None,
+    usage_tracker: Any = None,
+    run: bool = True,
+) -> GatewayServer:
+    """
+    Boot sequence:
+    1. Load/validate config
+    2. Ensure auth token exists
+    3. Build ASGI app
+    4. Start uvicorn server
+    """
+    # ── Gateway-specific config handling ─────────────────────────────
+    if config is None:
+        config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+
+    # Apply runtime port override
+    if port is not None:
+        config = config.model_copy(update={"port": port})
+
+    _setup_file_logging(config)
+    if config.config_path:
+        log.info("gateway.config_loaded", path=config.config_path)
+
+    if subscription_manager is None:
+        from opensquilla.gateway.websocket import SubscriptionManager
+
+        subscription_manager = SubscriptionManager()
+
+    # Gateway-specific: set env var for other components to discover
+    os.environ["OPENSQUILLA_GATEWAY_PORT"] = str(config.port)
+
+    # Gateway-specific: ensure auth token exists
+    if config.auth.mode == "token" and not config.auth.token:
+        token = secrets.token_urlsafe(32)
+        config.auth = config.auth.model_copy(update={"token": token})
+        config.mark_runtime_secret("auth.token")
+        log.info("gateway.auth_token_generated")
+
+    # Gateway-specific: resolve Control UI root directory (boot order 17)
+    if config.control_ui.enabled:
+        from opensquilla.gateway.control_ui import _STATIC_DIR, _TEMPLATE_DIR
+
+        if not _TEMPLATE_DIR.is_dir():
+            log.warning("gateway.control_ui.templates_missing", path=str(_TEMPLATE_DIR))
+        if not _STATIC_DIR.is_dir():
+            log.warning("gateway.control_ui.static_missing", path=str(_STATIC_DIR))
+        log.info(
+            "gateway.control_ui.resolved",
+            base_path=config.control_ui.base_path,
+            templates=str(_TEMPLATE_DIR),
+            static=str(_STATIC_DIR),
+        )
+    else:
+        log.info("gateway.control_ui.disabled")
+
+    # Surface lexical degradation when the operator enabled filter_enabled=true
+    # with a strategy that needs the local ONNX embedding backend.
+    emit_skill_filter_banner(config.skills)
+
+    # ── PID file lock ───────────────────────────────────────────────
+    # Prevents two gateway instances from sharing the same STATE_DIR.
+    # Must run before build_services so the lock is held before any DB work.
+    from opensquilla.gateway.pidlock import GatewayPidLock
+
+    _pid_lock = GatewayPidLock(_state_path(config, ""))
+    _pid_lock.acquire()
+
+    # ── Reusable service initialization via build_services ───────────
+    svc = await build_services(
+        config=config,
+        session_manager=session_manager,
+        provider_selector=provider_selector,
+        tool_registry=tool_registry,
+        usage_tracker=usage_tracker,
+        session_db_path=str(_state_path(config, "sessions.db")),
+    )
+
+    # Record boot time for uptime calculation (gateway-specific)
+    global _boot_time_ms
+    _boot_time_ms = int(time.time() * 1000)
+
+    log.info(
+        "gateway.starting",
+        host=config.host,
+        port=config.port,
+        auth_mode=config.auth.mode,
+    )
+
+    # ── Diagnostics runtime state ───────────────────────────────────
+    from opensquilla.gateway.diagnostics import DiagnosticsState
+
+    diagnostics_state = DiagnosticsState.from_config(config)
+
+    # ── TurnRunner (shared agent orchestration layer) ────────────────
+    turn_runner = build_turn_runner_from_services(
+        svc,
+        config=config,
+        diagnostics_state=diagnostics_state,
+    )
+    # Patch deferred callback so memory writes refresh TurnRunner snapshots
+    if hasattr(svc, "_turn_runner_ref"):
+        svc._turn_runner_ref.append(turn_runner)  # type: ignore[attr-defined]
+
+    memory_repair_service = getattr(svc, "memory_repair_service", None)
+    if memory_repair_service is not None:
+        memory_repair_service.start()
+        log.info("gateway.memory_repair_service_started")
+
+    # Lazy ref for channel_manager — cron handler captures it via closure,
+    # populated after channel_manager is constructed below.
+    _cm_holder: list = [None]
+    from opensquilla.scheduler.heartbeat import (
+        HeartbeatConfigWatcher,
+        HeartbeatRunner,
+    )
+    from opensquilla.scheduler.heartbeat_loop import HeartbeatLoop
+    from opensquilla.scheduler.heartbeat_service import HeartbeatService
+
+    heartbeat_service = HeartbeatService(
+        turn_runner=turn_runner,
+        session_storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        channel_manager_ref=lambda: _cm_holder[0],
+    )
+    heartbeat_loop = HeartbeatLoop(
+        config=config,
+        heartbeat_service=heartbeat_service,
+    )
+
+    from opensquilla.gateway.background_completion import BackgroundCompletionManager
+    from opensquilla.gateway.event_bridge import EventBridge
+    from opensquilla.gateway.subagent_announce import set_background_completion_manager
+    from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
+
+    runtime_event_bridge = EventBridge(
+        subscription_manager=subscription_manager,
+        connection_registry=get_registry(),
+    )
+
+    from opensquilla.engine.cache_break_monitor import add_compaction_listener
+
+    def _emit_runtime_compaction_event(
+        session_key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event_payload = dict(payload or {})
+        event_payload.setdefault("status", "completed")
+        event_payload.setdefault("source", "automatic")
+        emit_coro = runtime_event_bridge.emit(
+            session_key,
+            "session.event.compaction",
+            event_payload,
+        )
+        try:
+            create_background_task(emit_coro)
+        except RuntimeError:
+            emit_coro.close()
+
+    svc._compaction_listener_remove = add_compaction_listener(
+        _emit_runtime_compaction_event
+    )
+
+    background_completion_manager = BackgroundCompletionManager(
+        session_manager=svc.session_manager,
+        event_emitter=runtime_event_bridge.emit,
+        channel_manager_ref=lambda: _cm_holder[0],
+    )
+    set_background_completion_manager(background_completion_manager)
+
+    async def _subagent_completion_listener(event: Any) -> None:
+        from opensquilla.gateway.subagent_announce import announce_subagent_completion
+
+        await announce_subagent_completion(
+            event,
+            session_manager=svc.session_manager,
+            event_emitter=runtime_event_bridge.emit,
+            channel_manager=_cm_holder[0],
+            task_runtime=task_runtime,
+        )
+
+    async def _task_runtime_turn_handler(run: TaskRun) -> None:
+        await dispatch_task_runtime_turn(
+            run,
+            config=config,
+            session_manager=svc.session_manager,
+            turn_runner=turn_runner,
+            event_emitter=runtime_event_bridge.emit,
+        )
+
+    # Holder for the lifecycle listener to look up the task_runtime at
+    # execution time.  The runtime is needed for auto-closing a parent
+    # task's spawn group when the parent task ends (so the LLM's failure
+    # to call sessions_yield no longer strands completed subagent
+    # announcements).  We can't pass ``task_runtime`` directly because it
+    # is only bound to a name after the TaskRuntime constructor returns.
+    _lifecycle_task_runtime_holder: list[Any] = []
+    # Parallel holder for the optional subagent supervisor. Populated
+    # below when the supervisor is enabled, so the listener can
+    # ``forget_parent_task`` once the parent terminal phase fires.
+    _lifecycle_supervisor_holder: list[Any | None] = [None]
+
+    task_runtime = TaskRuntime(
+        storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        turn_handler=_task_runtime_turn_handler,
+        event_emitter=runtime_event_bridge.emit,
+        terminal_listener=_subagent_completion_listener,
+        lifecycle_listener=_make_task_session_lifecycle_listener(
+            session_manager=svc.session_manager,
+            event_emitter=runtime_event_bridge.emit,
+            task_runtime_holder=_lifecycle_task_runtime_holder,
+            supervisor_holder=_lifecycle_supervisor_holder,
+        ),
+        max_concurrency=_task_runtime_max_concurrency(config),
+        max_pending_per_session=_task_runtime_max_pending_per_session(config),
+        subagent_reserved_slots=int(
+            getattr(getattr(config, "subagents", None), "subagent_reserved_slots", 0)
+        ),
+        turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
+        pending_overflow_policy=getattr(
+            config.task_runtime, "pending_overflow_policy", "reject_newest"
+        ),
+    )
+    _lifecycle_task_runtime_holder.append(task_runtime)
+    # Wire task_runtime's short write-lock provider into turn_runner.
+    turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)
+    svc.task_runtime = task_runtime
+    # Bind the subagent supervisor to the now-constructed task_runtime so
+    # its replay path can drive ``announce_subagent_completion`` through
+    # the same code the primary listener uses (and so the supervisor's
+    # wake messages flow through the same dedup state).
+    supervisor = getattr(svc, "subagent_supervisor", None)
+    if supervisor is not None:
+        supervisor._task_runtime = task_runtime
+    # Wire the runtime into SessionManager so kill_session can cascade-cancel.
+    attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
+    if callable(attach_runtime):
+        attach_runtime(task_runtime)
+    from opensquilla.tools.builtin.sessions import set_task_runtime
+
+    set_task_runtime(task_runtime)
+
+    # Resolve HEARTBEAT.md path; instantiate Runner + Watcher;
+    # start Watcher BEFORE the Loop so the first tick already sees any
+    # frontmatter overrides. ``reload_now()`` runs synchronously at start.
+    heartbeat_runner = HeartbeatRunner()
+    workspace_dir = config.workspace_dir or ""
+    md_path_setting = getattr(config.heartbeat, "config_path", None)
+    if md_path_setting:
+        heartbeat_md_path = Path(md_path_setting).expanduser()
+    elif workspace_dir:
+        heartbeat_md_path = Path(workspace_dir).expanduser() / "HEARTBEAT.md"
+    else:
+        heartbeat_md_path = Path.home() / ".opensquilla" / "workspace" / "HEARTBEAT.md"
+    heartbeat_watcher = HeartbeatConfigWatcher(
+        heartbeat_runner,
+        heartbeat_md_path,
+        loop_listener=heartbeat_loop.apply_overrides,
+    )
+    await heartbeat_watcher.start()
+    svc.heartbeat_watcher = heartbeat_watcher
+
+    await heartbeat_loop.start()
+    svc.heartbeat_loop = heartbeat_loop
+
+    # Register cron agent_run handler (DI-based, no monkey-patch)
+    if svc.cron_scheduler is not None:
+        from opensquilla.gateway.auto_propose_bridge import (
+            AutoProposeRuntime,
+            register_runtime,
+        )
+        from opensquilla.memory.dream_factory import build_dream_factory
+        from opensquilla.scheduler.auto_propose_handler import make_auto_propose_handler
+        from opensquilla.scheduler.delivery import DeliveryChain
+        from opensquilla.scheduler.dream_handler import make_memory_dream_handler
+        from opensquilla.scheduler.handlers import (
+            make_agent_run_handler,
+            make_static_message_handler,
+            make_system_event_handler,
+        )
+        from opensquilla.scheduler.heartbeat_service import HeartbeatService
+        from opensquilla.skills.creator.auto_propose import auto_propose
+        from opensquilla.skills.meta.orchestrator import (
+            MetaOrchestrator,
+            make_agent_runner_from_parent,
+            make_llm_chat_from_provider,
+            make_tool_invoker_from_handler,
+        )
+        from opensquilla.tools.dispatch import build_tool_handler
+
+        async def _cron_ws_emitter(topic: str, event: str, payload: dict) -> int:
+            """Targeted WS push with per-connection error isolation."""
+            _registry = get_registry()
+            _sub_mgr = subscription_manager
+            if _sub_mgr is None:
+                return 0
+            conn_ids = _sub_mgr.get_topic_subscribers(topic)
+            conn_ids |= _sub_mgr.get_topic_subscribers("cron:*")
+            sent = 0
+            for conn_id in conn_ids:
+                conn = _registry.get(conn_id)
+                if conn:
+                    try:
+                        await conn.send_event(event, payload)
+                        sent += 1
+                    except Exception:
+                        pass
+            return sent
+
+        async def _session_forwarder(
+            origin_session_key: str,
+            text: str,
+            provenance: dict,
+        ) -> None:
+            if svc.session_manager is None:
+                return
+
+            entry = await svc.session_manager.append_message(
+                origin_session_key,
+                role="assistant",
+                content=text,
+                provenance=provenance,
+            )
+
+            _sub_mgr = subscription_manager
+            if _sub_mgr is None:
+                return
+
+            payload = build_cron_result_payload(origin_session_key, text, entry)
+
+            _registry = get_registry()
+            stream_payload = get_session_streams().record(
+                origin_session_key,
+                "session.event.cron_result",
+                payload,
+            )
+            for conn_id in _sub_mgr.get_message_subscribers(origin_session_key):
+                conn = _registry.get(conn_id)
+                if conn:
+                    try:
+                        await conn.send_event("session.event.cron_result", stream_payload)
+                    except Exception:
+                        pass
+
+            sessions_changed_payload = build_sessions_changed_payload(
+                origin_session_key, "cron_result"
+            )
+            for conn_id in (
+                _sub_mgr.get_message_subscribers(origin_session_key)
+                | _sub_mgr.get_session_subscribers()
+            ):
+                conn = _registry.get(conn_id)
+                if conn:
+                    try:
+                        await conn.send_event("sessions.changed", sessions_changed_payload)
+                    except Exception:
+                        pass
+
+        async def _emit_session_event(
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            _sub_mgr = subscription_manager
+            if _sub_mgr is None:
+                return
+
+            _registry = get_registry()
+            stream_payload = (
+                get_session_streams().record(session_key, event_name, payload)
+                if event_name.startswith("session.event.")
+                else payload
+            )
+            conn_ids = _sub_mgr.get_message_subscribers(session_key)
+            if event_name.startswith("sessions."):
+                conn_ids |= _sub_mgr.get_session_subscribers()
+
+            for conn_id in conn_ids:
+                conn = _registry.get(conn_id)
+                if conn:
+                    try:
+                        await conn.send_event(event_name, stream_payload)
+                    except Exception:
+                        pass
+
+        delivery_chain = DeliveryChain(
+            channel_manager_ref=lambda: _cm_holder[0],
+            ws_emitter=_cron_ws_emitter,
+            session_forwarder=_session_forwarder,
+        )
+
+        # Plug DeliveryChain.dispatch_failure_alert into execute_with_timeout
+        # so every failed cron run (agent_run raise, system_event raise,
+        # TimeoutError, generic exception) reaches the job's configured
+        # FailureDestination at runtime. Without this wire the dispatch
+        # plumbing is dead in production even though unit tests cover the
+        # hook directly.
+        from opensquilla.scheduler.jobs import set_failure_dispatcher
+
+        set_failure_dispatcher(delivery_chain.dispatch_failure_alert)
+
+        def _cron_workspace_resolver(agent_id: str) -> tuple[str | None, bool]:
+            workspace_dir = resolve_agent_workspace_dir(agent_id, config)
+            workspace_strict = getattr(config, "workspace_strict", None)
+            if not isinstance(workspace_strict, bool):
+                workspace_strict = bool(workspace_dir)
+            return str(workspace_dir), workspace_strict
+
+        auto_cfg = config.meta_skill.auto_propose
+        auto_home = _gateway_home(config)
+        auto_proposals_dir = auto_home / "proposals"
+        auto_log_dir = Path(
+            os.environ.get("OPENSQUILLA_LOG_DIR", str(auto_home / "logs"))
+        )
+        auto_agent_ids = _configured_agent_ids(config)
+
+        def _build_auto_propose_orchestrator(
+            agent_id: str,
+            *,
+            triggered_by: str,
+        ) -> MetaOrchestrator:
+            if svc.provider_selector is None:
+                raise RuntimeError("auto_propose provider not configured")
+            provider_selector = svc.provider_selector
+            router_cfg = getattr(config, "squilla_router", None)
+            tiers = getattr(router_cfg, "tiers", {}) if router_cfg is not None else {}
+            from opensquilla.router_tiers import HIGHEST_TEXT_TIER
+
+            t3_tier = tiers.get(HIGHEST_TEXT_TIER) if isinstance(tiers, dict) else None
+            t3_model = ""
+            t3_thinking_level = ""
+            if isinstance(t3_tier, dict):
+                t3_model = str(t3_tier.get("model") or "").strip()
+                t3_thinking_level = str(
+                    t3_tier.get("thinking_level") or t3_tier.get("thinking") or ""
+                ).strip()
+
+            clone_selector = getattr(provider_selector, "clone", None)
+            if t3_model and callable(clone_selector):
+                provider_selector = clone_selector()
+                override_model = getattr(provider_selector, "override_model", None)
+                if callable(override_model):
+                    override_model(t3_model)
+
+            resolver = getattr(provider_selector, "resolve", None)
+            if not callable(resolver):
+                raise RuntimeError("auto_propose provider selector has no resolve()")
+            provider = resolver()
+            workspace_dir = resolve_agent_workspace_dir(agent_id, config)
+            workspace_str = str(workspace_dir) if workspace_dir else None
+            ctx = _make_auto_propose_tool_context(
+                agent_id=agent_id,
+                workspace_dir=workspace_str,
+            )
+            if svc.tool_registry is None:
+                raise RuntimeError("auto_propose tool registry not configured")
+            if svc.skill_loader is None:
+                raise RuntimeError("auto_propose skill loader not configured")
+            tool_handler = build_tool_handler(svc.tool_registry, ctx)
+            from opensquilla.engine.agent import Agent
+            from opensquilla.engine.types import AgentConfig
+            from opensquilla.skills.creator.proposer import (
+                reset_runtime_e2e_context,
+                reset_smoke_fixture_context,
+                set_runtime_e2e_context,
+                set_smoke_fixture_context,
+            )
+            from opensquilla.skills.creator.runtime_e2e import make_runtime_e2e_context
+
+            auto_model_id = t3_model or resolve_agent_model(agent_id, config)
+            auto_metadata: dict[str, Any] = {
+                "routing_source": "meta_skill_auto_propose",
+                "routing_applied": bool(t3_model),
+            }
+            if t3_model:
+                auto_metadata.update({
+                    "routed_tier": HIGHEST_TEXT_TIER,
+                    "routed_model": t3_model,
+                    "applied_model": t3_model,
+                })
+            if t3_thinking_level:
+                auto_metadata.update({
+                    "thinking_requested": True,
+                    "thinking_level": t3_thinking_level,
+                })
+
+            base_config = AgentConfig(
+                model_id=auto_model_id,
+                workspace_dir=workspace_str,
+                metadata=auto_metadata,
+            )
+            tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            llm_chat = make_llm_chat_from_provider(
+                provider=provider,
+                base_config=base_config,
+                usage_tracker=svc.usage_tracker,
+                session_key=f"auto_propose:{agent_id}",
+            )
+            base_tool_invoker = make_tool_invoker_from_handler(tool_handler=tool_handler)
+            runtime_e2e_ctx = make_runtime_e2e_context(
+                provider=provider,
+                base_config=base_config,
+                skill_loader=svc.skill_loader,
+                tool_definitions=tool_definitions,
+                tool_handler=tool_handler,
+                agent_factory=Agent,
+                llm_chat=llm_chat,
+                tool_invoker=base_tool_invoker,
+                workspace_dir=workspace_str,
+                usage_tracker=svc.usage_tracker,
+                session_key=f"auto_propose:{agent_id}",
+                tool_registry=svc.tool_registry,
+                tool_context=ctx,
+                system_prompt=base_config.system_prompt or "",
+                baseline_model=base_config.model_id or "",
+            )
+
+            async def _tool_invoker(tool_name: str, args: dict[str, Any]) -> Any:
+                if tool_name == "meta_skill_persist_proposal":
+                    args = dict(args)
+                    args.setdefault("home", str(auto_home))
+                    args.setdefault("auto_enable_manual", False)
+                token = set_runtime_e2e_context(runtime_e2e_ctx)
+                smoke_token = set_smoke_fixture_context({"llm_chat": llm_chat})
+                try:
+                    return await base_tool_invoker(tool_name, args)
+                finally:
+                    reset_smoke_fixture_context(smoke_token)
+                    reset_runtime_e2e_context(token)
+
+            return MetaOrchestrator(
+                agent_runner=make_agent_runner_from_parent(
+                    provider=provider,
+                    base_config=base_config,
+                    tool_definitions=tool_definitions,
+                    tool_handler=tool_handler,
+                    agent_factory=Agent,
+                    workspace_dir=workspace_str,
+                    usage_tracker=svc.usage_tracker,
+                    session_key=f"auto_propose:{agent_id}",
+                ),
+                skill_loader=svc.skill_loader,
+                llm_chat=llm_chat,
+                tool_invoker=_tool_invoker,
+                workspace_dir=workspace_str,
+                run_writer=getattr(svc, "meta_run_writer", None),
+                triggered_by=triggered_by,
+                session_key=f"auto_propose:{agent_id}",
+                turn_id=None,
+                usage_tracker=svc.usage_tracker,
+            )
+
+        async def _register_auto_propose_runtime_crons() -> None:
+            await _register_auto_propose_crons(
+                scheduler=svc.cron_scheduler,
+                auto_cfg=auto_cfg,
+                agent_ids=auto_agent_ids,
+            )
+
+        async def _pause_auto_propose_runtime_crons() -> None:
+            await _pause_auto_propose_crons(
+                scheduler=svc.cron_scheduler,
+                agent_ids=auto_agent_ids,
+            )
+
+        async def _post_dream_auto_propose(
+            agent_id: str,
+            dream_summary: str = "",
+        ) -> None:
+            if not bool(getattr(auto_cfg, "on_dream_complete", False)):
+                return
+            result = await auto_propose(
+                orchestrator=_build_auto_propose_orchestrator(
+                    agent_id,
+                    triggered_by="auto_dream",
+                ),
+                skill_loader=cast("SkillLoader", svc.skill_loader),
+                log_dir=auto_log_dir,
+                window_days=auto_cfg.window_days,
+                min_freq=auto_cfg.min_freq,
+                top_k=auto_cfg.top_k,
+                triggered_by="dream",
+                proposals_dir=auto_proposals_dir,
+                auto_enable=bool(getattr(auto_cfg, "auto_enable", False)),
+                auto_enable_max_risk=str(
+                    getattr(auto_cfg, "auto_enable_max_risk", "low"),
+                ),
+                source_context=dream_summary,
+            )
+            log.info(
+                "auto_propose.dream_hook.complete",
+                agent_id=agent_id,
+                summary=result.summary(),
+                proposal_ids=result.proposals_created,
+                enabled_proposal_ids=result.proposals_enabled,
+                skipped=result.skipped,
+                errors=result.errors,
+            )
+
+        agent_handler = make_agent_run_handler(
+            delivery_chain=delivery_chain,
+            turn_runner_ref=lambda: turn_runner,
+            session_manager_ref=lambda: svc.session_manager,
+            task_runtime_ref=lambda: task_runtime,
+            workspace_resolver=_cron_workspace_resolver,
+            default_elevated=lambda: configured_default_elevated(config),
+        )
+        system_handler = make_system_event_handler(
+            delivery_chain=delivery_chain,
+            turn_runner_ref=lambda: turn_runner,
+            session_manager_ref=lambda: svc.session_manager,
+            session_event_emitter=_emit_session_event,
+            heartbeat_service_ref=lambda: heartbeat_service,
+            heartbeat_loop_ref=lambda: heartbeat_loop,
+            workspace_resolver=_cron_workspace_resolver,
+            default_elevated=lambda: configured_default_elevated(config),
+        )
+        static_handler = make_static_message_handler(delivery_chain=delivery_chain)
+        auto_propose_handler = make_auto_propose_handler(
+            build_orchestrator=lambda agent_id: _build_auto_propose_orchestrator(
+                agent_id,
+                triggered_by="auto_cron",
+            ),
+            skill_loader=cast("SkillLoader", svc.skill_loader),
+            log_dir=auto_log_dir,
+            proposals_dir=auto_proposals_dir,
+            config=auto_cfg,
+            enabled_predicate=lambda: bool(getattr(auto_cfg, "enabled", False)),
+        )
+        dream_handler = make_memory_dream_handler(
+            build_dream=build_dream_factory(
+                config=config,
+                turn_runner=turn_runner,
+            ),
+            should_skip=lambda: (
+                "disabled" if not getattr(config.memory.dream, "enabled", False) else None
+            ),
+            post_dream_hook=_post_dream_auto_propose,
+        )
+        svc.cron_scheduler.register_handler("agent_run", agent_handler)
+        svc.cron_scheduler.register_handler("static_message", static_handler)
+        svc.cron_scheduler.register_handler("system_event", system_handler)
+        svc.cron_scheduler.register_handler("memory_dream", dream_handler)
+        svc.cron_scheduler.register_handler("auto_propose", auto_propose_handler)
+        log.info("gateway.cron_handler_registered", handler_key="agent_run")
+        log.info("gateway.cron_handler_registered", handler_key="static_message")
+        log.info("gateway.cron_handler_registered", handler_key="system_event")
+        log.info("gateway.cron_handler_registered", handler_key="memory_dream")
+        log.info("gateway.cron_handler_registered", handler_key="auto_propose")
+
+        # ── Subagent health supervisor (off by default) ────────────────
+        # Watchdog that scans every open spawn group once per tick and
+        # replays the announce for any child whose terminal event was
+        # dropped on the floor by the primary dedup. See
+        # ``subagent_supervisor.py`` for the rationale and the 2026-06-05
+        # hack-deep incident. We attach the supervisor to the
+        # ``ServiceContainer`` so the lifecycle listener (registered
+        # below) can call ``forget_parent_task`` whenever a parent task
+        # ends, preventing stale group state from accumulating.
+        from opensquilla.gateway.subagent_supervisor import (
+            SubagentHealthSupervisor,
+            make_subagent_supervisor_handler,
+        )
+        from opensquilla.scheduler.types import (
+            ScheduleKind as _ScheduleKind,
+            SessionTarget as _SessionTarget,
+        )
+
+        supervisor_cfg = config.subagent_supervisor
+
+        supervisor_cfg = config.subagent_supervisor
+        if supervisor_cfg.enabled:
+            supervisor = SubagentHealthSupervisor(
+                session_manager=svc.session_manager,
+                task_runtime=None,  # bound after task_runtime is constructed below
+                stuck_threshold_seconds=supervisor_cfg.stuck_threshold_seconds,
+                max_retries=supervisor_cfg.max_retries,
+            )
+            supervisor_handler = make_subagent_supervisor_handler(supervisor)
+            svc.cron_scheduler.register_handler("subagent_supervisor", supervisor_handler)
+            log.info(
+                "gateway.subagent_supervisor_enabled",
+                interval_seconds=supervisor_cfg.interval_seconds,
+                stuck_threshold_seconds=supervisor_cfg.stuck_threshold_seconds,
+                max_retries=supervisor_cfg.max_retries,
+            )
+            # Install a single recurring cron at boot. The supervisor
+            # itself tracks per-parent-task state, so a single
+            # instance is enough to monitor every open workflow. The
+            # the per-parent cleanup happens in the lifecycle listener
+            # (wired in ``_make_task_session_lifecycle_listener``),
+            # which is registered later in this function.
+            #
+            # DEDUP: a previous boot may have already registered a
+            # supervisor job (e.g. on the prior gateway run that
+            # crashed or was killed before SIGTERM-cleanup). Skip the
+            # add_job call if one already exists, so a single boot does
+            # not leak extra jobs into the cron DB.
+            try:
+                list_jobs = getattr(svc.cron_scheduler, "list_jobs", None)
+                existing = (
+                    await list_jobs() if callable(list_jobs) else []
+                )
+                has_existing = any(
+                    getattr(j, "name", "") == "subagent_supervisor"
+                    for j in existing
+                )
+                if has_existing:
+                    log.info(
+                        "gateway.subagent_supervisor_cron_already_present",
+                    )
+                else:
+                    await svc.cron_scheduler.add_job(
+                        name="subagent_supervisor",
+                        handler_key="subagent_supervisor",
+                        payload={},
+                        session_target=_SessionTarget.ISOLATED,
+                        schedule_kind=_ScheduleKind.EVERY,
+                        schedule_value=str(supervisor_cfg.interval_seconds),
+                    )
+                    log.info(
+                        "gateway.subagent_supervisor_cron_installed",
+                        interval_seconds=supervisor_cfg.interval_seconds,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "gateway.subagent_supervisor_cron_install_failed",
+                    error=str(exc),
+                )
+        else:
+            supervisor = None
+        svc.subagent_supervisor = supervisor  # type: ignore[attr-defined]
+        # Backfill the lifecycle listener's supervisor_holder so parent
+        # task terminal events trigger ``forget_parent_task``.
+        # ``_lifecycle_supervisor_holder`` is the same mutable list
+        # passed to ``_make_task_session_lifecycle_listener`` earlier.
+        if supervisor is not None:
+            _lifecycle_supervisor_holder[0] = supervisor
+        register_runtime(AutoProposeRuntime(
+            config=auto_cfg,
+            home=auto_home,
+            register_crons=_register_auto_propose_runtime_crons,
+            pause_crons=_pause_auto_propose_runtime_crons,
+        ))
+        await _register_dream_crons(
+            scheduler=svc.cron_scheduler,
+            memory_config=config.memory,
+            agent_ids=_configured_agent_ids(config),
+        )
+        if bool(getattr(auto_cfg, "enabled", False)):
+            await _register_auto_propose_runtime_crons()
+        else:
+            await _pause_auto_propose_runtime_crons()
+
+    # Build channel adapters (don't start yet -- app doesn't exist)
+    webhook_routes: list = []
+    if channel_manager is None and config.channels.channels:
+        from opensquilla.channels.manager import ChannelManager
+        from opensquilla.gateway.event_bridge import EventBridge
+
+        event_bridge = EventBridge(
+            subscription_manager=subscription_manager,
+            connection_registry=get_registry(),
+        )
+        channel_rpc_context_factory = _make_channel_rpc_context_factory(
+            svc,
+            config,
+            subscription_manager=subscription_manager,
+            channel_manager_ref=lambda: _cm_holder[0],
+            turn_runner=turn_runner,
+            heartbeat_service=heartbeat_service,
+            diagnostics_state=diagnostics_state,
+        )
+        channel_manager = ChannelManager.from_config(
+            config.channels.channels,
+            turn_runner=turn_runner,
+            session_manager=svc.session_manager,
+            event_bridge=event_bridge,
+            config=config,
+            task_runtime=task_runtime,
+            rpc_dispatcher=get_dispatcher(),
+            channel_rpc_context_factory=channel_rpc_context_factory,
+        )
+        webhook_routes = channel_manager.collect_webhook_routes()
+        # Populate lazy ref so cron handler can deliver to channels
+        _cm_holder[0] = channel_manager
+        log.info(
+            "gateway.channels_built",
+            count=len(config.channels.channels),
+            webhooks=len(webhook_routes),
+        )
+
+    # Ensure lazy ref covers pre-injected channel_manager too
+    if channel_manager is not None:
+        _cm_holder[0] = channel_manager
+
+    # ── ASGI app ─────────────────────────────────────────────────────
+    app = create_gateway_app(
+        config,
+        session_manager=svc.session_manager,
+        provider_selector=svc.provider_selector,
+        tool_registry=svc.tool_registry,
+        subscription_manager=subscription_manager,
+        channel_manager=channel_manager,
+        usage_tracker=svc.usage_tracker,
+        skill_loader=svc.skill_loader,
+        cron_scheduler=svc.cron_scheduler,
+        turn_runner=turn_runner,
+        task_runtime=task_runtime,
+        flush_service=svc.flush_service,
+        heartbeat_service=heartbeat_service,
+        heartbeat_loop=heartbeat_loop,
+        agent_registry=svc.agent_registry,
+        diagnostics_state=diagnostics_state,
+        memory_managers=svc.memory_managers,
+        memory_stores=svc.memory_stores,
+        memory_retrievers=svc.memory_retrievers,
+        extra_routes=webhook_routes or None,
+    )
+    app.state.gateway_ready = False
+
+    server_handle = GatewayServer(app=app, config=config)
+    server_handle._channel_manager = channel_manager
+    server_handle._services = svc
+    server_handle._background_completion_manager = background_completion_manager
+
+    if run:
+        uvicorn_kwargs: dict[str, Any] = {
+            "app": app,
+            "host": config.host,
+            "port": config.port,
+            "log_level": "info" if not config.debug else "debug",
+        }
+        if config.tls.keyfile and config.tls.certfile:
+            uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile
+            uvicorn_kwargs["ssl_certfile"] = config.tls.certfile
+        uv_config = uvicorn.Config(
+            **uvicorn_kwargs,
+        )
+        server = uvicorn.Server(uv_config)
+        server_handle._server = server
+
+        task = create_background_task(server.serve())
+        server_handle._task = task
+
+        # Warn loudly before the normal started line so operators
+        # see the network-exposure notice even on info-level log streams.
+        if is_public_bind(config.host):
+            log.warning(
+                "gateway.bind.public",
+                host=config.host,
+                port=config.port,
+                message=(
+                    "gateway bound to a wildcard address; reachable from "
+                    "every interface. Opt-in required — only expose behind "
+                    "a trusted reverse proxy or VPN."
+                ),
+            )
+        log.info("gateway.started", host=config.host, port=config.port)
+
+    # Start channels (after app is ready to receive webhooks)
+    if channel_manager is not None:
+        results = await channel_manager.start_all()
+        start_errors_fn = getattr(channel_manager, "start_errors", None)
+        start_errors = start_errors_fn() if start_errors_fn is not None else {}
+        for name, ok in results.items():
+            if ok:
+                log.info("gateway.channel_started", channel=name)
+            else:
+                details = start_errors.get(name, {})
+                log.warning(
+                    "gateway.channel_failed",
+                    channel=name,
+                    error_type=details.get("error_type"),
+                    error=details.get("error"),
+                    exception=details.get("exception"),
+                )
+
+    if run:
+        create_background_task(preload_squilla_router_runtime(config))
+
+    app.state.gateway_ready = True
+    return server_handle

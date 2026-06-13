@@ -1,0 +1,79 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+/dist/
+/build/
+.venv/
+.env
+.env.test
+opensquilla.toml
+.gateway.log
+.gateway-test.html
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+.*/
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+data/
+.opensquilla/
+benchmarks/
+specs/
+# Local agent/editor instructions and runtime state.
+AGENTS.md
+!docs/agents.md
+!src/opensquilla/identity/templates/bootstrap/AGENTS.md
+CLAUDE.md
+GEMINI.md
+.codex
+.codex/
+.claude/
+.omc/
+.omx/
+
+# One-off planning artifacts kept local, not published.
+/PLAN.md
+/SPEC.md
+/prd.json
+/progress.txt
+/plans/
+/docs/superpowers/
+*.png
+# Brand assets are intentionally tracked: top-level assets/ for branding,
+# and the WebUI static asset path so the gateway page renders the mark.
+!/assets/*.png
+!/src/opensquilla/gateway/static/img/*.png
+site/
+/plugins/
+crontab-*
+~/
+/reference-*
+/reference-mem
+/bench-mem
+.omx/
+tests/functional/reports/
+
+# Local-only release-hygiene tests that reference legacy artifact names
+# kept off the public tree.
+/tests/_private/
+
+# Maintainer-local design / planning artifacts kept beside the repo but
+# not part of the published source. Move into /docs/proposals/ if/when
+# they are ready for public consumption.
+/meta-skills.pptx
+/kb-index.xlsx
+
+# Generated local outputs from document/meta-skill smoke runs.
+/texput.log
+/src/opensquilla/skills/bundled/multi-search-engine/Tokyo_5日出差行程.docx
+
+# Local-only fetcher for the clawhub skills imported into bundled/.
+# The bundled copies are tracked; the raw zip downloads and the fetch
+# helper stay out of the published tree.
+/_clawhub_skills/
+/scripts/_fetch_clawhub_skills.py

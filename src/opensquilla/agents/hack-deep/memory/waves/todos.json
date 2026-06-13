@@ -1,0 +1,16 @@
+{
+  "target": "51ifind.com + all subdomains",
+  "mode": "parallel",
+  "waves": {
+    "W0": {"task": "engagement-planning", "status": "completed", "completed": true},
+    "W1": {"task": "recon || intel-collection || attack-surface-enumeration", "status": "in_progress", "completed": false},
+    "W1.3": {"task": "attack-surface-enumeration", "status": "in_progress", "completed": false},
+    "W2": {"task": "vulnerability-triage", "status": "pending", "completed": false},
+    "W3": {"task": "opsec-evasion", "status": "pending", "completed": false},
+    "W4": {"task": "penetration (sub-tracks dynamic)", "status": "pending", "completed": false},
+    "W5": {"task": "privilege-escalation", "status": "pending", "completed": false},
+    "W6": {"task": "lateral-movement", "status": "pending", "completed": false},
+    "W7": {"task": "persistence-maintenance || impact-exfiltration", "status": "pending", "completed": false},
+    "W8": {"task": "cleanup-rollback || reporting-remediation", "status": "pending", "completed": false}
+  }
+}
