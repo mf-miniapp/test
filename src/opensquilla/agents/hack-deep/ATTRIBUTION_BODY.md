@@ -6,21 +6,28 @@ attribution documents only the v3.1 differences.
 
 ## 13 Specialist `evidence_schema` Reference
 
-| agent_id | evidence_schema | Added fields (v3.1) |
+| agent_id | evidence_schema | Added fields (v3.1) — **hack-deep owns 4 specialists only** |
 | --- | --- | --- |
 | engagement-planning | `roe-v1` | + `success_unit: per-port \| per-host \| per-domain` |
-| recon | `recon-v1` | + `infra_sharing: [{subdomain, ip, asn, cidr, ssl_cert_fp, js_bundle_hash}]` |
-| intel-collection | `intel-v1` | (unchanged) |
-| attack-surface-enumeration | `surface-v1` | (unchanged) |
 | vulnerability-triage | `triage-v1` | (unchanged) |
 | opsec-evasion | `opsec-v1` | + `per_target_group: [{group_id, strategy, stop_signal}]` |
-| penetration | `pentest-v1` | (dynamic sub-tracks; no fixed count) — v3.2 (2026-06-07) fully typed: every finding has `cvss` (3.1 base + vector), `classification` (CWE/OWASP/MITRE/technique), `auth_context` (anonymous/admin/...), `request`+`response` (full PoC capture), `reproduce_steps` (structured, NOT free-text), `chain_id`/`follows_from`/`enables`, `roe_violation`, `tool_used`+`manual_effort_minutes`, `cleanup_*` fields, `discovered_by`+`discovered_at`. `footholds` typed with `type`/`persistence_level`/`cleanup_difficulty`. New `methodology_steps` (PTES-aligned), `coverage_gaps`, `suggested_drill_in`, `out_of_scope_hits`+`scope_violations`, `rate_limit_per_vector` (per-vector). |
-| privilege-escalation | `privesc-v1` | (unchanged) |
-| lateral-movement | `lateral-v1` | (reads `recon`'s `infra_sharing` for cross-subdomain) |
-| persistence-maintenance | `persist-v1` | (v3.3 2026-06-08 fully typed) — see PersistEvidence: `topology_map` (list[TopologyHop] = client→edge→...→backend), `options` (list[PersistenceOption] with 16 fields incl. `mechanism` enum 40+ values, `output_target` (OutputTarget: location = response_header\|body\|error_log\|access_log\|written_file\|jwt_token\|cookie\|database_row\|external_artifact\|process_state\|kernel_object, path, expected_marker), `expected_behavior` (map: connect=403 / http_proxy=301 etc. — fixes the CONNECT false-negative), `antipatterns` (list[str] — things that LOOK like failures but are not), `pass_criteria` (list[PassCriterion] with kind enum 11 values + expected + description), `verification_script` (ONE complete script — no v1→v2→v3→v4 iteration), `validation_outcome` (pass\|warn\|fail\|in_progress\|blocked — set ONCE, not iterated), `verification_timing` (read_after_s ≥ 2 / poll_attempts ≥ 3 / poll_interval_s ≈ 1 — fixes the file-write race), `parallel_verification` (bool), `cache_key` (composite key for re-runs), `raw_evidence` (structured: proof_type + proof_content + captured_at — replaces grep/head mixing), `cleanup_difficulty` (trivial\|easy\|moderate\|hard\|irreversible), `cleanup_notes`, `discovered_by` + `discovered_at`, `manual_effort_minutes`, `depends_on_foothold` (foothold_id from pentest-v1). Top-level: `antipattern_log`, `parallel_verification_used`, `cache_keys_emitted`. Backward-compat: old dict-shaped options are coerced by Pydantic; the schema name stays `persist-v1`. |
-| impact-exfiltration | `impact-v1` | (unchanged) |
-| cleanup-rollback | `cleanup-v1` | (unchanged) |
-| reporting-remediation | `report-v1` | + `per_target_finding: [{entry_id, status, evidence_ref, impact_ref}]` |
+| penetration | `pentest-v1` | (dynamic sub-tracks; no fixed count) — v3.2 (2026-06-07) fully typed: every finding has `cvss` (3.1 base + vector), `classification` (CWE/OWASP/MITRE/technique), `auth_context` (anonymous/admin/...), `request`+`response` (full PoC capture), `reproduce_steps` (structured, NOT free-text), `chain_id`/`follows_from`/`enables`, `roe_violation`, `tool_used`+`manual_effort_minutes`, `cleanup_*` fields, `discovered_by`+`discovered_at`. `footholds` typed with `type`/`persistence_level`/`cleanup_difficulty`. New `methodology_steps` (PTES-aligned), `coverage_gaps`, `suggested_drill_in`, `out_of_scope_hits`+`scope_violations`, `rate_limit_per_vector` (per-vector). penetration 还可引用 `hunt-skill` (bundled skill, 6 类漏洞 hunting knowledge) 用于 PoC 构造; see `src/opensquilla/skills/bundled/hunt-skill/SKILL.md`。 |
+
+**2026-06-15 3-harness split — 9 specialists moved to other owners**:
+
+| agent_id | evidence_schema | new owner | migration note |
+| --- | --- | --- | --- |
+| recon | `recon-v1` | **hack-deep-find** | W1 改为 delegate 到 hack-deep-find; recon specialist 不再从 hack-deep spawn |
+| intel-collection | `intel-v1` | **hack-deep-find** | 同上 |
+| attack-surface-enumeration | `surface-v1` | **hack-deep-find** | 同上 |
+| privilege-escalation | `privesc-v1` | **hack-deep-ex** | W5 yield 到 hack-deep-ex |
+| lateral-movement | `lateral-v1` | **hack-deep-ex** | W6 yield; reads W1 `infra_sharing` (via post-exploit-complete-v1 handoff from hack-deep) |
+| persistence-maintenance | `persist-v1` | **hack-deep-ex** | W7 yield; v3.3 fully typed |
+| impact-exfiltration | `impact-v1` | **hack-deep-ex** | W7 yield |
+| cleanup-rollback | `cleanup-v1` | **hack-deep-ex** | W8 yield |
+| reporting-remediation | `report-v1` | **hack-deep-ex** | W8 yield; v1.0 加 7-Question Gate 字段 |
+
+runtime `check_authorization` 强制: hack-deep 直接 spawn 这 9 个 specialist 会抛 `UnauthorizedOwnerError`。正确做法见 hack-deep/SOUL_BODY.md § Cross-Owner Protocol。
 
 ## 7 Granular Fix Markers
 
