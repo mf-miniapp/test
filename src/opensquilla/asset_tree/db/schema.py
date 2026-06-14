@@ -1,4 +1,8 @@
-"""AssetTree relational schema (SQLAlchemy Core, MySQL 8.0+ / SQLite 3.38+).
+"""AssetTree relational schema (SQLAlchemy Core, MySQL 8.0+).
+
+AssetTree is MySQL-only. The schema is defined once via SQLAlchemy Core
+(the single source of truth used by the runtime) and mirrored as raw
+MySQL DDL in ``DDL_STATEMENTS`` (for ops/migration tools).
 
 Design summary
 ==============
@@ -24,7 +28,7 @@ Why JSON for ``metadata``?
 - Per-type fields are heterogeneous (sub_domain has DNS records, port has
   banner, service has version/CPE). A relational pivot table would add
   5+ tables and zero query wins for a 200-node tree.
-- MySQL 8.0 and SQLite 3.38+ both support JSON column type natively.
+- MySQL 8.0+ supports the native JSON column type with indexable paths.
 - Replaces the previous ``AssetNode.metadata: dict[str, Any]`` field 1:1.
 
 Hot query → covering index mapping
@@ -46,7 +50,7 @@ Hot query → covering index mapping
 Naming convention
 =================
 - All tables prefixed with ``asset_`` to avoid collision with other systems
-  sharing the same MySQL instance.
+  sharing the same MySQL instance. (AssetTree is MySQL-only.)
 - All foreign keys cascade-delete: removing a tree removes all its
   nodes / edges / evidence refs / state transitions.
 - All timestamps ``DATETIME(6)`` (microsecond precision) to disambiguate
@@ -80,8 +84,7 @@ from sqlalchemy.dialects.mysql import (
 )
 
 
-# Single MetaData namespace for all AssetTree tables. Naming convention
-# preserves the MySQL convention even on SQLite (where it's just a label).
+# Single MetaData namespace for all AssetTree tables.
 _metadata = MetaData(
     naming_convention={
         "ix": "ix_%(table_name)s_%(column_0_label)s",
@@ -94,7 +97,6 @@ _metadata = MetaData(
 
 # Use MySQL-specific TINYINT UNSIGNED for ``path_depth`` / ``child_order``
 # (saves 3 bytes per row vs INT) and BIGINT UNSIGNED for the audit log.
-# On SQLite the dialect falls back to INTEGER transparently.
 
 
 # ── Trees ──────────────────────────────────────────────────────────
@@ -152,7 +154,7 @@ asset_nodes = Table(
     # 512 chars handles depth-50 trees with 10-char ids (50*11 = 550, padded).
     Column("material_path", String(512), nullable=False),
     # 0 = root, 1 = sub_domain, ..., 5 = endpoint. Use TINYINT UNSIGNED on
-    # MySQL for 1-byte storage; falls back to SMALLINT on SQLite.
+    # MySQL TINYINT UNSIGNED for 1-byte storage of path_depth / child_order.
     Column("path_depth", SmallInteger, nullable=False, server_default="0"),
     Column("source_wave", String(128), nullable=True),
     Column("assigned_wave", String(128), nullable=True),
@@ -271,16 +273,12 @@ asset_edges = Table(
 asset_state_transitions = Table(
     "asset_state_transitions",
     _metadata,
-    # BIGINT UNSIGNED auto-increment PK on MySQL (8 bytes), INTEGER on
-    # SQLite (4 bytes; plenty for audit log volumes). Uses SQLAlchemy
-    # 2.0 Identity() so the dialect picks the correct autoincrement
-    # strategy (AUTOINCREMENT on SQLite, AUTO_INCREMENT on MySQL).
+    # BIGINT UNSIGNED auto-increment PK on MySQL (8 bytes; large range
+    # for audit log volumes). SQLAlchemy emits AUTO_INCREMENT.
     Column(
         "id",
-        # INTEGER on SQLite (4 bytes; auto-increments), BIGINT UNSIGNED
-        # on MySQL (8 bytes; auto-increments). SQLAlchemy needs
-        # ``autoincrement=True`` paired with the dialect's integer
-        # variant to emit ``AUTOINCREMENT`` / ``AUTO_INCREMENT``.
+        # BIGINT UNSIGNED on MySQL (8 bytes; auto-increments).
+        # ``autoincrement=True`` is required to emit AUTO_INCREMENT.
         Integer().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"),
         primary_key=True,
         autoincrement=True,

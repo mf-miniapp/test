@@ -18,18 +18,18 @@
 两种使用方式::
 
     # Python API
-    from opensquilla.asset_tree.db import SqliteBackend, build_engine_from_url, build_session_factory
+    from opensquilla.asset_tree.db import MysqlBackend, build_engine_from_url, build_session_factory
     from opensquilla.asset_tree.migrate_endpoints_to_url import migrate
 
-    engine = build_engine_from_url("sqlite+aiosqlite:///tmp/asset_tree.db")
+    engine = build_engine_from_url("mysql+aiomysql://user:pass@host:3306/opensquilla")
     factory = build_session_factory(engine)
-    backend = SqliteBackend(engine, factory)
+    backend = MysqlBackend(engine, factory)
     report = asyncio.run(migrate(backend, dry_run=False))
     print(report)
 
     # CLI
     python -m opensquilla.asset_tree.migrate_endpoints_to_url \
-        --url sqlite+aiosqlite:///tmp/asset_tree.db --dry-run
+        --url 'mysql+aiomysql://user:pass@host:3306/opensquilla' --dry-run
 """
 from __future__ import annotations
 
@@ -209,24 +209,26 @@ async def _patch_endpoint_meta(
     """在 endpoint.metadata 上写入迁移溯源，保留旧字段。"""
     engine = backend._engine  # type: ignore[attr-defined]
     async with engine.begin() as conn:
-        # 读现有 metadata (SQLite 端走 JSON 提取)
+        # 读现有 metadata。MySQL JSON 列直接返回 dict（SQLAlchemy 自动反序列化）。
         row = await conn.execute(
             text("SELECT metadata FROM asset_nodes WHERE tree_id=:t AND id=:i"),
             {"t": tree_id, "i": node_id},
         )
-        cur = row.scalar() or "{}"
-        # SQLAlchemy JSON 字段在 SQLite 返回 str；在 MySQL 返回 dict。这里统一处理。
+        cur = row.scalar()
         import json as _json
-        if isinstance(cur, str):
-            meta = _json.loads(cur) if cur else {}
+        if cur is None or cur == "":
+            meta = {}
+        elif isinstance(cur, str):
+            meta = _json.loads(cur)
         else:
-            meta = dict(cur) if cur else {}
+            meta = dict(cur)
         meta["_migrated_from"] = old_service_id
         meta["migrated_at"] = _utcnow_iso()
         await conn.execute(
             text("UPDATE asset_nodes SET metadata=:m WHERE tree_id=:t AND id=:i"),
             {"m": _json.dumps(meta, ensure_ascii=False), "t": tree_id, "i": node_id},
         )
+        # NOTE: SQLAlchemy 与 aiomysql 配合时，dict 参数会自动 JSON-serialize。
 
 
 async def _verify_no_service_to_endpoint(backend: AssetTreeBackend, tree_id: str) -> list[str]:
@@ -321,8 +323,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--url",
         default=None,
-        help="SQLAlchemy DB URL. Defaults to $ASSET_TREE_DB_URL or "
-             "sqlite+aiosqlite:///tmp/asset_tree_default.db.",
+        help="MySQL SQLAlchemy DB URL, e.g. "
+             "'mysql+aiomysql://user:pass@host:3306/opensquilla'. "
+             "Defaults to $ASSET_TREE_DB_URL (required).",
     )
     p.add_argument(
         "--dry-run",
@@ -348,15 +351,11 @@ async def _amain() -> int:
         build_session_factory,
     )
 
-    engine = build_engine_from_url(args.url)
+    engine = build_engine_from_url(args.url)  # validates MySQL URL
     factory = build_session_factory(engine)
+    from opensquilla.asset_tree.db.backend import MysqlBackend
+    backend = MysqlBackend(engine, factory)
     url = str(engine.url)
-    if url.startswith("sqlite"):
-        from opensquilla.asset_tree.db.backend import SqliteBackend
-        backend = SqliteBackend(engine, factory)
-    else:
-        from opensquilla.asset_tree.db.backend import MysqlBackend
-        backend = MysqlBackend(engine, factory)
 
     try:
         report = await migrate(backend, dry_run=args.dry_run)

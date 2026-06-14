@@ -1,14 +1,11 @@
 """Async connection-pool factory for the AssetTree DB.
 
-The default URL is read from ``ASSET_TREE_DB_URL``. Examples::
+The DB URL is read from ``ASSET_TREE_DB_URL`` and MUST be a MySQL
+``mysql+aiomysql://`` URL — SQLite is not supported by AssetTree.
 
-    # MySQL (production)
+Examples::
+
     export ASSET_TREE_DB_URL='mysql+aiomysql://opensquilla:secret@db.local:3306/opensquilla'
-
-    # SQLite (tests / single-process dev)
-    export ASSET_TREE_DB_URL='sqlite+aiosqlite:////tmp/asset_tree.db'
-
-Both dialects compile the SAME SQLAlchemy schema defined in ``schema.py``.
 """
 
 from __future__ import annotations
@@ -23,65 +20,66 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
+class AssetTreeConfigError(RuntimeError):
+    """Raised when AssetTree is asked to use an unsupported DB dialect.
+
+    AssetTree only supports MySQL (production). SQLite URLs are rejected
+    at the factory boundary to prevent accidental misuse.
+    """
+
+
 def default_db_url() -> str:
-    """Resolve the default DB URL from env (fallback: sqlite in tmp)."""
-    url = os.environ.get("ASSET_TREE_DB_URL")
-    if url:
-        return url
-    # Fallback for dev: per-process sqlite so concurrent processes don't collide
-    import tempfile
-    return "sqlite+aiosqlite:///" + os.path.join(tempfile.gettempdir(), "asset_tree_default.db")
+    """Resolve the default DB URL from ``ASSET_TREE_DB_URL``.
+
+    Raises:
+        AssetTreeConfigError: if the env var is unset/empty, or points
+            to a non-MySQL URL. AssetTree is MySQL-only.
+    """
+    url = os.environ.get("ASSET_TREE_DB_URL", "").strip()
+    if not url:
+        raise AssetTreeConfigError(
+            "ASSET_TREE_DB_URL is not set. AssetTree requires a MySQL URL, "
+            "e.g. 'mysql+aiomysql://user:pass@host:3306/opensquilla'."
+        )
+    if not url.startswith("mysql"):
+        raise AssetTreeConfigError(
+            f"AssetTree only supports MySQL (got URL: {url!r}). "
+            "Set ASSET_TREE_DB_URL to a 'mysql+aiomysql://...' connection string."
+        )
+    return url
 
 
 def build_engine_from_url(url: str | None = None, **kwargs: Any) -> AsyncEngine:
-    """Create an async engine + session factory for the given DB URL.
+    """Create an async engine for the given MySQL DB URL.
 
     Args:
         url: SQLAlchemy URL string. ``None`` → ``default_db_url()``.
         **kwargs: forwarded to ``create_async_engine`` (e.g. pool_size).
 
-    Connection-pool defaults:
-        - MySQL: pool_size=10, pool_recycle=1800 (30 min, MySQL's wait_timeout)
-        - SQLite: NullPool (sqlite doesn't share connections across threads)
-
-    SQLite-specific:
-      SQLite ignores ``ON DELETE CASCADE`` unless ``PRAGMA foreign_keys``
-      is ON for each connection. We wire a connect-listener to set
-      that pragma for every new connection.
+    Connection-pool defaults (MySQL only):
+        - pool_size=10
+        - max_overflow=5
+        - pool_recycle=1800 (30 min, MySQL's wait_timeout)
+        - pool_timeout=30
+        - pool_pre_ping=True
     """
-    from sqlalchemy import event
-    from sqlalchemy.engine import Engine
-
     url = url or default_db_url()
-    is_sqlite = url.startswith("sqlite")
+    if not url.startswith("mysql"):
+        raise AssetTreeConfigError(
+            f"AssetTree only supports MySQL (got URL: {url!r})."
+        )
 
     engine_kwargs: dict[str, Any] = {
         "echo": False,
         "future": True,
-        "pool_pre_ping": True,  # detect stale connections
+        "pool_pre_ping": True,
+        "pool_size": kwargs.get("pool_size", 10),
+        "max_overflow": kwargs.get("max_overflow", 5),
+        "pool_recycle": kwargs.get("pool_recycle", 1800),
+        "pool_timeout": kwargs.get("pool_timeout", 30),
     }
-    if is_sqlite:
-        engine_kwargs["poolclass"] = None  # NullPool; SQLite can't share across threads
-    else:
-        engine_kwargs["pool_size"] = kwargs.get("pool_size", 10)
-        engine_kwargs["max_overflow"] = kwargs.get("max_overflow", 5)
-        engine_kwargs["pool_recycle"] = kwargs.get("pool_recycle", 1800)
-        engine_kwargs["pool_timeout"] = kwargs.get("pool_timeout", 30)
-
     engine_kwargs.update({k: v for k, v in kwargs.items() if k not in engine_kwargs})
-    engine = create_async_engine(url, **engine_kwargs)
-
-    if is_sqlite:
-        # Enable FK enforcement per connection. PRAGMA foreign_keys is
-        # a connection-level setting; we attach to the underlying sync
-        # engine's "connect" event.
-        @event.listens_for(engine.sync_engine, "connect")
-        def _enable_sqlite_fk(dbapi_connection: Any, _: Any) -> None:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
-
-    return engine
+    return create_async_engine(url, **engine_kwargs)
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[Any]:

@@ -49,8 +49,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--url",
         default=None,
-        help="SQLAlchemy DB URL. Defaults to $ASSET_TREE_DB_URL or "
-             "sqlite+aiosqlite:///tmp/asset_tree_default.db.",
+        help="MySQL SQLAlchemy DB URL, e.g. "
+             "'mysql+aiomysql://user:pass@host:3306/opensquilla'. "
+             "Defaults to $ASSET_TREE_DB_URL (required).",
     )
     p.add_argument(
         "--reset",
@@ -77,15 +78,11 @@ async def _amain() -> int:
         build_session_factory,
     )
 
-    engine = build_engine_from_url(args.url)
+    engine = build_engine_from_url(args.url)  # validates MySQL URL
     factory = build_session_factory(engine)
+    from opensquilla.asset_tree.db.backend import MysqlBackend
+    backend = MysqlBackend(engine, factory)
     url = str(engine.url)
-    if url.startswith("sqlite"):
-        from opensquilla.asset_tree.db.backend import SqliteBackend
-        backend = SqliteBackend(engine, factory)
-    else:
-        from opensquilla.asset_tree.db.backend import MysqlBackend
-        backend = MysqlBackend(engine, factory)
 
     try:
         if args.reset:

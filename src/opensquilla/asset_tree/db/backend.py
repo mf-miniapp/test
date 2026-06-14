@@ -1,15 +1,9 @@
-"""AssetTree backend abstraction — MySQL (prod) + SQLite (test) backends.
+"""AssetTree backend abstraction — MySQL only.
 
 A backend encapsulates all DB operations against the relational schema
 defined in ``schema.py``. The ``AssetTree`` in-memory class is a session
-cache; persistence goes through one of these backends.
-
-Backend selection:
-- ``MysqlBackend``  — production (aiomysql driver, ``mysql+aiomysql://`` URL)
-- ``SqliteBackend`` — tests / single-process dev (aiosqlite driver)
-
-Both backends speak the same SQLAlchemy async API; switching is purely
-a URL change.
+cache; persistence goes through ``MysqlBackend`` (the only supported
+backend, ``mysql+aiomysql://`` URL).
 """
 
 from __future__ import annotations
@@ -23,7 +17,6 @@ from typing import Any, AsyncIterator, Optional
 
 from sqlalchemy import select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -132,7 +125,7 @@ class AssetTreeBackend(ABC):
         ``parent_id``: ``None`` means "no parent" (root layer). The
         backend translates this to the empty-string sentinel internally
         so the UNIQUE dedup constraint can be enforced (NULL values in
-        a UNIQUE constraint are never equal in either MySQL or SQLite).
+        a UNIQUE constraint are never equal in MySQL).
         """
 
     @abstractmethod
@@ -239,11 +232,7 @@ class AssetTreeBackend(ABC):
 
 
 class _SqlAlchemyBackend(AssetTreeBackend):
-    """Common SQLAlchemy 2.0 async implementation.
-
-    Both MySQL and SQLite backends share this; the only difference is the
-    dialect-specific INSERT...ON CONFLICT / INSERT...ON DUPLICATE KEY UPDATE.
-    """
+    """Common SQLAlchemy 2.0 async implementation. MySQL only."""
 
     _INSERT_DIALECT_ATTR: str = ""  # set by subclasses
 
@@ -264,7 +253,7 @@ class _SqlAlchemyBackend(AssetTreeBackend):
 
         We use ``MetaData.create_all`` instead of raw DDL because raw
         MySQL ``ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`` syntax is
-        rejected by SQLite. After creation, on MySQL we additionally run
+        After creation we additionally run
         ``ALTER TABLE ... ENGINE=InnoDB`` to ensure the production
         storage engine is set even when SQLAlchemy's CREATE TABLE
         omitted it (it sometimes does for indexes-only diffs).
@@ -383,8 +372,8 @@ class _SqlAlchemyBackend(AssetTreeBackend):
 
         Translates ``parent_id=None`` to ``""`` (NOT NULL sentinel) so
         the UNIQUE dedup constraint can enforce uniqueness at the DB
-        layer — both MySQL and SQLite treat NULLs as distinct in UNIQUE
-        indexes, which would silently allow duplicate root nodes.
+        layer — MySQL treats NULLs as distinct in UNIQUE indexes, which
+        would silently allow duplicate root nodes.
         """
         parent_sentinel = parent_id if parent_id is not None else ""
 
@@ -426,9 +415,8 @@ class _SqlAlchemyBackend(AssetTreeBackend):
                 return True
             except IntegrityError as exc:
                 # UNIQUE dedup constraint — node already exists.
-                # Both MySQL ("Duplicate entry") and SQLite ("UNIQUE
-                # constraint failed") embed identifying info in the
-                # exception; we accept any IntegrityError from a node
+                # MySQL ("Duplicate entry") embeds identifying info in
+                # the exception; we accept any IntegrityError from a node
                 # insert path as a dedup hit.
                 err_str = str(exc).upper() + " " + str(exc.orig).upper()
                 if "UNIQUE" in err_str:
@@ -765,10 +753,8 @@ class _SqlAlchemyBackend(AssetTreeBackend):
     # ── Helpers ────────────────────────────────────────────────
 
     def _insert_dialect(self, table: Any) -> Any:
-        """Return dialect-specific INSERT builder."""
-        if self._INSERT_DIALECT_ATTR == "mysql":
-            return mysql_insert(table)
-        return sqlite_insert(table)
+        """Return dialect-specific INSERT builder. MySQL only."""
+        return mysql_insert(table)
 
     def _row_to_node(self, mapping: Any) -> NodeRow:
         """Convert a SQLAlchemy row mapping to a NodeRow.
@@ -808,19 +794,6 @@ class MysqlBackend(_SqlAlchemyBackend):
     _INSERT_DIALECT_ATTR = "mysql"
 
 
-class SqliteBackend(_SqlAlchemyBackend):
-    """SQLite backend — tests + single-process dev.
-
-    Default URL: ``sqlite+aiosqlite:////tmp/asset_tree.db``. Uses
-    ``INSERT ... ON CONFLICT DO UPDATE`` for upsert.
-
-    SQLite has no TINYINT/SMALLINT distinction; depth/order columns fall
-    back to INTEGER. JSON columns are stored as TEXT — the
-    ``_row_to_node`` helper parses them back on read.
-    """
-
-    _INSERT_DIALECT_ATTR = "sqlite"
-
 
 # ── Default factory ────────────────────────────────────────────
 
@@ -849,10 +822,14 @@ def get_default_backend() -> AssetTreeBackend:
             url = default_db_url()
             engine = build_engine_from_url(url)
             factory = build_session_factory(engine)
-            if url.startswith("sqlite"):
-                backend: AssetTreeBackend = SqliteBackend(engine, factory)
-            else:
-                backend = MysqlBackend(engine, factory)
+            # pool.default_db_url() already validates and rejects non-MySQL,
+            # but we double-check here to make the intent explicit.
+            if not url.startswith("mysql"):
+                from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+                raise AssetTreeConfigError(
+                    f"AssetTree only supports MySQL (got URL: {url!r})."
+                )
+            backend: AssetTreeBackend = MysqlBackend(engine, factory)
             # Auto-migrate on first init so callers don't have to.
             try:
                 import asyncio as _asyncio

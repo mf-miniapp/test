@@ -2,8 +2,8 @@
 
 See sibling modules:
 - ``schema.py``   : SQLAlchemy Core table definitions (single source of truth)
-- ``pool.py``     : async engine factory + connection-pool config
-- ``backend.py``  : ``AssetTreeBackend`` ABC + ``MysqlBackend`` + ``SqliteBackend``
+- ``pool.py``     : async engine factory + connection-pool config (MySQL only)
+- ``backend.py``  : ``AssetTreeBackend`` ABC + ``MysqlBackend``
 - ``migrations.py``: idempotent table / index creation
 - ``ddl.sql``     : raw MySQL DDL for ops / migration tool
 """
@@ -11,10 +11,10 @@ See sibling modules:
 from opensquilla.asset_tree.db.backend import (
     AssetTreeBackend,
     MysqlBackend,
-    SqliteBackend,
     get_default_backend,
 )
 from opensquilla.asset_tree.db.pool import (
+    AssetTreeConfigError,
     build_engine_from_url,
     build_session_factory,
     default_db_url,
@@ -29,10 +29,10 @@ from opensquilla.asset_tree.db.schema import (
 )
 
 __all__ = [
-    "DDL_STATEMENTS",
+    "AssetTreeConfigError",
     "AssetTreeBackend",
+    "DDL_STATEMENTS",
     "MysqlBackend",
-    "SqliteBackend",
     "asset_edges",
     "asset_evidence_refs",
     "asset_nodes",

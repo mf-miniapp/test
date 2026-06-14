@@ -1,9 +1,8 @@
 # AssetTree MySQL Persistence — Design Document
 
 > **Phase 4 (2026-06-14)** — replaces the prior JSON-file persistence
-> with enterprise-grade MySQL storage. SQLite is supported as a
-> dialect-equivalent test backend; both share the same SQLAlchemy Core
-> schema and migration runner.
+> with enterprise-grade MySQL storage. AssetTree is MySQL-only; the
+> only supported driver is ``aiomysql`` (``mysql+aiomysql://`` URL).
 
 ---
 
@@ -11,7 +10,7 @@
 
 - **MySQL as the source of truth** for all `AssetTree` state (replaces
   the prior JSON snapshot in `~/.opensquilla/state/asset_trees/`).
-- **SQLite parity** for CI / dev runs (no MySQL server required).
+- **MySQL only** — non-MySQL URLs are rejected at the pool factory.
 - **Hot-query coverage** via 11+ indexes mapped to every read path.
 - **Dedup invariant enforced at the DB layer** (UNIQUE on
   `(tree_id, asset_type, parent_id, value)`).
@@ -23,9 +22,9 @@
 
 | Layer | Driver | Why |
 |---|---|---|
-| Query abstraction | SQLAlchemy 2.0 Core | Single schema → MySQL or SQLite dialect automatically |
+| Query abstraction | SQLAlchemy 2.0 Core | Single schema compiles to MySQL DDL |
 | Production async | `aiomysql` (already in project deps via `pyproject.toml`) | Native asyncio, matches the rest of the codebase |
-| Test async | `aiosqlite` (already installed) | No external server required |
+| Test async | Same `aiomysql` driver against a test MySQL instance | Set `TEST_MYSQL_URL` to point at a test server |
 | Async glue | `sqlalchemy.ext.asyncio.AsyncEngine` + `async_sessionmaker` | Standard SQLAlchemy 2.0 pattern |
 
 `greenlet` is a runtime dep of SQLAlchemy async; it was added to
@@ -103,7 +102,7 @@ SQLAlchemy Core definitions and `DDL_STATEMENTS` for the raw MySQL DDL.
 
 | # | Query | Index used | Notes |
 |---|---|---|---|
-| 1 | `add_node` dedup | `uq_asset_nodes_dedup` (UNIQUE on `(tree_id, asset_type, parent_id, value)`) | Root layer uses `""` sentinel so the UNIQUE applies (NULL is never equal in either MySQL or SQLite). |
+| 1 | `add_node` dedup | `uq_asset_nodes_dedup` (UNIQUE on `(tree_id, asset_type, parent_id, value)`) | Root layer uses `""` sentinel so the UNIQUE applies (MySQL treats NULL as never equal in UNIQUE). |
 | 2 | `find_node(asset_type, value)` (root layer) | `ix_asset_nodes_tree_value` + `parent_id == ""` filter | Hits the value index, then filters root-layer rows. |
 | 3 | `find_nodes_by_value(value)` | `ix_asset_nodes_tree_value` | Cross-parent lookup. |
 | 4 | `find_unseen(asset_type?)` | `ix_asset_nodes_tree_state` (+ `ix_asset_nodes_tree_type` when filter is set) | The hot "next wave" query. |
@@ -125,8 +124,8 @@ Plus tree-level indexes:
 passing `None` get translated to `""` at the `backend.add_node` boundary
 and back to `None` on read.
 
-This works because **both MySQL and SQLite treat `NULL` as distinct in
-UNIQUE constraints** — a `NULL parent_id` row would allow duplicate
+This works because **MySQL treats `NULL` as distinct in UNIQUE
+constraints** — a `NULL parent_id` row would allow duplicate
 root-layer nodes with the same `(tree_id, asset_type, value)` triple,
 defeating the dedup invariant. The empty-string sentinel restores
 correctness at the cost of one tiny indirection at the API boundary.
@@ -147,20 +146,18 @@ correctness at the cost of one tiny indirection at the API boundary.
 
 ## 6. Connection pool configuration
 
-| Setting | MySQL | SQLite |
-|---|---|---|
-| `pool_size` | 10 | (NullPool — SQLite doesn't share connections across threads) |
-| `max_overflow` | 5 | n/a |
-| `pool_recycle` | 1800s (MySQL `wait_timeout`) | n/a |
-| `pool_timeout` | 30s | n/a |
-| `pool_pre_ping` | True (detect stale conns) | True |
-| `PRAGMA foreign_keys` | n/a (InnoDB enforces FKs) | `ON` per connection (event listener) |
+| Setting | MySQL |
+|---|---|
+| `pool_size` | 10 |
+| `max_overflow` | 5 |
+| `pool_recycle` | 1800s (MySQL `wait_timeout`) |
+| `pool_timeout` | 30s |
+| `pool_pre_ping` | True (detect stale conns) |
+| `PRAGMA foreign_keys` | n/a (InnoDB enforces FKs natively) |
 
 URL examples:
 ```
 mysql+aiomysql://opensquilla:secret@db.host:3306/opensquilla
-sqlite+aiosqlite:////var/lib/opensquilla/asset_tree.db
-sqlite+aiosqlite:///:memory:        # ephemeral test backend
 ```
 
 ## 7. Migration runner
@@ -201,9 +198,9 @@ write path.
 - Stats summary.
 - Concurrency: 100 concurrent inserts of the same (tree, type, value) → 1 winner.
 
-The SQLite backend (`sqlite+aiosqlite:///`) covers all paths; the
-MySQL backend shares the same `SqlAlchemyBackend` parent class so
-dialect-level differences are exercised at integration time.
+All paths are exercised against a real MySQL server (see
+``TEST_MYSQL_URL`` in ``conftest.py``). The single ``_SqlAlchemyBackend``
+parent class keeps the test surface uniform across MySQL minor versions.
 
 ## 10. Migration path for existing data
 
