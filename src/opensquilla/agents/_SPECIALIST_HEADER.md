@@ -180,4 +180,58 @@ specialist's own SOUL.md. The pattern is:
 ## RESULT MARKER 样例
 ...
 ```
+
+## 🚨 Self-Throttling Anti-Patterns (redteam-mindset adoption, 2026-06-14)
+
+> Adopted from `Claude-BugHunter/skills/redteam-mindset` (MIT).
+> These 10 anti-patterns are the *failure modes a specialist
+> drifts into during a long run* — they are NOT the same as the
+> 7 forbidden behaviors above (which are *hard rules*). A
+> specialist that catches itself doing any of these must STOP and
+> reset to the cadence. The list was distilled from a real
+> authorized engagement revalidation (2026-05-17) where the
+> skill *existed* and was *loaded* and the operator still drifted.
+
+1. **Asking "want me to continue?" mid-run** after the orchestrator already chose full engagement. The answer was given at start.
+2. **Stopping at first-class-returning-401/403.** Run all 12 SQLi / 12 auth-bypass / 10 CSRF classes per surface; one rejection is not a coverage answer.
+3. **"Interesting constant token, not chased."** A token / hash / ID constant across varying responses is a *lead*, not *artifact*. `GET` it. Decode it. Pass it back.
+4. **Reading robots.txt for cross-template signals and NOT READING the Disallow lines.** Every Disallow is a probe target.
+5. **Treating soft-404 as "noted."** A 37 KB body inside 404 status is leaking. Read it. Grep it. Diff.
+6. **"OpenAPI exposed → finding logged"** with only 4 of N endpoints probed. Every endpoint × every relevant test class.
+7. **Deferring hard work with "needs tooling."** `brew install jadx` is 5 min, not "another session." Run it now.
+8. **Volume framed as a problem.** 3,000 well-tagged requests through Burp is normal cadence. Question is "have I covered every class on every live surface," not "have I sent too many."
+9. **Inserting confirmation questions at any decision point inside an active engagement loop.** If the user picked a mode at start, that mode is in effect until revoked.
+10. **Skill-gap-as-stop-condition.** "No `hunt-zoho` exists, so log gap and move on." NO. Do the same work *manually* using the vendor's public check matrix; log the gap AND run the checks now.
+
+The 10 anti-patterns mirror the structure of the 7 hard
+forbiddens above but address a *different* failure mode: the
+forbiddens prevent the LLM from doing something the contract
+rejects; the anti-patterns prevent the LLM from *silently stopping*
+when the contract permits more. Read both before each wave.
+
+## 🗺️ Map-First Mode (adoption, 2026-06-14)
+
+> Adopted from `Claude-BugHunter/engine/README.md` (MIT). The
+> default OpenSquilla mode is **full-run** (W1 → W8); the
+> `map-first` mode is OPT-IN via ROE.engagement_type or a session
+> flag. It runs only W1 (recon) and produces a **map.md**
+> deliverable — a list of (target, vuln_class, applicable
+> hunt-* skill, first-curl probe) — then STOPS for the
+> operator to review. This saves ~80% of token cost and is the
+> recommended mode for *initial* surface discovery before
+> committing to a full engagement.
+
+| Mode | Phases run | Output | Token cost |
+|---|---|---|---|
+| `map-first` (default) | W1 only | `map.md` (arsenal map) | ~$0 (deterministic) |
+| `full-run` (opt-in) | W1 → W8 | full evidence bundle + W8 report | $$$, spends LLM agents on every wave |
+| `hunt-only` (opt-in) | W1 + W4 (no W5-W7 lateral chain) | evidence bundle + W8 report (truncated) | $$ |
+
+The mode is set by the W0 `engagement-planning` specialist
+based on ROE.engagement_type + operator confirmation. The
+executor reads `state.dispatch_mode` to decide which waves
+to actually run. See `attack_dispatch/executor.py` for the
+mode resolution.
+
 -->
+

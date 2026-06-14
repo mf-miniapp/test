@@ -84,6 +84,16 @@ log = logging.getLogger(__name__)
 # Dynamic fan-out: how many entry buckets per penetration sub-track.
 SUB_TRACK_BUCKET_SIZE = 8
 
+# 2026-06-14 (triage-validation adoption). When the wave evidence
+# is not a PenetrationEvidence (e.g. recon, intel, triage), the
+# 7-Question Gate has nothing to filter and the helper is a no-op.
+# We pass a tiny proxy that looks like a PenetrationEvidence to
+# the helper's type narrowing (the helper checks ``findings`` and
+# short-circuits on empty list, so an empty-findings proxy is
+# indistinguishable from a real empty evidence). Defined here at
+# module level so the dispatch site stays readable.
+_EMPTY_PENTEST_PROXY = PenetrationEvidence(target="__unused__", findings=[])
+
 # Default per-step artifact archive root. Production code (hack-deep) runs
 # against this; tests can pass a tmp_path to keep the real workspace clean.
 DEFAULT_ARTIFACT_ROOT = Path.home() / ".opensquilla" / "agents" / "hack-deep" / "memory" / "waves"
@@ -1745,6 +1755,238 @@ class DispatchExecutor:
                     merged[k] = v
         return make_evidence(schema_name, **merged)
 
+    @staticmethod
+    def _apply_seven_question_gate(
+        *,
+        evidence: "PenetrationEvidence",
+        wave: str,
+        state: "DispatchState",
+        roe: "ROEEvidence | None" = None,
+    ) -> tuple[int, int, int]:
+        """2026-06-14 (triage-validation adoption). Apply the
+        7-Question Gate to every finding in ``evidence.findings``.
+
+        For each finding that has a ``seven_question_gate`` field
+        populated AND ``seven_question_gate.any_fail()`` is True:
+          - finding.status is downgraded to ``"partial"``,
+          - ``evidence.unverified_findings`` gains the entry_id,
+          - ``state.errors`` gains a structured note (so the W8
+            report can cite the gate question ids).
+
+        The function is a no-op for findings without the gate
+        field (legacy / opt-in) and returns
+        ``(gate_applied_count, downgraded_count, skipped_count)``.
+
+        When ``roe`` is provided, the helper also enforces the
+        ROE severity gate: findings whose ``cvss.severity_rating``
+        is NOT in ``roe.severity_gate`` are flagged for the W8
+        reporter's inclusion filter (not downgraded; the W8
+        reporter reads the flag).
+        """
+        if not evidence.findings:
+            return 0, 0, 0
+
+        applied = 0
+        downgraded = 0
+        skipped = 0
+        severity_drops: list[str] = []
+
+        severity_allowed: set[str] | None = None
+        if roe is not None and getattr(roe, "severity_gate", None):
+            severity_allowed = {s.lower() for s in roe.severity_gate}
+
+        engagement_type: str | None = (
+            getattr(roe, "engagement_type", None) if roe is not None else None
+        )
+
+        for f in evidence.findings:
+            # 1) 7-Question Gate verdict (if present).
+            gate = getattr(f, "seven_question_gate", None)
+            if gate is not None:
+                applied += 1
+                if gate.any_fail():
+                    f.status = "partial"
+                    evidence.unverified_findings.append(f.entry_id)
+                    fail_qs = gate.fail_questions()
+                    state.errors.append(
+                        f"wave {wave} finding {f.entry_id} 7Q-Gate "
+                        f"failed questions: {','.join(fail_qs)}; "
+                        f"auto-downgraded to partial"
+                    )
+                    downgraded += 1
+                # Stash the engagement_type the gate was applied under
+                # so the W8 report can render the right gate header.
+                if (
+                    getattr(gate, "applied_engagement_type", None) is None
+                    and engagement_type is not None
+                ):
+                    gate.applied_engagement_type = engagement_type
+            else:
+                skipped += 1
+
+            # 2) ROE severity gate (when ROE is provided).
+            if severity_allowed is not None:
+                cvss = getattr(f, "cvss", None)
+                rating = (
+                    getattr(cvss, "severity", None)
+                    if cvss is not None
+                    else None
+                )
+                if rating is not None and rating.lower() not in severity_allowed:
+                    severity_drops.append(f.entry_id)
+                    state.errors.append(
+                        f"wave {wave} finding {f.entry_id} severity "
+                        f"{rating!r} is outside ROE.severity_gate "
+                        f"{sorted(severity_allowed)}; W8 inclusion "
+                        f"flag set"
+                    )
+
+        if severity_drops:
+            # Attach the drops to a top-level field on the evidence
+            # (Pydantic extra='forbid' on PenetrationEvidence would
+            # reject this; we use a model_dump + setattr on the
+            # dispatch state instead, so the W8 reporter reads it
+            # via state.errors OR via a sibling field if the
+            # evidence schema grows one in a future iteration).
+            state.errors.append(
+                f"wave {wave} severity-gate drops "
+                f"({len(severity_drops)}): {','.join(severity_drops)}"
+            )
+
+        return applied, downgraded, skipped
+
+    @staticmethod
+    def scope_audit_findings(
+        *,
+        evidence: "PenetrationEvidence | LateralEvidence",
+        roe: "ROEEvidence | None" = None,
+    ) -> dict[str, list[str]]:
+        """2026-06-14 (Claude-BugHunter scope.py adoption).
+
+        Scan every finding's request body / response body / pivot
+        point for hosts and return a mapping ``entry_id -> [out-of-
+        scope hosts]``. The caller (W4 / W6 specialist or the
+        executor's post-process step) writes the lists into the
+        finding's ``scope_violations`` field and the W8 reporter
+        flags the finding as "PoC referenced out-of-scope host".
+
+        The audit is **deterministic**: scope is enforced in code,
+        not by trusting the LLM. The pattern language is the
+        Claude-BugHunter ``Scope`` DSL (apex / wildcard / exact /
+        CIDR / re:regex) with deny-wins + default-deny semantics.
+        See ``opensquilla.attack_dispatch.scope_matcher`` for the
+        canonical implementation; this method is a thin wrapper
+        that pulls patterns from ``ROEEvidence``.
+
+        If ``roe`` is None, the audit is a no-op and returns
+        ``{}`` (no patterns to match against). If ``roe.scope_patterns``
+        is empty but ``roe.allowed_assets`` is populated, the
+        audit uses ``allowed_assets`` / ``forbidden_assets`` as
+        a *whole-string* allowlist (legacy behavior).
+        """
+        if roe is None:
+            return {}
+
+        in_patterns = list(getattr(roe, "scope_patterns", None) or [])
+        # If the structured scope_patterns is empty, fall back to
+        # the legacy allowed_assets / forbidden_assets whole-string
+        # match. This is a transitional affordance: legacy ROEs
+        # from before 2026-06-14 still work, but new ROEs MUST
+        # populate scope_patterns.
+        if not in_patterns:
+            in_patterns = list(getattr(roe, "allowed_assets", None) or [])
+
+        out_patterns: list[str] = []
+        forbidden = list(getattr(roe, "forbidden_assets", None) or [])
+        # ``forbidden_assets`` are treated as exact-host patterns
+        # (the legacy ROE format). The structured DSL doesn't have
+        # a "forbidden" field; users express deny via out-of-scope
+        # patterns in scope_patterns or via forbidden_assets here.
+        for f in forbidden:
+            out_patterns.append(f)
+            # also support bare-host-with-subdomain semantics for
+            # common case ``forbidden_assets=["internal.example.com"]``
+            out_patterns.append("." + f)
+
+        # Collect the text blobs to scan.
+        from opensquilla.attack_dispatch.scope_matcher import (
+            extract_hosts_from_blob,
+            scope_audit_hosts,
+        )
+
+        violations: dict[str, list[str]] = {}
+
+        # PenetrationEvidence has findings[*].request.body and
+        # findings[*].response.body. Scan both.
+        if isinstance(evidence, PenetrationEvidence):
+            for f in evidence.findings:
+                blobs: list[str] = []
+                req = getattr(f, "request", None)
+                if req is not None:
+                    blobs.append(str(getattr(req, "body", "") or ""))
+                    blobs.append(str(getattr(req, "url", "") or ""))
+                    headers = getattr(req, "headers", None) or {}
+                    for k, v in headers.items():
+                        if k.lower() in ("host", "referer", "origin"):
+                            blobs.append(str(v))
+                resp = getattr(f, "response", None)
+                if resp is not None:
+                    blobs.append(str(getattr(resp, "body_snippet", "") or ""))
+                    rheaders = getattr(resp, "headers", None) or {}
+                    for k, v in rheaders.items():
+                        if k.lower() in ("location",):
+                            blobs.append(str(v))
+                hosts: set[str] = set()
+                for blob in blobs:
+                    hosts.update(extract_hosts_from_blob(blob))
+                oos = scope_audit_hosts(
+                    sorted(hosts),
+                    in_scope_patterns=in_patterns,
+                    out_of_scope_patterns=out_patterns,
+                )
+                if oos:
+                    violations[f.entry_id] = oos
+                    # Stash on the evidence-level scope_violations
+                    # list (the field that already exists in
+                    # PenetrationEvidence). Each entry is prefixed
+                    # with the finding entry_id so the W8 reporter
+                    # can group by finding. Also bump the
+                    # out_of_scope_hits counter so the score
+                    # surface is auditable in one number.
+                    existing = list(getattr(evidence, "scope_violations", None) or [])
+                    for h in oos:
+                        tagged = f"{f.entry_id}:{h}"
+                        if tagged not in existing:
+                            existing.append(tagged)
+                    evidence.scope_violations = existing
+                    evidence.out_of_scope_hits = int(
+                        getattr(evidence, "out_of_scope_hits", 0) or 0
+                    ) + len(oos)
+
+        # LateralEvidence has discovered_hosts[]. Scan each.
+        elif isinstance(evidence, LateralEvidence):
+            for h in evidence.discovered_hosts or []:
+                host = (
+                    h.get("host")
+                    if isinstance(h, dict)
+                    else getattr(h, "host", None)
+                )
+                if not host:
+                    continue
+                from opensquilla.attack_dispatch.scope_matcher import (
+                    reject_reason as _rr,
+                )
+                reason = _rr(
+                    host,
+                    in_scope_patterns=in_patterns,
+                    out_of_scope_patterns=out_patterns,
+                )
+                if reason:
+                    key = f"lateral-pivot:{host}"
+                    violations[key] = [host]
+
+        return violations
+
     def _verify_pentest_findings(
         self,
         *,
@@ -2249,6 +2491,39 @@ class DispatchExecutor:
                 last_raw = raw_results
                 last_briefs = briefs_by_env
                 continue
+            # 2026-06-14 (triage-validation adoption): apply the
+            # 7-Question Gate BEFORE the runtime verifier. The gate
+            # verdict is the cheap structural filter; the verifier
+            # re-runs the surviving findings' reproduce steps.
+            # The helper is a no-op for findings without
+            # ``seven_question_gate`` set, so legacy W4 specialists
+            # are unaffected.
+            roe_evidence = None
+            try:
+                w0_artifact = state.evidence_paths.get("W0")
+                if w0_artifact:
+                    from opensquilla.attack_dispatch.evidence import (
+                        ROEEvidence as _ROE,
+                    )
+                    from pathlib import Path as _P
+                    raw = _P(w0_artifact).read_text(encoding="utf-8")
+                    roe_evidence = _ROE.model_validate_json(raw)
+            except Exception:  # noqa: BLE001 — best-effort
+                roe_evidence = None
+            gate_applied, gate_downgraded, gate_skipped = (
+                self._apply_seven_question_gate(
+                    evidence=evidence
+                    if isinstance(evidence, PenetrationEvidence)
+                    else _EMPTY_PENTEST_PROXY,
+                    wave=wave,
+                    state=state,
+                    roe=roe_evidence,
+                )
+                if isinstance(evidence, PenetrationEvidence)
+                else (0, 0, 0)
+            )
+            del gate_applied, gate_skipped  # used for audit only
+
             # Verify.
             findings_verified, findings_downgraded = (
                 self._verify_pentest_findings(
@@ -2258,6 +2533,7 @@ class DispatchExecutor:
                     target=target,
                 )
             )
+            findings_downgraded += gate_downgraded
             # Score.
             primary_handoff = (
                 envelopes[0].handoff_id if envelopes else wave

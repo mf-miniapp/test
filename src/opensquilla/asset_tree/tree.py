@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -40,16 +42,42 @@ class AssetTree:
       - ``_value_index``: (AssetType, value) → node_id  (去重用)
     """
 
-    def __init__(self, root_domain: str) -> None:
+    def __init__(
+        self,
+        root_domain: str,
+        *,
+        backend: Any | None = None,
+        tree_id: str | None = None,
+    ) -> None:
+        """Build an AssetTree.
+
+        Args:
+            root_domain: The root domain (e.g. "example.com").
+            backend: Optional ``AssetTreeBackend``. When provided, every
+                mutation is persisted to the backend after the in-memory
+                indexes are updated. When None, the tree is purely
+                in-memory (test mode without DB).
+            tree_id: Required when backend is set — the DB primary key for
+                this tree. Ignored when backend is None.
+        """
         self._nodes: dict[str, AssetNode] = {}
         self._edges: dict[str, list[str]] = {}
         self._by_type: dict[AssetType, list[str]] = {}
+        # Root-layer dedup only. Non-root duplicates across parents are LEGITIMATE
+        # (e.g. shared IPs, shared ports); they are deduped by parent walk instead.
         self._value_index: dict[tuple[AssetType, str], str] = {}
+        self._lock = threading.RLock()
+        # Use getattr-tolerant attributes so legacy trees loaded from
+        # JSON (without these set) don't AttributeError on first mutation.
+        self._backend = backend
+        self._tree_id = tree_id
+        if backend is not None and tree_id is None:
+            raise ValueError("tree_id is required when backend is set")
         self.root_id: Optional[str] = None
         self.root_domain: str = root_domain
 
-        # 创建根节点
-        self.root_id = self.add_node(
+        # 创建根节点（直接调用锁内方法，避开 add_node 的锁保护，因为 _lock 刚刚初始化）
+        self.root_id = self._add_node_locked(
             asset_type=AssetType.ROOT_DOMAIN,
             value=root_domain,
         )
@@ -81,8 +109,41 @@ class AssetTree:
         Returns:
             节点 ID（新建或已有）。
         """
-        # 去重: 同父 + 同类型 + 同值
-        if parent_id:
+        with self._lock:
+            return self._add_node_locked(
+                asset_type=asset_type,
+                value=value,
+                parent_id=parent_id,
+                source_wave=source_wave,
+                metadata=metadata,
+                id_override=id_override,
+            )
+
+    def _add_node_locked(
+        self,
+        asset_type: AssetType,
+        value: str,
+        parent_id: Optional[str] = None,
+        source_wave: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        *,
+        id_override: Optional[str] = None,
+    ) -> str:
+        """`add_node` 的锁内实现。`__init__` 在持有锁之前不能调用此方法。"""
+        # 去重策略:
+        #   - 根节点 (parent_id=None): 用全局 value_index 去重，防止重复创建
+        #   - 非根节点: 检查同父节点下的子节点去重（不写入 value_index，跨父重复视为合法）
+        if parent_id is None:
+            existing_id = self._value_index.get((asset_type, value))
+            if existing_id and existing_id in self._nodes:
+                node = self._nodes[existing_id]
+                node.last_seen = datetime.now(timezone.utc)
+                if source_wave and not node.source_wave:
+                    node.source_wave = source_wave
+                if metadata:
+                    node.metadata.update(metadata)
+                return existing_id
+        else:
             for child_id in self._edges.get(parent_id, []):
                 child = self._nodes[child_id]
                 if child.asset_type == asset_type and child.value == value:
@@ -113,49 +174,101 @@ class AssetTree:
 
         # 注册到所有索引
         self._nodes[node.id] = node
-        self._value_index[(asset_type, value)] = node.id
+        # 只为根层节点写 _value_index；非根层由 _edges 同父遍历去重
+        if parent_id is None:
+            self._value_index[(asset_type, value)] = node.id
 
         if parent_id is not None:
             self._nodes[parent_id].children_ids.append(node.id)
             self._edges.setdefault(parent_id, []).append(node.id)
 
         self._by_type.setdefault(asset_type, []).append(node.id)
+
+        # Backend persistence (Phase 4). Fire-and-forget when no loop is
+        # running; in async contexts the caller wraps the tree in an
+        # event loop. To avoid blocking sync tests, only call when a loop
+        # is active.
+        if getattr(self, "_backend", None) is not None:
+            self._persist_node(node)
+
         return node.id
+
+    def _persist_node(self, node: AssetNode) -> None:
+        """Optional auto-persist hook — DISABLED in Phase 4.
+
+        The tools' ``asset_tree_add_nodes`` already does an explicit
+        awaited bulk write via ``backend.add_nodes_bulk``. Firing a
+        per-node fire-and-forget here races with the bulk insert
+        (FK constraints against not-yet-committed parents). Keep the
+        method as a hook for future callers that need per-node
+        incremental persistence, but do nothing by default.
+        """
+        return None
+
+    def _material_path_for(self, node: AssetNode) -> str:
+        """Build the slash-separated id chain for the node."""
+        if node.parent_id is None:
+            return node.id
+        parent = self._nodes.get(node.parent_id)
+        if parent is None:
+            return node.id
+        return self._material_path_for(parent) + "/" + node.id
 
     def get_node(self, node_id: str) -> Optional[AssetNode]:
         """按 ID 获取节点。"""
-        return self._nodes.get(node_id)
+        with self._lock:
+            return self._nodes.get(node_id)
 
     def update_state(self, node_id: str, new_state: AssetState) -> None:
         """更新节点探测状态。"""
-        node = self._nodes.get(node_id)
-        if node is None:
-            raise ValueError(f"Node not found: {node_id}")
-        node.state = new_state
-        node.last_seen = datetime.now(timezone.utc)
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                raise ValueError(f"Node not found: {node_id}")
+            old_state = node.state
+            node.state = new_state
+            node.last_seen = datetime.now(timezone.utc)
+
+        # Persist state change + record audit log entry (Phase 4)
+        if getattr(self, "_backend", None) is not None and getattr(self, "_tree_id", None) is not None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            asyncio.ensure_future(self._backend.update_node_state(
+                node_id=node_id, tree_id=self._tree_id,
+                new_state=new_state.value,
+            ))
+            asyncio.ensure_future(self._backend.add_state_transition(
+                tree_id=self._tree_id, node_id=node_id,
+                from_state=old_state.value, to_state=new_state.value,
+            ))
 
     def update_metadata(self, node_id: str, **fields: Any) -> None:
         """更新节点的 metadata 字段（merge 语义）。"""
-        node = self._nodes.get(node_id)
-        if node is None:
-            raise ValueError(f"Node not found: {node_id}")
-        node.metadata.update(fields)
-        node.last_seen = datetime.now(timezone.utc)
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                raise ValueError(f"Node not found: {node_id}")
+            node.metadata.update(fields)
+            node.last_seen = datetime.now(timezone.utc)
 
     def add_evidence_ref(self, node_id: str, handoff_id: str) -> None:
         """为节点关联一个 evidence handoff_id（去重）。"""
-        node = self._nodes.get(node_id)
-        if node is None:
-            raise ValueError(f"Node not found: {node_id}")
-        if handoff_id not in node.evidence_refs:
-            node.evidence_refs.append(handoff_id)
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                raise ValueError(f"Node not found: {node_id}")
+            if handoff_id not in node.evidence_refs:
+                node.evidence_refs.append(handoff_id)
 
     def assign_wave(self, node_id: str, wave: str) -> None:
         """标记节点正在被哪个波次处理。"""
-        node = self._nodes.get(node_id)
-        if node is None:
-            raise ValueError(f"Node not found: {node_id}")
-        node.assigned_wave = wave
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                raise ValueError(f"Node not found: {node_id}")
+            node.assigned_wave = wave
 
     def remove_subtree(self, node_id: str) -> None:
         """删除以 node_id 为根的子树（含该节点）。
@@ -163,57 +276,59 @@ class AssetTree:
         清理所有内部索引和父节点的 children_ids 列表。
         不允许删除根节点。
         """
-        if node_id == self.root_id:
-            raise ValueError("Cannot delete root node")
+        with self._lock:
+            if node_id == self.root_id:
+                raise ValueError("Cannot delete root node")
 
-        # 收集待删除节点（BFS）
-        to_remove: list[str] = []
-        queue = [node_id]
-        while queue:
-            current = queue.pop()
-            to_remove.append(current)
-            queue.extend(self._edges.get(current, []))
+            # 收集待删除节点（BFS）
+            to_remove: list[str] = []
+            queue = [node_id]
+            while queue:
+                current = queue.pop()
+                to_remove.append(current)
+                queue.extend(self._edges.get(current, []))
 
-        to_remove_set = set(to_remove)
+            to_remove_set = set(to_remove)
 
-        # 找到被删节点的父节点
-        target_node = self._nodes.get(node_id)
-        parent_id = target_node.parent_id if target_node else None
-        if not parent_id:
-            # 尝试从 edges 反查
-            for pid, children in self._edges.items():
-                if node_id in children:
-                    parent_id = pid
-                    break
+            # 找到被删节点的父节点
+            target_node = self._nodes.get(node_id)
+            parent_id = target_node.parent_id if target_node else None
+            if not parent_id:
+                # 尝试从 edges 反查
+                for pid, children in self._edges.items():
+                    if node_id in children:
+                        parent_id = pid
+                        break
 
-        # 从所有索引中移除
-        for nid in to_remove:
-            node = self._nodes.pop(nid, None)
-            if node is None:
-                continue
+            # 从所有索引中移除
+            for nid in to_remove:
+                node = self._nodes.pop(nid, None)
+                if node is None:
+                    continue
 
-            # 移除 value index
-            self._value_index.pop((node.asset_type, node.value), None)
+                # 只为根层节点 pop _value_index；非根层节点本就不在索引中
+                if node.parent_id is None:
+                    self._value_index.pop((node.asset_type, node.value), None)
 
-            # 移除 type index
-            type_list = self._by_type.get(node.asset_type, [])
-            if nid in type_list:
-                type_list.remove(nid)
+                # 移除 type index
+                type_list = self._by_type.get(node.asset_type, [])
+                if nid in type_list:
+                    type_list.remove(nid)
 
-            # 移除 edges (parent → child)
-            self._edges.pop(nid, None)
+                # 移除 edges (parent → child)
+                self._edges.pop(nid, None)
 
-        # 从父节点的 children 列表和 edges 中移除
-        if parent_id and parent_id in self._nodes:
-            self._nodes[parent_id].children_ids = [
-                c for c in self._nodes[parent_id].children_ids if c not in to_remove_set
-            ]
-        if parent_id and parent_id in self._edges:
-            self._edges[parent_id] = [
-                c for c in self._edges[parent_id] if c not in to_remove_set
-            ]
+            # 从父节点的 children 列表和 edges 中移除
+            if parent_id and parent_id in self._nodes:
+                self._nodes[parent_id].children_ids = [
+                    c for c in self._nodes[parent_id].children_ids if c not in to_remove_set
+                ]
+            if parent_id and parent_id in self._edges:
+                self._edges[parent_id] = [
+                    c for c in self._edges[parent_id] if c not in to_remove_set
+                ]
 
-    # ── 关系查询 ──────────────────────────────────────
+        # ── 关系查询 ──────────────────────────────────────
 
     def get_children(self, node_id: str) -> list[AssetNode]:
         """获取节点的直接子节点列表。"""
@@ -264,6 +379,64 @@ class AssetTree:
                 if parent and parent.asset_type == AssetType.SUB_DOMAIN:
                     ip_to_parents.setdefault(node.value, []).append(node.parent_id)
         return {ip: parents for ip, parents in ip_to_parents.items() if len(parents) > 1}
+
+    def find_shared_components(self) -> dict[str, list[str]]:
+        """发现被多个 SERVICE / URL 复用的组件（product+version 一致）。
+
+        返回 ``{component_value: [parent_id, ...]}``，仅保留 2+ 父节点共享的项。
+        用于波次选择：共享组件一旦被攻破，影响面更大、优先级更高。
+        """
+        comp_to_parents: dict[str, list[str]] = {}
+        for node in self._nodes.values():
+            if node.asset_type != AssetType.COMPONENT or not node.parent_id:
+                continue
+            parent = self._nodes.get(node.parent_id)
+            if parent is None:
+                continue
+            if parent.asset_type not in {AssetType.SERVICE, AssetType.URL}:
+                continue
+            comp_to_parents.setdefault(node.value, []).append(node.parent_id)
+        return {c: ps for c, ps in comp_to_parents.items() if len(ps) > 1}
+
+    def find_leaked_secrets(self, *, validated_only: bool = False) -> list[AssetNode]:
+        """发现所有 ``SECRET`` 节点。
+
+        Args:
+            validated_only: 若为 True，仅返回 ``metadata.validated is True`` 的节点。
+                默认 False，返回全部以便 triage。
+        """
+        results: list[AssetNode] = []
+        for node in self._nodes.values():
+            if node.asset_type != AssetType.SECRET:
+                continue
+            if validated_only and not node.metadata.get("validated"):
+                continue
+            results.append(node)
+        return results
+
+    def find_injection_vectors(
+        self,
+        *,
+        category: Optional[str] = None,
+        verified_only: bool = False,
+    ) -> list[AssetNode]:
+        """发现 ``INJECTION_VECTOR`` 节点。
+
+        Args:
+            category: 可选过滤，如 ``"sqli"`` / ``"ssrf"`` / ``"xss"`` /
+                ``"path_traversal"``。匹配 ``metadata.category``。
+            verified_only: 仅返回 ``metadata.verified is True`` 的节点。
+        """
+        results: list[AssetNode] = []
+        for node in self._nodes.values():
+            if node.asset_type != AssetType.INJECTION_VECTOR:
+                continue
+            if category is not None and node.metadata.get("category") != category:
+                continue
+            if verified_only and not node.metadata.get("verified"):
+                continue
+            results.append(node)
+        return results
 
     # ── 状态查询 ──────────────────────────────────────
 
@@ -363,17 +536,32 @@ class AssetTree:
         tree._edges = {}
         tree._by_type = {}
         tree._value_index = {}
+        tree._lock = threading.RLock()
         tree.root_id = root_id
+        tree.root_domain = root_domain  # 恢复 from_dict 上的 root_domain 属性
 
         # 恢复节点
         for nid, n_data in nodes_data.items():
             node = AssetNode.model_validate(n_data)
             tree._nodes[nid] = node
-            tree._value_index.setdefault((node.asset_type, node.value), nid)
+            # 仅根层节点（parent_id is None）写入 _value_index，与 add_node 一致
+            if node.parent_id is None:
+                tree._value_index.setdefault((node.asset_type, node.value), nid)
             tree._by_type.setdefault(node.asset_type, []).append(nid)
 
         # 恢复边
         tree._edges = {k: list(v) for k, v in edges_data.items()}
+
+        # 重建每个节点的 children_ids（to_dict 只写 _edges，序列化节点不带 children_ids 重建）
+        for parent_id, child_ids in tree._edges.items():
+            parent = tree._nodes.get(parent_id)
+            if parent is None:
+                continue
+            existing = set(parent.children_ids)
+            for cid in child_ids:
+                if cid not in existing:
+                    parent.children_ids.append(cid)
+                    existing.add(cid)
 
         return tree
 

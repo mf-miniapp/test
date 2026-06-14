@@ -80,6 +80,7 @@ const App = (() => {
         <a class="nav-item" href="#" data-path="/agents">${icons.agents()} Agents</a>
         <a class="nav-item" href="#" data-path="/usage">${icons.usage()} Usage</a>
         <a class="nav-item" href="#" data-path="/cron">${icons.cron()} Cron</a>
+        <a class="nav-item" href="${basePath}/../asset-tree/" target="_blank" rel="noopener">${icons.monitor()} Asset Tree</a>
         <div class="nav-group-label">Settings</div>
         <a class="nav-item" href="#" data-path="/config">${icons.config()} Config</a>
         <a class="nav-item" href="#" data-path="/logs">${icons.logs()} Logs</a>

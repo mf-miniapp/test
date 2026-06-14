@@ -30,6 +30,7 @@ dependencies = [
     "rich>=13.0",
     "websockets>=13.0",
     "aiosqlite>=0.20",
+    "aiomysql>=0.2.0",
     "apscheduler>=3.10",
     "pyyaml>=6.0",
     "sqlite-vec>=0.1",

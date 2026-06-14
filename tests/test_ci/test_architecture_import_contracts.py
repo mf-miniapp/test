@@ -8,6 +8,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    ("agents", "asset_tree"),
     ("agents", "gateway"),
     ("agents", "identity"),
     ("agents", "onboarding"),
@@ -34,6 +35,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "skills"),
     ("cli", "tools"),
     ("engine", "agents"),
+    ("engine", "attack_dispatch"),
     ("engine", "channels"),
     ("engine", "contracts"),
     ("engine", "gateway"),
@@ -51,6 +53,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "agents"),
     ("gateway", "application"),
     ("gateway", "attack_dispatch"),
+    ("gateway", "asset_tree"),
     ("gateway", "chat"),
     ("gateway", "channels"),
     ("gateway", "contracts"),
@@ -116,6 +119,8 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("skills", "provider"),
     ("skills", "safety"),
     ("skills", "tools"),
+    ("tools", "attack_dispatch"),
+    ("tools", "asset_tree"),
     ("tools", "agents"),
     ("tools", "channels"),
     ("tools", "engine"),

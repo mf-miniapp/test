@@ -27,6 +27,32 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
     "group:memory": frozenset({"memory_search", "memory_get"}),
     "group:web": frozenset({"web_search", "web_fetch", "http_request"}),
     "group:messaging": frozenset({"message"}),
+    # ── Recon tool groups (hack-deep-find specialists) ────────────
+    "group:recon:dns": frozenset({"recon_dns_resolve", "recon_dns_over_https"}),
+    "group:recon:portscan": frozenset(
+        {"recon_port_scan_tcp", "recon_port_scan_range", "recon_grab_banner", "masscan_scan", "nmap_scan"}
+    ),
+    "group:recon:http": frozenset(
+        {
+            "recon_http_probe",
+            "recon_directory_bruteforce",
+            "recon_extract_endpoints_from_js",
+        }
+    ),
+    "group:recon": frozenset(),  # populated after dict literal as union of subgroups
+    # ── AssetTree tool group (hack-deep-find LLM-coordinator) ────
+    "group:asset_tree": frozenset(
+        {
+            "asset_tree_create",
+            "asset_tree_add_nodes",
+            "asset_tree_update_state",
+            "asset_tree_find_unseen",
+            "asset_tree_get_subtree",
+            "asset_tree_list_siblings",
+            "asset_tree_stats",
+            "asset_tree_complete",
+        }
+    ),
     "channel:chat": frozenset(
         {
             "message",
@@ -121,6 +147,24 @@ _TOOL_PROFILES: Mapping[str, frozenset[str] | None] = {
 }
 _SENDER_SCOPED_TOOL_GROUPS: frozenset[str] = frozenset({"channel:perm"})
 _SENDER_SCOPED_TOOL_NAMES: frozenset[str] = _TOOL_GROUPS["channel:perm"]
+
+
+def _materialize_recon_superset() -> None:
+    """Populate `group:recon` as the union of its subgroups.
+
+    Called once at module import; the dict is module-mutable but the values
+    are frozensets so the type contract is preserved at runtime.
+    """
+    if isinstance(_TOOL_GROUPS, dict):
+        union = (
+            _TOOL_GROUPS["group:recon:dns"]
+            | _TOOL_GROUPS["group:recon:portscan"]
+            | _TOOL_GROUPS["group:recon:http"]
+        )
+        _TOOL_GROUPS.__setitem__("group:recon", union)  # type: ignore[attr-defined]
+
+
+_materialize_recon_superset()
 
 
 @dataclass(frozen=True)

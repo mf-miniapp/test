@@ -101,6 +101,84 @@ class ROEEvidence(EvidenceBase):
     success_criteria: list[str] = Field(default_factory=list)
     phase_plan: list[dict[str, Any]] = Field(default_factory=list)
 
+    # 2026-06-14 (bb-methodology adoption): engagement type gate.
+    # Drives W4 finding filter and W8 report shape. Borrowed verbatim
+    # from bb-methodology PART 0.
+    #   bug_bounty     : impact-demonstrated bugs ONLY (H1 / Bugcrowd)
+    #   red_team       : hygiene + recon + IoCs + chains (client deliverable)
+    #   pentest        : depends on signed SoW; usually hygiene + impact + recon
+    #   internal_audit : compliance-mapped (PCI / ISO / NIST / DPDPA / GDPR)
+    engagement_type: Literal[
+        "bug_bounty", "red_team", "pentest", "internal_audit"
+    ] = Field(
+        default="red_team",
+        description=(
+            "Engagement type — drives W4 finding filter and W8 report shape. "
+            "Adopted from bb-methodology PART 0 (Claude-BugHunter). Default "
+            "is red_team to match OpenSquilla deployment posture."
+        ),
+    )
+    # 2026-06-14 (scope.py DSL adoption): in-scope pattern DSL.
+    # Mirrors Claude-BugHunter Scope pattern language: bare apex
+    # (example.com matches apex + any subdomain), *.wildcard.example.com
+    # (any subdomain, NOT bare apex), exact host, CIDR (10.0.0.0/8), or
+    # re:^regex$ for custom matches. Deny-wins / default-deny is
+    # enforced in code by opensquilla.attack_dispatch.scope_matcher.
+    # allowed_assets (free-form) stays as-is for backward-compat; new
+    # scope_patterns is the *structured* form the code layer can match
+    # deterministically without LLM interpretation.
+    scope_patterns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "2026-06-14. Structured in-scope patterns using the "
+            "Claude-BugHunter scope DSL: bare apex, *.wildcard, "
+            "exact host, CIDR (10.0.0.0/8), or re:^regex$. "
+            "Deny-wins + default-deny semantics enforced by "
+            "attack_dispatch.scope_matcher. Empty list = "
+            "scope_matcher only consults allowed_assets / "
+            "forbidden_assets via the legacy whole-string match."
+        ),
+    )
+    # 2026-06-14 (/hunt redteam/wapt split): per-mode severity gate.
+    # Adopts Claude-BugHunter /hunt two-track dispatcher behavior:
+    #   red_team: only critical/high (medium only if it chains)
+    #   wapt:     full OWASP coverage incl. medium
+    # Drives W8 per-finding inclusion filter. Defaults to the gate
+    # implied by engagement_type if not explicitly set.
+    severity_gate: list[Literal["critical", "high", "medium", "low", "info"]] = Field(
+        default_factory=lambda: ["critical", "high", "medium", "low", "info"],
+        description=(
+            "2026-06-14. Severity tiers that pass into the W8 report. "
+            "Adopted from /hunt redteam/wapt split. Default = all tiers. "
+            "ROE planner should set this per engagement: bug_bounty -> "
+            "['critical','high']; red_team -> ['critical','high']; "
+            "pentest -> ['critical','high','medium']; internal_audit -> all."
+        ),
+    )
+    # 2026-06-14 (redteam-mindset adoption): mandatory-cadence flags.
+    # bb-methodology "Real-engagement cadence" section enumerates
+    # what a COMPLETE sweep per live host looks like (top-100 path
+    # probe, robots.txt read, JS bundle grep, source-map check, etc.).
+    # These booleans make the cadence auditable in the W8 report.
+    cadence: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "top_100_path_probe": True,
+            "robots_txt_read": True,
+            "sitemap_xml_read": True,
+            "js_bundle_grep": True,
+            "source_map_check": True,
+            "form_sqli_marker_sweep": True,
+            "auth_bypass_class_sweep": True,
+            "openapi_endpoint_full_coverage": True,
+        },
+        description=(
+            "2026-06-14. Mandatory-cadence flags from bb-methodology. "
+            "Each key is a sweep step the W4 specialist committed to "
+            "running per live host. W8 reports the cadence completion "
+            "ratio; engagements below 80% are flagged as incomplete."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # fix 5: W1 recon must include infra_sharing
@@ -366,6 +444,46 @@ class TriageEvidence(EvidenceBase):
     verification_paths: list[dict[str, Any]] = Field(default_factory=list)
     prioritized_top_n: list[dict[str, Any]] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
+
+    # 2026-06-14 (bb-methodology adoption): disclosed-report pattern
+    # grounding. The triage specialist is expected to ground each
+    # candidate in patterns distilled from real public reports
+    # (HackerOne / Bugcrowd / GitHub Security Advisories). The
+    # structured form mirrors the frontmatter of Claude-BugHunter
+    # ``hunt-*`` skills (see bundled/hunt-* SKILL.md files for the
+    # canonical examples). Each entry references a known public
+    # report by source + id so W8 reporting can cite it. Pattern
+    # matching against the bundled ``hunt-*`` skills happens in
+    # the executor's `_rank_candidates` step.
+    disclosed_report_patterns: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "2026-06-14. Patterns distilled from public disclosures "
+            "the triage grounded each candidate in. Each entry has "
+            "shape: {vuln_class, source (hackerone_public | "
+            "bugcrowd | github_security_advisories | snyk_research | "
+            "sonarsource_research), report_id, cve (optional), "
+            "tech_stack (optional), pattern_summary, payload_template, "
+            "bypass_table (optional)}. Empty list = candidate was "
+            "novel (no public pattern match) and carries an extra "
+            "uncertainty marker."
+        ),
+    )
+    # 2026-06-14 (bb-methodology adoption): class-level knowledge
+    # density. Lets W8 report cite which ``hunt-*`` SKILL.md was
+    # consulted during triage, mirroring Claude-BugHunter's
+    # `bb-methodology` reference table.
+    hunt_skills_consulted: list[str] = Field(
+        default_factory=list,
+        description=(
+            "2026-06-14. Names of bundled ``hunt-*`` skills the "
+            "triage specialist loaded as knowledge references. "
+            "Mirrors Claude-BugHunter's per-class skill map. "
+            "W8 surfaces the consulted-skill list in the report's "
+            "methodology section so reviewers can audit the "
+            "grounding depth."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +766,119 @@ class OPSECEvidence(EvidenceBase):
 # no CVSS, no RoE guard — and the parent had no way to roll forward.
 # See docs/hack-deep.md §5.5 for the field rationale.
 # ---------------------------------------------------------------------------
+
+
+# 2026-06-14 (triage-validation adoption): 7-Question Gate.
+# Borrowed verbatim from Claude-BugHunter `triage-validation` SKILL.md
+# (the 7-Question Gate section). The Gate is a post-collection
+# filter that the W4 specialist fills per finding; the W8 reporter
+# consumes it to drop findings that fail any "fail" answer. Each
+# question maps to one of the 7 gate questions; the executor
+# auto-downgrades a finding to `partial` if any QAResult.verdict is
+# 'fail'. The `reasons` field carries the free-text reasoning
+# verbatim so the W8 report can cite the gate verdicts in the
+# finding body.
+QAVerdict = Literal["pass", "fail", "unknown"]
+
+
+class QAResult(BaseModel):
+    """One answer in the 7-Question Gate.
+
+    The ``verdict`` is the discriminator; ``reason`` is the
+    free-text rationale the W4 specialist typed (the W8 report
+    surfaces it verbatim so reviewers can audit the gate call).
+    ``evidence_ref`` optionally points at a piece of supporting
+    evidence (e.g. an H1 report id, a CVSS vector, a chain entry).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: QAVerdict = "unknown"
+    reason: str = Field(default="", description="Free-text rationale the W8 report cites verbatim.")
+    evidence_ref: str | None = Field(
+        default=None,
+        description=(
+            "Optional pointer to supporting evidence: an H1 report id, "
+            "a CVSS vector, a chain entry, etc. The W8 report can "
+            "render this as a footnote link."
+        ),
+    )
+
+
+class SevenQuestionGate(BaseModel):
+    """The 7-Question Gate applied to one PenetrationFinding.
+
+    All 7 questions are required (i.e. always present) so the
+    executor can index the verdict set without None handling. A
+    finding WITHOUT a `seven_question_gate` field is legacy (no
+    gate applied); a finding WITH the field but any 'fail' answer
+    is auto-downgraded to `partial` by the executor.
+
+    The question semantics (verbatim from upstream):
+
+    * Q1: Can an attacker use this RIGHT NOW, step by step?
+    * Q2: Is the impact on the engagement's accepted impact list?
+    * Q3: Is the root cause in an in-scope asset? (mirrors
+          roe_violation=False semantically; a fail here duplicates
+          the ROE guard but the report cites it for human review.)
+    * Q4: Does it require privileged access that an attacker can't
+          realistically get?
+    * Q5: Is this already known or accepted behavior?
+    * Q6: Is it part of an A->B->C chain (or chainable)?
+    * Q7: Does it map to the engagement's accepted business impact?
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    q1_attacker_usable: QAResult = Field(default_factory=QAResult)
+    q2_impact_accepted: QAResult = Field(default_factory=QAResult)
+    q3_in_scope: QAResult = Field(default_factory=QAResult)
+    q4_privilege_realistic: QAResult = Field(default_factory=QAResult)
+    q5_not_known: QAResult = Field(default_factory=QAResult)
+    q6_chainable: QAResult = Field(default_factory=QAResult)
+    q7_business_impact: QAResult = Field(default_factory=QAResult)
+    # Convenience: which engagement_type's gate policy was applied.
+    # Defaults to None for legacy findings; the W8 report reads
+    # this to render the right gate section heading.
+    applied_engagement_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "The engagement_type whose gate policy was applied. "
+            "Mirrors ROEEvidence.engagement_type so the W8 report "
+            "can show the same gate shape in the finding body."
+        ),
+    )
+
+    def any_fail(self) -> bool:
+        """True iff any question verdict is 'fail'."""
+        for q in (
+            self.q1_attacker_usable,
+            self.q2_impact_accepted,
+            self.q3_in_scope,
+            self.q4_privilege_realistic,
+            self.q5_not_known,
+            self.q6_chainable,
+            self.q7_business_impact,
+        ):
+            if q.verdict == "fail":
+                return True
+        return False
+
+    def fail_questions(self) -> list[str]:
+        """Return the q-ids (e.g. ['q1_attacker_usable']) that failed."""
+        out: list[str] = []
+        for qid, q in (
+            ("q1_attacker_usable", self.q1_attacker_usable),
+            ("q2_impact_accepted", self.q2_impact_accepted),
+            ("q3_in_scope", self.q3_in_scope),
+            ("q4_privilege_realistic", self.q4_privilege_realistic),
+            ("q5_not_known", self.q5_not_known),
+            ("q6_chainable", self.q6_chainable),
+            ("q7_business_impact", self.q7_business_impact),
+        ):
+            if q.verdict == "fail":
+                out.append(qid)
+        return out
 
 
 # Auth context — what level of authentication was needed to trigger the
@@ -1267,6 +1498,25 @@ class PenetrationFinding(BaseModel):
             "response) and ``body_missing_required_marker`` (one or "
             "more substrings in ``body_required_substrings`` were "
             "absent). ``None`` when verified is True or None."
+        ),
+    )
+
+    # 2026-06-14 (triage-validation adoption): 7-Question Gate.
+    # The W4 specialist runs the gate per finding; the W8 reporter
+    # reads it to drop findings that fail any "fail" answer. The
+    # executor auto-downgrades a finding to ``partial`` when this
+    # field is set AND ``seven_question_gate.any_fail()`` returns
+    # True. Legacy findings (no field) skip the gate entirely.
+    # The gate semantics are documented on ``SevenQuestionGate``.
+    seven_question_gate: Optional["SevenQuestionGate"] = Field(
+        default=None,
+        description=(
+            "2026-06-14. The 7-Question Gate verdict set the W4 "
+            "specialist applied to this finding. Optional for "
+            "backward-compat; when set, the executor auto-"
+            "downgrades the finding to ``partial`` on any fail. "
+            "Adopted from Claude-BugHunter triage-validation "
+            "SKILL.md (the 7-Question Gate section)."
         ),
     )
 
@@ -1964,6 +2214,53 @@ class ReportEvidence(EvidenceBase):
     remediation_roadmap: list[dict[str, Any]] = Field(default_factory=list)
     appendix: dict[str, Any] = Field(default_factory=dict)
 
+    # 2026-06-14 (triage-validation adoption): aggregate 7-Question
+    # Gate results. The W8 specialist runs the gate per-finding and
+    # writes the summary here so the report's header can render
+    # pass/fail rates. Mirrors the ``bb-methodology``-style
+    # "submission gate" that bug-bounty platforms apply to incoming
+    # reports. The CLI / PDF exporter reads these fields to render
+    # the gate section without re-walking every per_target_finding.
+    #
+    # Field semantics:
+    #   gate_engagement_type : mirrors ROEEvidence.engagement_type
+    #                          so the W8 header can show the right
+    #                          gate policy (bug_bounty / red_team /
+    #                          pentest / internal_audit).
+    #   gate_total_findings  : count of per_target_finding rows.
+    #   gate_passed_findings : count where status is "owned" AND
+    #                          seven_question_gate is set AND no fail.
+    #                          Status of "partial" or "blocked" is
+    #                          NOT counted as pass.
+    #   gate_failed_findings : count where seven_question_gate is
+    #                          set AND any_fail() is True. Surfaced
+    #                          in the report's "Submission Gate
+    #                          Failures" section with the entry_ids
+    #                          + failed-question ids.
+    #   gate_skipped_findings: count where seven_question_gate is
+    #                          NOT set (legacy / opt-in findings).
+    #                          Surfaced as informational, NOT a fail.
+    #   gate_pass_rate       : pass / (pass + fail) float in [0, 1].
+    #                          When pass + fail == 0, returns 1.0
+    #                          (no gated findings = 100% pass).
+    #   gate_failed_entry_ids: list of entry_ids that failed. Sorted
+    #                          for stable output.
+    gate_engagement_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "2026-06-14. The engagement_type whose gate policy the "
+            "W8 specialist applied. Mirrors "
+            "ROEEvidence.engagement_type. One of: bug_bounty, "
+            "red_team, pentest, internal_audit."
+        ),
+    )
+    gate_total_findings: int = Field(default=0, ge=0)
+    gate_passed_findings: int = Field(default=0, ge=0)
+    gate_failed_findings: int = Field(default=0, ge=0)
+    gate_skipped_findings: int = Field(default=0, ge=0)
+    gate_pass_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    gate_failed_entry_ids: list[str] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # W0.5 target-expansion (2026-06-07)
@@ -2156,6 +2453,79 @@ class PhaseQualityScore(EvidenceBase):
 
 
 # ---------------------------------------------------------------------------
+# 2026-06-14 — hack-deep-find → hack-deep handoff (v2 redesign Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class FindFrontierNode(BaseModel):
+    """One-line summary of an UNSEEN / frontier node in the AssetTree.
+
+    Carried in ``FindCompleteEvidence.frontier_summary`` so the receiving
+    hack-deep LLM gets an at-a-glance view of what still needs triaging
+    without having to re-read the full AssetTree JSON.
+    """
+
+    node_id: str
+    asset_type: str
+    value: str
+    state: str
+    parent_value: str | None = None
+
+
+class FindCompleteEvidence(EvidenceBase):
+    """hack-deep-find → hack-deep handoff.
+
+    Emitted by the find LLM-coordinator after ``asset_tree_find_unseen``
+    returns empty. Wraps the persisted AssetTree path so hack-deep's W0
+    (or a soft-reference W0.4 wave) can pre-load it instead of running
+    its own W0.5 recon.
+    """
+
+    evidence_schema: Literal["find-complete-v1"] = "find-complete-v1"
+    # ``target`` is inherited from EvidenceBase; we set it to the root
+    # domain so the executor's evidence-path index is human-friendly.
+    tree_id: str
+    root_domain: str
+    tree_path: str = Field(
+        description=(
+            "Absolute path to the persisted AssetTree JSON "
+            "(~/.opensquilla/state/asset_trees/<tree_id>.json). "
+            "hack-deep re-loads via AssetTree.from_json."
+        ),
+    )
+    tree_stats: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Snapshot of AssetTree.stats() at handoff time.",
+    )
+    frontier_summary: list[FindFrontierNode] = Field(
+        default_factory=list,
+        description=(
+            "One entry per UNSEEN / frontier node so hack-deep can "
+            "prioritize without a second read of the AssetTree."
+        ),
+    )
+    duration_s: int = Field(
+        default=0,
+        description="Total find-run duration in seconds (for budget tracking).",
+    )
+    specialists_invoked: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Specialist agent_ids that ran during this find. Helps "
+            "hack-deep reason about coverage gaps."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _set_target_from_root_domain(cls, data: Any) -> Any:
+        """Fill `target` from `root_domain` so EvidenceBase invariant holds."""
+        if isinstance(data, dict) and "target" not in data and "root_domain" in data:
+            data = {**data, "target": data["root_domain"]}
+        return data
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -2179,12 +2549,12 @@ EVIDENCE_SCHEMAS: dict[str, type[EvidenceBase]] = {
     "resource-v1": ResourceEvidence,  # 2026-06-10 R3 P0 S24 (W0.6 output)
     "port-attack-plan-v1": PortAttackPlanEvidence,  # 2026-06-11 v4.0 R3 (W2.5 output)
     "web-crawl-v1": WebCrawlEvidence,  # 2026-06-11 v4.0 R4 (W3.5 output)
+    "find-complete-v1": FindCompleteEvidence,  # 2026-06-14 hack-deep-find handoff
 }
 
 EVIDENCE_SCHEMA_NAMES: tuple[str, ...] = tuple(EVIDENCE_SCHEMAS.keys())
-assert len(EVIDENCE_SCHEMA_NAMES) == 18, (
-    "expected 18 evidence schemas (13 + sub_target_handle-v1 + "
-    "quality-score-v1 + resource-v1 + port-attack-plan-v1 + web-crawl-v1)"
+assert len(EVIDENCE_SCHEMA_NAMES) == 19, (
+    "expected 19 evidence schemas (18 + find-complete-v1)"
 )
 
 

@@ -1,7 +1,28 @@
 """Asset tree node models — 类型、状态和节点定义。
 
-AssetType 枚举了树中所有可能的节点层级:
-  ROOT_DOMAIN → SUB_DOMAIN → IP → PORT → SERVICE → ENDPOINT
+AssetType 枚举了树中所有可能的节点层级::
+
+  Network surface
+    ROOT_DOMAIN → SUB_DOMAIN → IP → PORT → SERVICE → URL
+
+  Web surface (URL 之下的可下钻资产)
+    URL
+      ├─ ENDPOINT            (method + path)
+      │    └─ PARAMETER      (path / query / header / cookie)
+      │         └─ INJECTION_VECTOR  (param × vuln 类型的二元漏洞点)
+      ├─ AUTH_SURFACE        (login / SSO / API key / OAuth / JWT / reset)
+      ├─ STATIC_ASSET        (robots.txt / swagger.json / .git/HEAD / 备份 / JS)
+      ├─ API_SCHEMA          (OpenAPI / GraphQL SDL / Postman / gRPC)
+      ├─ COOKIE              (HttpOnly / Secure / SameSite / 过期)
+      └─ HEADER              (安全头 / 信息泄露头)
+
+  Off-host surface
+    COMPONENT               (product + version + cpe，独立 CVE 视角)
+    STORAGE → STORAGE_OBJECT (s3 / azure / gcs bucket 与对象)
+    SECRET                  (泄漏的凭证 / token / 内部域名)
+
+  Catch-all
+    GENERIC                 (兜底，可挂在任何父节点下)
 
 AssetState 追踪每个节点的探测进度，驱动波次选择:
   UNSEEN → DISCOVERED → TRIAGED → EXPLOITED / ABANDONED
@@ -24,26 +45,99 @@ from pydantic import BaseModel, Field
 
 
 class AssetType(str, enum.Enum):
-    """资产树节点类型 — 决定节点在层级中的位置和可接受的子节点类型。"""
+    """资产树节点类型 — 决定节点在层级中的位置和可接受的子节点类型。
 
+    完整的层级关系见模块顶部的链路图。新增类型必须同步更新::
+
+      - ``_VALID_PARENT_CHILD``（运行时父子校验）
+      - ``db/schema.py`` 中 ``ck_asset_nodes_asset_type`` 的白名单
+        与 ``DDL_STATEMENTS`` 模板
+    """
+
+    # ── Network surface ──────────────────────────────────────────
     ROOT_DOMAIN = "root_domain"  # 顶层根域名
     SUB_DOMAIN = "sub_domain"  # 子域名
     IP = "ip"  # IPv4 / IPv6 地址
     PORT = "port"  # 开放端口
     SERVICE = "service"  # 端口上的服务指纹
-    ENDPOINT = "endpoint"  # 服务下的具体路径 / 表 / 方法
+
+    # ── Web surface（URL 之下）────────────────────────────────────
+    URL = "url"  # 服务下的可调用 URL（vhost / scheme / 认证上下文）
+    ENDPOINT = "endpoint"  # URL 下的可调用接口（method + path）
+    PARAMETER = "parameter"  # 接口下的具体参数（path/query/header/cookie）
+    INJECTION_VECTOR = "injection_vector"  # 参数 × 注入类型的二元漏洞点
+    AUTH_SURFACE = "auth_surface"  # 鉴权面：login / SSO / API key / OAuth / JWT / reset
+    STATIC_ASSET = "static_asset"  # 静态资源：robots.txt / swagger.json / .git/HEAD / 备份 / JS
+    API_SCHEMA = "api_schema"  # 结构化接口描述：OpenAPI / GraphQL SDL / Postman / gRPC
+    COOKIE = "cookie"  # Cookie（HttpOnly / Secure / SameSite / 过期）
+    HEADER = "header"  # HTTP 头（含安全头缺失 / 信息泄露头）
+
+    # ── Off-host surface ─────────────────────────────────────────
+    COMPONENT = "component"  # 组件指纹：product + version + cpe（独立 CVE 视角）
+    STORAGE = "storage"  # 云存储：s3 / azure / gcs bucket
+    STORAGE_OBJECT = "storage_object"  # 存储桶内的对象（敏感文件、备份等）
+    SECRET = "secret"  # 泄漏的凭证 / 内部信息（key/token/内部域名）
+
+    # ── Catch-all ────────────────────────────────────────────────
     GENERIC = "generic"  # 兜底
 
 
 # 合法的父子关系: parent → set(child)
+#
+# 设计要点:
+#   - ``URL`` 是 web 站点的统一挂载点；``ENDPOINT / AUTH_SURFACE /
+#     STATIC_ASSET / API_SCHEMA / COOKIE / HEADER`` 都直接挂在 URL 之下，
+#     表达"同一 base URL 下不同维度的资产"。
+#   - ``COMPONENT`` 同时挂在 ``SERVICE``（指纹如 nginx 1.24.0）和 ``URL``
+#     （从 JS bundle/响应头识别的前端组件）之下，因为组件是 CVE 视角
+#     的独立可测资产，跨层级复用合理。
+#   - ``STORAGE`` / ``STORAGE_OBJECT`` 挂在 ``SUB_DOMAIN`` 之下，表达
+#     "该子域对应公司名/产品名关联到的云存储"。
+#   - ``SECRET`` 可挂在任何父节点之下（JS 文件、env、config、git 历史
+#     都可能命中），通过 ``GENERIC`` 的特殊化 ``_ALLOWED_PARENT_TYPES``
+#     集合精确控制，避免误挂。
+#   - ``GENERIC`` 仍保留"父位可接受任何子类型"语义不变。
 _VALID_PARENT_CHILD: dict[AssetType, set[AssetType]] = {
+    # Network surface
     AssetType.ROOT_DOMAIN: {AssetType.SUB_DOMAIN},
-    AssetType.SUB_DOMAIN: {AssetType.IP},
-    AssetType.IP: {AssetType.PORT},
+    AssetType.SUB_DOMAIN: {AssetType.IP, AssetType.STORAGE, AssetType.SECRET},
+    AssetType.IP: {AssetType.PORT, AssetType.SECRET},
     AssetType.PORT: {AssetType.SERVICE},
-    AssetType.SERVICE: {AssetType.ENDPOINT},
+    AssetType.SERVICE: {
+        AssetType.URL,
+        AssetType.COMPONENT,
+        AssetType.SECRET,
+    },
+    # Web surface — 全部以 URL 为父位
+    AssetType.URL: {
+        AssetType.ENDPOINT,
+        AssetType.AUTH_SURFACE,
+        AssetType.STATIC_ASSET,
+        AssetType.API_SCHEMA,
+        AssetType.COMPONENT,
+        AssetType.COOKIE,
+        AssetType.HEADER,
+        AssetType.SECRET,
+    },
+    AssetType.ENDPOINT: {AssetType.PARAMETER},
+    AssetType.PARAMETER: {AssetType.INJECTION_VECTOR},
+    # Off-host surface
+    AssetType.STORAGE: {AssetType.STORAGE_OBJECT},
+    # Catch-all
     AssetType.GENERIC: set(AssetType),  # generic 可以接受任何子类型
 }
+
+# ``SECRET`` 允许的父类型白名单（精确控制，避免误挂）
+_SECRET_ALLOWED_PARENTS: frozenset[AssetType] = frozenset({
+    AssetType.SUB_DOMAIN,
+    AssetType.IP,
+    AssetType.SERVICE,
+    AssetType.URL,
+    AssetType.STATIC_ASSET,
+    AssetType.API_SCHEMA,
+    AssetType.STORAGE,
+    AssetType.STORAGE_OBJECT,
+})
 
 
 class AssetState(str, enum.Enum):
@@ -175,7 +269,19 @@ class AssetPath(BaseModel):
 
 
 def validate_parent_child(parent_type: AssetType, child_type: AssetType) -> None:
-    """校验父子关系是否合法，不合法则抛出 ValueError。"""
+    """校验父子关系是否合法，不合法则抛出 ValueError。
+
+    ``SECRET`` 节点单独走白名单校验（见 ``_SECRET_ALLOWED_PARENTS``），
+    其它节点走 ``_VALID_PARENT_CHILD``。
+    """
+    if child_type == AssetType.SECRET:
+        if parent_type not in _SECRET_ALLOWED_PARENTS:
+            raise ValueError(
+                f"Invalid parent→child: {parent_type.value} → {child_type.value}. "
+                f"Allowed parents of secret: "
+                f"{sorted(t.value for t in _SECRET_ALLOWED_PARENTS)}"
+            )
+        return
     allowed = _VALID_PARENT_CHILD.get(parent_type)
     if allowed is None:
         raise ValueError(f"Unknown parent type: {parent_type}")

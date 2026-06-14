@@ -12,7 +12,21 @@ from typing import Optional
 
 from .models import AssetNode, AssetType, AssetState
 from .tree import AssetTree
-from .routing import WaveRoute
+
+
+@dataclass(frozen=True)
+class RouteInfo:
+    """Lightweight routing decision consumed by BriefGenerator.
+
+    Replaces the deleted ``routing.WaveRoute`` — only the three fields
+    actually consumed by ``BriefGenerator.generate`` are kept. Caller is
+    expected to build this from whatever routing policy is in effect
+    (the new LLM-coordinator builds it ad-hoc in its session prompts).
+    """
+
+    wave_id: str
+    specialist: str
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -86,7 +100,7 @@ class BriefGenerator:
     def generate(
         self,
         target_node: AssetNode,
-        route: WaveRoute,
+        route: RouteInfo,
         *,
         max_siblings: int = 10,
         max_subtree_depth: int = 3,

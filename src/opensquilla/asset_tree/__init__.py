@@ -36,13 +36,6 @@ from opensquilla.asset_tree.models import (
     AssetType,
 )
 from opensquilla.asset_tree.tree import AssetTree
-from opensquilla.asset_tree.routing import (
-    RoutingRules,
-    WaveRoute,
-    default_routing_rules,
-    route_node,
-    route_subtree,
-)
 from opensquilla.asset_tree.brief_gen import BriefContext, BriefGenerator
 
 __all__ = [
@@ -54,9 +47,4 @@ __all__ = [
     "AssetType",
     "BriefContext",
     "BriefGenerator",
-    "RoutingRules",
-    "WaveRoute",
-    "default_routing_rules",
-    "route_node",
-    "route_subtree",
 ]
