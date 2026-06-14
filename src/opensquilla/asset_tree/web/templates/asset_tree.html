@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Asset Tree — 资产树管理</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-dim: #8b949e;
+      --accent: #58a6ff;
+      --accent-dim: #1f6feb;
+      --green: #3fb950;
+      --orange: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+      --radius: 6px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh;
+    }
+    /* ── Layout ─────────────────────────────── */
+    .app { display: flex; height: 100vh; }
+    .sidebar {
+      width: 280px; min-width: 280px;
+      background: var(--surface); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ── Sidebar ────────────────────────────── */
+    .sidebar-header {
+      padding: 16px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .sidebar-header h2 { font-size: 15px; font-weight: 600; }
+    .tree-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .tree-item {
+      padding: 10px 12px; border-radius: var(--radius); cursor: pointer;
+      margin-bottom: 4px; transition: background 0.15s;
+    }
+    .tree-item:hover { background: var(--border); }
+    .tree-item.active { background: var(--accent-dim); }
+    .tree-item-title { font-size: 14px; font-weight: 500; }
+    .tree-item-meta { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+    /* ── Main content ───────────────────────── */
+    .main-header {
+      padding: 16px 24px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px;
+    }
+    .main-header h1 { font-size: 18px; font-weight: 600; flex: 1; }
+    .main-body { flex: 1; display: flex; overflow: hidden; }
+    .tree-panel { flex: 1; overflow-y: auto; padding: 20px 24px; }
+    .detail-panel {
+      width: 340px; min-width: 340px;
+      background: var(--surface); border-left: 1px solid var(--border);
+      overflow-y: auto; padding: 20px;
+    }
+
+    /* ── Tree view ──────────────────────────── */
+    .tree-node { margin-left: 20px; }
+    .tree-node-root { margin-left: 0; }
+    .tree-node-header {
+      display: flex; align-items: center; gap: 6px;
+      padding: 4px 8px; border-radius: var(--radius);
+      cursor: pointer; user-select: none; font-size: 14px;
+      transition: background 0.1s;
+    }
+    .tree-node-header:hover { background: rgba(88, 166, 255, 0.1); }
+    .tree-node-header.selected { background: rgba(88, 166, 255, 0.2); }
+    .tree-node-toggle {
+      width: 16px; height: 16px; display: flex;
+      align-items: center; justify-content: center;
+      font-size: 10px; color: var(--text-dim);
+      transition: transform 0.15s;
+    }
+    .tree-node-toggle.expanded { transform: rotate(90deg); }
+    .tree-node-toggle.leaf { visibility: hidden; }
+    .tree-node-icon { font-size: 14px; width: 18px; text-align: center; }
+    .tree-node-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree-node-state {
+      font-size: 11px; padding: 1px 6px; border-radius: 10px;
+      font-weight: 500;
+    }
+    .state-unseen { background: #30363d; color: #8b949e; }
+    .state-discovered { background: #0d2818; color: var(--green); }
+    .state-triaged { background: #2d1b00; color: var(--orange); }
+    .state-exploited { background: #2d0b0b; color: var(--red); }
+    .state-abandoned { background: #1a1a2e; color: var(--purple); }
+    .tree-node-children { overflow: hidden; }
+    .tree-node-children.collapsed { display: none; }
+
+    /* ── Empty state ────────────────────────── */
+    .empty-state {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; height: 100%; color: var(--text-dim);
+      gap: 12px;
+    }
+    .empty-state-icon { font-size: 48px; opacity: 0.5; }
+    .empty-state-text { font-size: 15px; }
+
+    /* ── Buttons ────────────────────────────── */
+    .btn {
+      padding: 6px 14px; border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--surface);
+      color: var(--text); font-size: 13px; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 4px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .btn:hover { background: var(--border); }
+    .btn-primary { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
+    .btn-primary:hover { background: var(--accent); }
+    .btn-danger { border-color: var(--red); color: var(--red); }
+    .btn-danger:hover { background: rgba(248, 81, 73, 0.15); }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+    /* ── Forms / inputs ─────────────────────── */
+    input[type="text"], select, textarea {
+      padding: 6px 10px; border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--bg);
+      color: var(--text); font-size: 13px; width: 100%;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none; border-color: var(--accent);
+    }
+    label { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; display: block; }
+    .form-group { margin-bottom: 12px; }
+
+    /* ── Modal ──────────────────────────────── */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    .modal-overlay.hidden { display: none; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 24px; width: 420px;
+      max-height: 80vh; overflow-y: auto;
+    }
+    .modal h3 { font-size: 16px; margin-bottom: 16px; }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+    /* ── Stats bar ──────────────────────────── */
+    .stats-bar {
+      display: flex; gap: 16px; padding: 12px 24px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px; color: var(--text-dim);
+    }
+    .stat-item { display: flex; gap: 4px; }
+    .stat-value { color: var(--text); font-weight: 500; }
+
+    /* ── Detail panel ───────────────────────── */
+    .detail-section { margin-bottom: 20px; }
+    .detail-section h4 {
+      font-size: 12px; text-transform: uppercase; color: var(--text-dim);
+      margin-bottom: 8px; letter-spacing: 0.5px;
+    }
+    .detail-row {
+      display: flex; justify-content: space-between;
+      padding: 4px 0; font-size: 13px;
+    }
+    .detail-row-label { color: var(--text-dim); }
+    .detail-row-value { color: var(--text); font-family: monospace; font-size: 12px; }
+    .metadata-block {
+      background: var(--bg); border-radius: var(--radius);
+      padding: 8px 10px; font-family: monospace; font-size: 11px;
+      white-space: pre-wrap; word-break: break-all;
+      max-height: 200px; overflow-y: auto;
+    }
+
+    /* ── Responsive ─────────────────────────── */
+    @media (max-width: 900px) {
+      .sidebar { width: 220px; min-width: 220px; }
+      .detail-panel { width: 280px; min-width: 280px; }
+    }
+    @media (max-width: 700px) {
+      .app { flex-direction: column; }
+      .sidebar { width: 100%; min-width: 100%; max-height: 200px; }
+      .main-body { flex-direction: column; }
+      .detail-panel { width: 100%; min-width: 100%; border-left: none; border-top: 1px solid var(--border); max-height: 40vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <!-- Sidebar: tree list -->
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h2>🌳 Asset Trees</h2>
+        <button class="btn btn-sm btn-primary" onclick="showCreateTreeModal()">+ 新建</button>
+      </div>
+      <div class="tree-list" id="treeList"></div>
+    </div>
+
+    <!-- Main content -->
+    <div class="main">
+      <div class="main-header">
+        <h1 id="mainTitle">选择或创建一个资产树</h1>
+        <div id="mainActions" style="display:none">
+          <button class="btn btn-sm" onclick="showAddNodeModal()">+ 添加节点</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteCurrentTree()">删除树</button>
+        </div>
+      </div>
+      <div class="stats-bar" id="statsBar" style="display:none"></div>
+      <div class="main-body">
+        <div class="tree-panel" id="treePanel">
+          <div class="empty-state">
+            <div class="empty-state-icon">🌳</div>
+            <div class="empty-state-text">选择左侧的资产树，或创建一个新的</div>
+          </div>
+        </div>
+        <div class="detail-panel" id="detailPanel" style="display:none"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create tree modal -->
+  <div class="modal-overlay hidden" id="createTreeModal">
+    <div class="modal">
+      <h3>新建资产树</h3>
+      <div class="form-group">
+        <label>根域名</label>
+        <input type="text" id="createTreeDomain" placeholder="example.com">
+      </div>
+      <div class="form-group">
+        <label>描述（可选）</label>
+        <input type="text" id="createTreeDesc" placeholder="目标资产描述">
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="hideModal('createTreeModal')">取消</button>
+        <button class="btn btn-primary" onclick="createTree()">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add node modal -->
+  <div class="modal-overlay hidden" id="addNodeModal">
+    <div class="modal">
+      <h3>添加节点</h3>
+      <div class="form-group">
+        <label>节点类型</label>
+        <select id="addNodeType">
+          <option value="sub_domain">子域名 (SUB_DOMAIN)</option>
+          <option value="ip">IP 地址 (IP)</option>
+          <option value="port">端口 (PORT)</option>
+          <option value="service">服务 (SERVICE)</option>
+          <option value="endpoint">端点 (ENDPOINT)</option>
+          <option value="generic">通用 (GENERIC)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>值</label>
+        <input type="text" id="addNodeValue" placeholder="如 api.example.com">
+      </div>
+      <div class="form-group">
+        <label>父节点 ID（留空则添加到根节点）</label>
+        <input type="text" id="addNodeParent" placeholder="父节点 ID">
+      </div>
+      <div class="form-group">
+        <label>元数据 JSON（可选）</label>
+        <textarea id="addNodeMeta" rows="3" placeholder='{"key": "value"}'></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="hideModal('addNodeModal')">取消</button>
+        <button class="btn btn-primary" onclick="addNode()">添加</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── State ──────────────────────────────
+    let currentTreeId = null;
+    let currentTreeData = null;
+    let selectedNodeId = null;
+    let expandedNodes = new Set();
+
+    const TYPE_ICONS = {
+      root_domain: '🌐', sub_domain: '🔗', ip: '🖥️',
+      port: '🚪', service: '⚙️', endpoint: '📍', generic: '📦'
+    };
+    const TYPE_NAMES = {
+      root_domain: '根域名', sub_domain: '子域名', ip: 'IP',
+      port: '端口', service: '服务', endpoint: '端点', generic: '通用'
+    };
+
+    // ── API calls ──────────────────────────
+    async function api(method, path, body) {
+      const opts = { method, headers: {} };
+      if (body) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      const resp = await fetch('/asset-tree/api' + path, opts);
+      return resp.json();
+    }
+
+    // ── Tree list ──────────────────────────
+    async function loadTreeList() {
+      const data = await api('GET', '/trees');
+      const list = document.getElementById('treeList');
+      if (!data.trees || data.trees.length === 0) {
+        list.innerHTML = '<div style="padding:20px;color:var(--text-dim);text-align:center;font-size:13px">暂无资产树</div>';
+        return;
+      }
+      list.innerHTML = data.trees.map(t => `
+        <div class="tree-item ${t.id === currentTreeId ? 'active' : ''}"
+             onclick="selectTree('${t.id}')">
+          <div class="tree-item-title">🌐 ${esc(t.root_domain)}</div>
+          <div class="tree-item-meta">${t.node_count} 节点 · ${t.description || '无描述'}</div>
+        </div>
+      `).join('');
+    }
+
+    // ── Select & load tree ─────────────────
+    async function selectTree(treeId) {
+      currentTreeId = treeId;
+      selectedNodeId = null;
+      const data = await api('GET', `/trees/${treeId}`);
+      currentTreeData = data;
+
+      document.getElementById('mainTitle').textContent = `🌐 ${data.root_domain}`;
+      document.getElementById('mainActions').style.display = 'flex';
+      document.getElementById('statsBar').style.display = 'flex';
+
+      renderStats(data);
+      renderTree(data.tree);
+      document.getElementById('detailPanel').style.display = 'none';
+      await loadTreeList();
+    }
+
+    function renderStats(data) {
+      const bar = document.getElementById('statsBar');
+      const stats = data.tree?.stats || {};
+      const counts = {};
+      if (data.tree?.nodes) {
+        for (const n of data.tree.nodes) {
+          counts[n.asset_type] = (counts[n.asset_type] || 0) + 1;
+        }
+      }
+      const parts = [
+        `<span class="stat-item">节点: <span class="stat-value">${data.node_count || 0}</span></span>`,
+      ];
+      for (const [type, count] of Object.entries(counts)) {
+        parts.push(`<span class="stat-item">${TYPE_ICONS[type] || '📦'} ${TYPE_NAMES[type] || type}: <span class="stat-value">${count}</span></span>`);
+      }
+      bar.innerHTML = parts.join('');
+    }
+
+    // ── Render tree ────────────────────────
+    function renderTree(tree) {
+      const panel = document.getElementById('treePanel');
+      if (!tree || !tree.nodes || tree.nodes.length === 0) {
+        panel.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🌱</div><div class="empty-state-text">空树 — 添加第一个节点吧</div></div>';
+        return;
+      }
+      // Build node index
+      const nodeMap = {};
+      for (const n of tree.nodes) nodeMap[n.id] = n;
+      // Find root
+      const root = tree.nodes.find(n => !n.parent_id) || tree.nodes[0];
+      panel.innerHTML = renderNode(root, nodeMap, true);
+    }
+
+    function renderNode(node, nodeMap, isRoot) {
+      const children = (node.children_ids || []).map(id => nodeMap[id]).filter(Boolean);
+      const hasChildren = children.length > 0;
+      const isExpanded = expandedNodes.has(node.id);
+      const isSelected = selectedNodeId === node.id;
+
+      let html = `<div class="tree-node ${isRoot ? 'tree-node-root' : ''}">`;
+      html += `<div class="tree-node-header ${isSelected ? 'selected' : ''}" onclick="selectNode('${node.id}')">`;
+      html += `<span class="tree-node-toggle ${!hasChildren ? 'leaf' : ''} ${isExpanded ? 'expanded' : ''}" onclick="event.stopPropagation(); toggleNode('${node.id}')">▶</span>`;
+      html += `<span class="tree-node-icon">${TYPE_ICONS[node.asset_type] || '📦'}</span>`;
+      html += `<span class="tree-node-label">${esc(node.value)}</span>`;
+      html += `<span class="tree-node-state state-${node.state}">${node.state}</span>`;
+      html += `</div>`;
+
+      if (hasChildren) {
+        html += `<div class="tree-node-children ${isExpanded ? '' : 'collapsed'}">`;
+        for (const child of children) {
+          html += renderNode(child, nodeMap, false);
+        }
+        html += `</div>`;
+      }
+      html += `</div>`;
+      return html;
+    }
+
+    // ── Node selection ─────────────────────
+    function selectNode(nodeId) {
+      selectedNodeId = nodeId;
+      // Re-render to update selection highlight
+      if (currentTreeData?.tree) renderTree(currentTreeData.tree);
+      // Show detail panel
+      const nodeMap = {};
+      for (const n of currentTreeData.tree.nodes) nodeMap[n.id] = n;
+      const node = nodeMap[nodeId];
+      if (node) renderDetail(node);
+    }
+
+    function renderDetail(node) {
+      const panel = document.getElementById('detailPanel');
+      panel.style.display = 'block';
+
+      let html = `<div class="detail-section">`;
+      html += `<h4>节点信息</h4>`;
+      html += `<div class="detail-row"><span class="detail-row-label">ID</span><span class="detail-row-value">${node.id}</span></div>`;
+      html += `<div class="detail-row"><span class="detail-row-label">类型</span><span class="detail-row-value">${TYPE_ICONS[node.asset_type] || ''} ${TYPE_NAMES[node.asset_type] || node.asset_type}</span></div>`;
+      html += `<div class="detail-row"><span class="detail-row-label">值</span><span class="detail-row-value">${esc(node.value)}</span></div>`;
+      html += `<div class="detail-row"><span class="detail-row-label">状态</span><span class="detail-row-value"><span class="tree-node-state state-${node.state}">${node.state}</span></span></div>`;
+      if (node.source_wave) {
+        html += `<div class="detail-row"><span class="detail-row-label">来源波次</span><span class="detail-row-value">${node.source_wave}</span></div>`;
+      }
+      html += `</div>`;
+
+      // State change
+      html += `<div class="detail-section">`;
+      html += `<h4>操作</h4>`;
+      html += `<div style="display:flex;gap:6px;flex-wrap:wrap">`;
+      for (const state of ['unseen', 'discovered', 'triaged', 'exploited', 'abandoned']) {
+        const disabled = node.state === state ? 'disabled' : '';
+        html += `<button class="btn btn-sm" ${disabled} onclick="updateNodeState('${node.id}','${state}')">${state}</button>`;
+      }
+      html += `</div>`;
+      html += `<button class="btn btn-sm btn-danger" style="margin-top:8px" onclick="deleteNode('${node.id}')">删除节点</button>`;
+      html += `</div>`;
+
+      // Metadata
+      if (node.metadata && Object.keys(node.metadata).length > 0) {
+        html += `<div class="detail-section">`;
+        html += `<h4>元数据</h4>`;
+        html += `<div class="metadata-block">${esc(JSON.stringify(node.metadata, null, 2))}</div>`;
+        html += `</div>`;
+      }
+
+      // Children
+      if (node.children_ids && node.children_ids.length > 0) {
+        html += `<div class="detail-section">`;
+        html += `<h4>子节点 (${node.children_ids.length})</h4>`;
+        html += `<div style="font-size:13px;color:var(--text-dim)">${node.children_ids.join(', ')}</div>`;
+        html += `</div>`;
+      }
+
+      panel.innerHTML = html;
+    }
+
+    // ── Actions ────────────────────────────
+    function toggleNode(nodeId) {
+      if (expandedNodes.has(nodeId)) expandedNodes.delete(nodeId);
+      else expandedNodes.add(nodeId);
+      if (currentTreeData?.tree) renderTree(currentTreeData.tree);
+    }
+
+    async function updateNodeState(nodeId, newState) {
+      await api('PUT', `/trees/${currentTreeId}/nodes/${nodeId}`, { state: newState });
+      await selectTree(currentTreeId);
+    }
+
+    async function deleteNode(nodeId) {
+      if (!confirm('确定删除此节点及其所有子节点？')) return;
+      await api('DELETE', `/trees/${currentTreeId}/nodes/${nodeId}`);
+      selectedNodeId = null;
+      document.getElementById('detailPanel').style.display = 'none';
+      await selectTree(currentTreeId);
+    }
+
+    async function deleteCurrentTree() {
+      if (!currentTreeId) return;
+      if (!confirm(`确定删除资产树 "${currentTreeId}"？此操作不可恢复。`)) return;
+      await api('DELETE', `/trees/${currentTreeId}`);
+      currentTreeId = null;
+      currentTreeData = null;
+      selectedNodeId = null;
+      document.getElementById('mainTitle').textContent = '选择或创建一个资产树';
+      document.getElementById('mainActions').style.display = 'none';
+      document.getElementById('statsBar').style.display = 'none';
+      document.getElementById('treePanel').innerHTML = '<div class="empty-state"><div class="empty-state-icon">🌳</div><div class="empty-state-text">选择左侧的资产树，或创建一个新的</div></div>';
+      document.getElementById('detailPanel').style.display = 'none';
+      await loadTreeList();
+    }
+
+    // ── Modals ─────────────────────────────
+    function showCreateTreeModal() {
+      document.getElementById('createTreeModal').classList.remove('hidden');
+      document.getElementById('createTreeDomain').focus();
+    }
+    function showAddNodeModal() {
+      if (!currentTreeId) return;
+      document.getElementById('addNodeModal').classList.remove('hidden');
+      document.getElementById('addNodeValue').focus();
+    }
+    function hideModal(id) {
+      document.getElementById(id).classList.add('hidden');
+    }
+
+    async function createTree() {
+      const domain = document.getElementById('createTreeDomain').value.trim();
+      if (!domain) { alert('请输入根域名'); return; }
+      const desc = document.getElementById('createTreeDesc').value.trim();
+      await api('POST', '/trees', { root_domain: domain, description: desc });
+      hideModal('createTreeModal');
+      document.getElementById('createTreeDomain').value = '';
+      document.getElementById('createTreeDesc').value = '';
+      await loadTreeList();
+    }
+
+    async function addNode() {
+      const type = document.getElementById('addNodeType').value;
+      const value = document.getElementById('addNodeValue').value.trim();
+      if (!value) { alert('请输入节点值'); return; }
+      const parentId = document.getElementById('addNodeParent').value.trim() || undefined;
+      let metadata = {};
+      const metaStr = document.getElementById('addNodeMeta').value.trim();
+      if (metaStr) {
+        try { metadata = JSON.parse(metaStr); }
+        catch { alert('元数据 JSON 格式错误'); return; }
+      }
+      await api('POST', `/trees/${currentTreeId}/nodes`, {
+        asset_type: type, value, parent_id: parentId, metadata,
+      });
+      hideModal('addNodeModal');
+      document.getElementById('addNodeValue').value = '';
+      document.getElementById('addNodeParent').value = '';
+      document.getElementById('addNodeMeta').value = '';
+      await selectTree(currentTreeId);
+    }
+
+    // ── Helpers ────────────────────────────
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+    // ── Init ───────────────────────────────
+    loadTreeList();
+  </script>
+</body>
+</html>

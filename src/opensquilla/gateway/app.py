@@ -10,12 +10,13 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
-from starlette.routing import Route, WebSocketRoute
+from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from opensquilla import __version__
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.asset_tree.web import create_asset_tree_routes
 from opensquilla.gateway.control_ui import create_control_ui_routes
 from opensquilla.gateway.middleware import (
     AuthMiddleware,
@@ -487,6 +488,11 @@ def create_gateway_app(
 
     # ── Control UI routes ────────────────────────────────────────────────
     routes.extend(create_control_ui_routes(config))
+
+    # ── Asset Tree Web UI ────────────────────────────────────────────────
+    routes.append(
+        Mount("/asset-tree", routes=create_asset_tree_routes())
+    )
 
     # ── Middleware ───────────────────────────────────────────────────────────
 
