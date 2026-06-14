@@ -75,10 +75,13 @@ PASS_THROUGH_FILES: tuple[str, ...] = (
 # ATTRIBUTION_BODY}.md so editors can syntax-highlight, linters can
 # validate, and diffs stay small. The constants below are loaded
 # one-shot at import time.
-from opensquilla.agents.hack_deep import (
-    SOUL_BODY as SOUL_BODY,
-    ATTRIBUTION_BODY as ATTRIBUTION_BODY,
-)
+# 2026-06-15 (unified-naming): package renamed to use hyphens;
+# Python's `from X import Y` syntax rejects hyphens, so we use
+# importlib.
+import importlib
+_hack_deep_pkg = importlib.import_module("opensquilla.agents.hack-deep")
+SOUL_BODY = _hack_deep_pkg.SOUL_BODY
+ATTRIBUTION_BODY = _hack_deep_pkg.ATTRIBUTION_BODY
 WORKSPACE_STATE = {
     "bootstrap_completed_at": "2026-06-05T00:00:00.000000Z",
     "schema_version": 1,

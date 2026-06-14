@@ -62,7 +62,7 @@ def _load(name: str) -> str:
 
 
 # Module-level constants. These are the public surface — callers should
-# import them like ``from opensquilla.agents.hack_deep import SOUL_BODY``.
+# import them like ``from opensquilla.agents.hack-deep import SOUL_BODY``.
 SOUL_BODY: str = _load("SOUL_BODY.md")
 ATTRIBUTION_BODY: str = _load("ATTRIBUTION_BODY.md")
 

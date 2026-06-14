@@ -1,6 +1,44 @@
-"""Wave DAG: 4 layers × 11 waves (W0..W8 + W0.5 target-expansion + W1.5 per-subdomain).
+"""Wave DAG: 4 layers × 11 waves, split across 3 LLM owners.
 
-Replaces the broken 7-phase checklist with a real DAG:
+**2026-06-15 refactor**: the 4-layer × 9-wave DAG that previously
+drove a single ``hack-deep`` orchestrator is now split across
+**3 owner LLMs**. The split enforces a clean separation of concerns
+so each LLM has a single responsibility:
+
+================  ==============================================
+Owner              Waves it owns
+================  ==============================================
+hack-deep-find     asset discovery only
+                   W0.5 W1 W1.5 W1.5c W2.5 W3.5
+hack-deep          attack only
+                   W0 W1.6* W2 W3 W4 W4.5*
+hack-deep-ex       post-exploitation only
+                   W5 W6 W6.5* W7 W8
+================  ==============================================
+
+The 3-harness rationale (full version in
+``docs/agent_system_3harness.md``):
+
+* **hack-deep-find** is the *only* LLM authorized to drive DNS
+  / port / endpoint / fingerprint / web-crawl specialists. It
+  consumes a root domain (or an explicit ``find-complete-v1``
+  handoff from the main agent) and produces the asset tree.
+* **hack-deep** is the *only* LLM authorized to drive ROE
+  generation, vulnerability triage, opsec evasion, and
+  penetration. It consumes the asset tree (or a directly-passed
+  target with an asset map) and produces the
+  ``pentest-v1.footholds[]``.
+* **hack-deep-ex** is the *only* LLM authorized to drive
+  post-exploitation. It consumes the footholds + the typed
+  ``post-exploit-complete-v1`` handoff and produces the
+  ``privesc-v1`` / ``lateral-v1`` / ``persist-v1`` /
+  ``impact-v1`` / ``cleanup-v1`` / ``report-v1`` evidence
+  bundle.
+
+Drill-in slots inherit the parent wave's owner (e.g. ``W4.5a``
+is owned by hack-deep; ``W6.5a`` is owned by hack-deep-ex).
+
+The DAG itself is unchanged:
 
   广度层 (Breadth):  W0   engagement-planning
                     W0.5 target-expansion           (NEW: subdomain enumeration, static fanout)
@@ -15,9 +53,9 @@ Replaces the broken 7-phase checklist with a real DAG:
   收口层 (Synthesis): W8 cleanup-rollback ‖ reporting-remediation
 
 Drill-in slots (only in Breadth + Depth):
-  W1.5 广度层侦察补探
-  W4.5 深度层入口补攻
-  W6.5 深度层横向补探
+  W1.6* (hack-deep)         — attack-surface prep drill-in
+  W4.5* (hack-deep)         — attack vector expansion drill-in
+  W6.5* (hack-deep-ex)      — lateral pivot expansion drill-in
   Each with reasons a (swap vector) / b (swap entry) / c (expand scan)
 
 Feedback loop (NEW 2026-06-07):
@@ -65,6 +103,51 @@ LAYERS: dict[str, tuple[str, ...]] = {
 FanoutMode = Literal["single", "static_fanout", "dynamic_fanout"]
 
 
+# 2026-06-15 (3-harness split): each wave has a single owner_agent.
+# The owner is the LLM orchestrator authorized to drive that wave's
+# envelope. The 3-harness split is:
+#
+#   hack-deep-find  : asset discovery only (W0.5 W1 W1.5 W1.5c W2.5 W3.5)
+#   hack-deep       : attack only (W0 ROE + W2 triage + W3 opsec + W4 pentest)
+#   hack-deep-ex    : post-exploitation (W5 privesc + W6 lateral + W7 persist+impact + W8 cleanup+report)
+#
+# W1.6* drill-in slots are owned by hack-deep (operator-driven W2-W4 prep);
+# W6.5* drill-in slots are owned by hack-deep-ex. The W4.5* slots are
+# owned by hack-deep (W4 is the attack surface, drill-in is attack expansion).
+OwnerAgent = Literal["hack-deep-find", "hack-deep", "hack-deep-ex"]
+"""
+The 3-harness split (2026-06-15) maps each wave to a single owner LLM.
+
+The owner of a wave is the LLM orchestrator authorized to issue the
+``sessions_spawn`` for that wave. The Typed Envelope is unchanged
+(``agent_id`` is still the *target* specialist, not the *owner*).
+The owner is enforced at the registry level via
+``subagents.allow_agents`` on each LLM's workspace config (see
+``scripts/clone_hack_deep.py`` /
+``scripts/clone_hack_deep_ex.py`` /
+``scripts/clone_hack_deep_find.py``).
+
+The split rationale is in
+``docs/agent_system_3harness.md`` (forthcoming). Short version:
+
+* **hack-deep-find** is the *only* agent that may drive DNS / port /
+  endpoint / fingerprint scans. The 6 recon specialists live in its
+  allowlist.
+* **hack-deep** is the *only* agent that may drive W0 ROE / W2
+  triage / W3 opsec / W4 penetration. It produces the
+  ``pentest-v1`` evidence with ``footholds[]`` for the next stage.
+* **hack-deep-ex** is the *only* agent that may drive W5-W8. It
+  consumes ``pentest-v1.footholds[]`` and ``privesc-v1`` /
+  ``lateral-v1`` / ``persist-v1`` / ``impact-v1`` / ``cleanup-v1`` /
+  ``report-v1``.
+
+The Typed Envelope between the 3 owners is the existing
+``find-complete-v1`` (hack-deep-find → hack-deep) plus the new
+``post-exploit-complete-v1`` (hack-deep → hack-deep-ex, see
+``evidence.py`` for the schema).
+"""
+
+
 @dataclass(frozen=True)
 class WaveSpec:
     """One wave in the DAG.
@@ -80,6 +163,11 @@ class WaveSpec:
       evidence_schema: the schema name specialists must produce
       deps:           list of wave ids whose evidence must be present
       drill_in_allowed: True iff this wave can spawn a `.5*` drill-in
+      owner_agent:    2026-06-15. The LLM orchestrator authorized to drive
+                      this wave. One of: "hack-deep-find" / "hack-deep" /
+                      "hack-deep-ex". The Typed Envelope is unchanged;
+                      owner_agent is enforced at the registry level via
+                      subagents.allow_agents on each LLM workspace.
     """
 
     wave: str
@@ -90,6 +178,7 @@ class WaveSpec:
     evidence_schema: str
     deps: tuple[str, ...]
     drill_in_allowed: bool
+    owner_agent: OwnerAgent = "hack-deep"
 
     def is_drill_in(self) -> bool:
         return ".5" in self.wave
@@ -109,6 +198,7 @@ def _w(
     fanout: FanoutMode = "single",
     fanout_agents: tuple[str, ...] = (),
     drill_in_allowed: bool = False,
+    owner_agent: OwnerAgent = "hack-deep",
 ) -> WaveSpec:
     return WaveSpec(
         wave=wave,
@@ -119,6 +209,7 @@ def _w(
         evidence_schema=evidence_schema,
         deps=deps,
         drill_in_allowed=drill_in_allowed,
+        owner_agent=owner_agent,
     )
 
 
@@ -127,6 +218,7 @@ WAVES: dict[str, WaveSpec] = {
     "W0": _w(
         "W0", LayerName.BREADTH.value, "engagement-planning",
         "roe-v1", deps=(),
+        owner_agent="hack-deep",
     ),
     "W0.5": _w(
         "W0.5", LayerName.BREADTH.value, None,
@@ -135,6 +227,7 @@ WAVES: dict[str, WaveSpec] = {
         fanout="static_fanout",
         fanout_agents=("recon", "intel-collection", "attack-surface-enumeration"),
         drill_in_allowed=False,
+        owner_agent="hack-deep-find",
     ),
     "W0.6": _w(
         "W0.6", LayerName.BREADTH.value, None,
@@ -149,6 +242,7 @@ WAVES: dict[str, WaveSpec] = {
         fanout="static_fanout",
         fanout_agents=("recon", "penetration", "engagement-planning"),
         drill_in_allowed=False,
+        owner_agent="hack-deep-find",
     ),
     "W1": _w(
         "W1", LayerName.BREADTH.value, None,
@@ -159,6 +253,7 @@ WAVES: dict[str, WaveSpec] = {
         fanout="static_fanout",
         fanout_agents=("recon", "intel-collection", "attack-surface-enumeration"),
         drill_in_allowed=True,
+        owner_agent="hack-deep-find",
     ),
     "W1.5": _w(
         "W1.5", LayerName.BREADTH.value, "recon",
@@ -166,6 +261,7 @@ WAVES: dict[str, WaveSpec] = {
         deps=("W0.5",),
         fanout="dynamic_fanout",
         drill_in_allowed=False,  # feedback loop is at orchestrator level, not drill-in
+        owner_agent="hack-deep-find",
     ),
     "W1.5c": _w(
         "W1.5c", LayerName.BREADTH.value, "recon",
@@ -178,11 +274,13 @@ WAVES: dict[str, WaveSpec] = {
         deps=("W1",),
         fanout="single",
         drill_in_allowed=False,
+        owner_agent="hack-deep-find",
     ),
     "W2": _w(
         "W2", LayerName.BREADTH.value, "vulnerability-triage",
         "triage-v1",
         deps=("W1",),  # W2 reads W1's asset map; W3 opsec gates W4, not W2
+        owner_agent="hack-deep",
     ),
     "W2.5": _w(
         "W2.5", LayerName.BREADTH.value, "vulnerability-triage",
@@ -194,12 +292,14 @@ WAVES: dict[str, WaveSpec] = {
         deps=("W2", "W1.5c"),
         fanout="dynamic_fanout",
         drill_in_allowed=False,
+        owner_agent="hack-deep-find",  # 2026-06-15: per-port planning is recon-side
     ),
     # Covert layer -------------------------------------------------------------
     "W3": _w(
         "W3", LayerName.COVERT.value, "opsec-evasion",
         "opsec-v1",
         deps=("W2.5",),
+        owner_agent="hack-deep",
     ),
     "W3.5": _w(
         "W3.5", LayerName.BREADTH.value, "recon",
@@ -212,6 +312,7 @@ WAVES: dict[str, WaveSpec] = {
         deps=("W3",),
         fanout="dynamic_fanout",
         drill_in_allowed=False,
+        owner_agent="hack-deep-find",  # 2026-06-15: web crawl is recon-side
     ),
     # Depth layer --------------------------------------------------------------
     "W4": _w(
@@ -222,17 +323,20 @@ WAVES: dict[str, WaveSpec] = {
                               # block W4 if W0.6 missing or failed)
         fanout="dynamic_fanout",  # count = entry_count // 8
         drill_in_allowed=True,
+        owner_agent="hack-deep",
     ),
     "W5": _w(
         "W5", LayerName.DEPTH.value, "privilege-escalation",
         "privesc-v1",
         deps=("W4",),
+        owner_agent="hack-deep-ex",
     ),
     "W6": _w(
         "W6", LayerName.DEPTH.value, "lateral-movement",
         "lateral-v1",
         deps=("W5",),
         drill_in_allowed=True,
+        owner_agent="hack-deep-ex",
     ),
     "W7": _w(
         "W7", LayerName.DEPTH.value, None,
@@ -240,6 +344,7 @@ WAVES: dict[str, WaveSpec] = {
         deps=("W6",),
         fanout="static_fanout",
         fanout_agents=("persistence-maintenance", "impact-exfiltration"),
+        owner_agent="hack-deep-ex",
     ),
     # Synthesis layer ---------------------------------------------------------
     "W8": _w(
@@ -248,6 +353,7 @@ WAVES: dict[str, WaveSpec] = {
         deps=("W7",),
         fanout="static_fanout",
         fanout_agents=("cleanup-rollback", "reporting-remediation"),
+        owner_agent="hack-deep-ex",
     ),
 }
 
@@ -264,10 +370,74 @@ DRILL_IN_SLOTS: dict[str, tuple[str, ...]] = {
     # W1.5 is now a registered wave (per-subdomain fan-out). The numeric
     # suffix .5 is reserved for registered sub-waves; drill-in slots of a
     # parent P use suffix .(P+1).N to stay distinguishable.
+    #
+    # 2026-06-15 (3-harness split): each drill-in inherits its parent
+    # wave's owner_agent. W1.6* (attack-surface prep) -> hack-deep,
+    # W4.5* (attack vector expansion) -> hack-deep,
+    # W6.5* (lateral pivot expansion) -> hack-deep-ex.
     "W1": ("W1.6a", "W1.6b", "W1.6c"),
     "W4": ("W4.5a", "W4.5b", "W4.5c"),
     "W6": ("W6.5a", "W6.5b", "W6.5c"),
 }
+
+
+class UnauthorizedOwnerError(Exception):
+    """Raised when sessions_spawn is called from the wrong owner LLM.
+
+    3-harness split (2026-06-15): the LLM that drives a wave must
+    match the wave's owner_agent. For example, hack-deep-find cannot
+    drive W5 (privilege-escalation); only hack-deep-ex can. This
+    check is enforced at the executor / envelope-parse layer; the
+    LLM is expected to follow the contract but the runtime is
+    defense-in-depth.
+    """
+
+    def __init__(self, wave: str, calling_agent: str, expected_owner: str) -> None:
+        self.wave = wave
+        self.calling_agent = calling_agent
+        self.expected_owner = expected_owner
+        super().__init__(
+            f"wave {wave!r} is owned by {expected_owner!r} but "
+            f"caller is {calling_agent!r}; the 3-harness split "
+            f"(hack-deep-find / hack-deep / hack-deep-ex) prohibits "
+            f"this call. See attack_dispatch/waves.py:OwnerAgent."
+        )
+
+
+def owner_of_wave(wave: str) -> OwnerAgent:
+    """Return the owner_agent for a wave or drill-in slot name.
+
+    Drill-in slots (e.g. ``W4.5a``) inherit their parent wave's
+    owner (W4.5a -> W4 -> hack-deep). Unknown waves raise
+    KeyError (caller is expected to validate the wave name first).
+    """
+    if wave in WAVES:
+        return WAVES[wave].owner_agent
+    # Drill-in: strip the suffix (W4.5a -> W4, W1.6b -> W1)
+    for parent in DRILL_IN_SLOTS:
+        if wave in DRILL_IN_SLOTS[parent]:
+            return WAVES[parent].owner_agent
+    raise KeyError(f"wave {wave!r} is not a registered wave or drill-in slot")
+
+
+def check_authorization(wave: str, calling_agent: str) -> None:
+    """Raise UnauthorizedOwnerError if calling_agent can't drive wave.
+
+    The 3-harness split (2026-06-15) assigns each wave to exactly
+    one of the 3 LLM owners:
+
+      hack-deep-find : asset discovery (W0.5 W1 W1.5 W1.5c W2.5 W3.5)
+      hack-deep      : attack         (W0 W1.6* W2 W3 W4 W4.5*)
+      hack-deep-ex   : post-exploit   (W5 W6 W6.5* W7 W8)
+
+    This function is called by the executor's
+    ``_resolve_dispatch`` (or the gateway's session spawn handler)
+    BEFORE issuing the specialist call. The check is one-line and
+    O(1) (just a dict lookup).
+    """
+    expected = owner_of_wave(wave)
+    if calling_agent != expected:
+        raise UnauthorizedOwnerError(wave, calling_agent, expected)
 
 
 def is_drill_in_allowed(parent_wave: str) -> bool:

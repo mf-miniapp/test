@@ -32,32 +32,40 @@ from opensquilla.attack_dispatch.envelope import (
     validate_result_marker_format,
 )
 from opensquilla.attack_dispatch.waves import (
+    DRILL_IN_SLOTS,
     LAYER_NAMES,
     LAYERS,
+    LayerName,
+    OwnerAgent,
+    UnauthorizedOwnerError,
     WAVE_NAMES,
     WAVES,
-    LayerName,
     WaveSpec,
+    check_authorization,
     get_wave,
     is_drill_in_allowed,
     list_drill_in_slots,
+    owner_of_wave,
 )
 from opensquilla.attack_dispatch.evidence import (
     EVIDENCE_SCHEMAS,
     EVIDENCE_SCHEMA_NAMES,
     EvidenceBase,
     GlobalFinding,
-    PerTargetFinding,
-    ReconEvidence,
-    ResultStatus as EvidenceResultStatus,
-    ROEEvidence,
+    LateralEvidence,
     OPSECEvidence,
     PenetrationEvidence,
     PenetrationFinding,
-    LateralEvidence,
+    PerTargetFinding,
+    QAResult,
+    ReconEvidence,
     ReportEvidence,
+    ResultStatus as EvidenceResultStatus,
+    ROEEvidence,
+    SevenQuestionGate,
     SubTargetHandle,
     SubTargetHandleList,
+    TriageEvidence,
     make_evidence,
 )
 from opensquilla.attack_dispatch.drill_in import (
@@ -77,6 +85,18 @@ from opensquilla.attack_dispatch.trail import (
     TrailRow,
     TrailSnapshot,
     rebuild_trail_markdown,
+)
+from opensquilla.attack_dispatch.scope_matcher import (
+    REJECT_CANNOT_PARSE,
+    REJECT_DEFAULT_DENY,
+    REJECT_DENY_WINS,
+    REJECT_SUFFIX_CONFUSION,
+    REJECT_WILDCARD_TOO_SHALLOW,
+    WILDCARD_PREFIX,
+    extract_hosts_from_blob,
+    in_scope,
+    reject_reason,
+    scope_audit_hosts,
 )
 
 __all__ = [
