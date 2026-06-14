@@ -34,6 +34,8 @@ calls (in production) or by in-memory test doubles (in unit tests).
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -76,6 +78,8 @@ from opensquilla.attack_dispatch.waves import (
     list_drill_in_slots,
 )
 
+log = logging.getLogger(__name__)
+
 
 # Dynamic fan-out: how many entry buckets per penetration sub-track.
 SUB_TRACK_BUCKET_SIZE = 8
@@ -83,6 +87,88 @@ SUB_TRACK_BUCKET_SIZE = 8
 # Default per-step artifact archive root. Production code (hack-deep) runs
 # against this; tests can pass a tmp_path to keep the real workspace clean.
 DEFAULT_ARTIFACT_ROOT = Path.home() / ".opensquilla" / "agents" / "hack-deep" / "memory" / "waves"
+
+
+# ---------------------------------------------------------------------------
+# Context-overflow detection (v3.3, 2026-06-14, Issue #9)
+# ---------------------------------------------------------------------------
+
+# Terminal-reason strings that indicate the specialist's context window
+# overflowed.  When any of these appears in the specialist's error
+# response (or exception message), the executor can attempt a slim-respawn
+# with a stripped-down brief instead of propagating the failure immediately.
+_CONTEXT_OVERFLOW_REASONS: frozenset[str] = frozenset({
+    "provider_request_too_large",
+    "provider_output_truncated",
+    "context_exhausted",
+    "context_length_exceeded",
+})
+
+# Maximum number of slim-respawn retries per specialist (independent of
+# transient retry cap).  After this many retries the overflow is treated
+# as exhausted — the specialist result is recorded as an error but the
+# executor continues to the next wave.
+CONTEXT_OVERFLOW_MAX_RETRIES: int = 2
+
+
+def _is_context_overflow(exc: BaseException | None, result: object = None) -> bool:
+    """Return ``True`` if *exc* or *result* signals context overflow."""
+    # Check exception first (most common path)
+    if exc is not None:
+        msg = str(exc).lower()
+        if any(reason in msg for reason in _CONTEXT_OVERFLOW_REASONS):
+            return True
+        # Also match common HTTP 400/413 patterns
+        if "request too large" in msg or "token limit" in msg:
+            return True
+    # Check result dict for error indicators
+    if isinstance(result, dict):
+        for key in ("terminal_reason", "error", "error_class", "error_code"):
+            val = str(result.get(key, "")).lower()
+            if any(reason in val for reason in _CONTEXT_OVERFLOW_REASONS):
+                return True
+    return False
+
+
+def _compute_slim_brief(original_brief: str) -> str:
+    """Strip non-essential content from *original_brief* for a slim respawn.
+
+    Keeps the W4/W7 contract section and core instruction; removes triage
+    summaries, opsec tables, artifact path lists, and verbose context that
+    can be re-read from persistent artifacts.
+    """
+    lines = original_brief.splitlines()
+    kept: list[str] = []
+    skip_block = False
+
+    for line in lines:
+        lower = line.lower().strip()
+
+        # Skip verbose triage summaries
+        if lower.startswith("## triage summary") or lower.startswith("## opsec"):
+            skip_block = True
+            continue
+        if lower.startswith("## ") and skip_block:
+            skip_block = False
+        if skip_block:
+            continue
+
+        # Skip artifact path listings
+        if "artifact_root" in lower or "waves/" in lower or ".json" in lower:
+            continue
+        # Skip verbose instructions about file formats
+        if lower.startswith("output format") or lower.startswith("json schema"):
+            continue
+
+        kept.append(line)
+
+    slim = "\n".join(kept).strip()
+    if not slim:
+        # Fallback: keep first 50% of original
+        half = len(lines) // 2
+        slim = "\n".join(lines[: half]).strip()
+    # Prepend context overflow marker so downstream can detect slim retries
+    return f"[subagent_context_overflow_auto_retry]\n{slim}"
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +570,11 @@ class DispatchExecutor:
         quality_scorer_fn: "PhaseQualityScorerFn | None" = None,
         quality_threshold: int = 90,
         quality_max_retries: int = 3,
+        transient_max_retries: int = 2,
+        transient_retry_backoff: float = 1.0,
+        resume: bool = True,
+        overflow_max_retries: int = CONTEXT_OVERFLOW_MAX_RETRIES,
+        overflow_slim_evidence_fraction: float = 0.25,
     ) -> None:
         self.specialist_fn = specialist_fn
         self.thinness_threshold = thinness_threshold
@@ -589,6 +680,103 @@ class DispatchExecutor:
         # Per-wave retry counter; reset on each new wave.
         # ``_score_phase_quality`` reads / increments this.
         self._wave_retry_count: dict[str, int] = {}
+        # Transient failure retry config. When a specialist call raises
+        # a transient error (ConnectionError, TimeoutError, OSError,
+        # RateLimitError), the executor retries up to this many times
+        # with exponential backoff before giving up.
+        self.transient_max_retries: int = int(transient_max_retries)
+        self.transient_retry_backoff: float = float(transient_retry_backoff)
+        self.resume: bool = bool(resume)
+        # v3.3 (2026-06-14, Issue #9): context-overflow slim-respawn config.
+        # When a specialist call fails due to context overflow, the executor
+        # computes a stripped-down "slim" brief and retries (up to
+        # ``overflow_max_retries`` per specialist) instead of propagating
+        # the failure immediately.  The per-specialist retry count is
+        # tracked in ``_overflow_retries`` and reset on each new ``run()``.
+        self.overflow_max_retries: int = int(overflow_max_retries)
+        self.overflow_slim_evidence_fraction: float = float(overflow_slim_evidence_fraction)
+        self._overflow_retries: dict[str, int] = {}
+
+    # -- checkpoint / resume ------------------------------------------------
+
+    def _checkpoint_path(self, root: Path | None = None) -> Path:
+        """Return the path to the checkpoint file under *root* (or artifact_root)."""
+        return (root or self.artifact_root) / ".checkpoint.json"
+
+    def _save_checkpoint(self, state: "DispatchState", root: Path | None = None) -> None:
+        """Persist completed evidence to ``<root>/.checkpoint.json``.
+
+        The checkpoint JSON has two keys:
+
+        * ``evidence`` – ``{wave_id: serialized_evidence}`` for every
+          completed wave whose value is an ``EvidenceBase`` instance.
+          Runtime-only entries (e.g. ``W0_subdomain_handle``) are skipped.
+        * ``evidence_paths`` – ``{wave_id: str}`` mirroring
+          ``state.evidence_paths``.
+
+        Write is atomic (via rename) and best-effort; failures are
+        logged to ``state.errors`` but do **not** abort the run.
+        """
+        try:
+            effective_root = root or self.artifact_root
+            effective_root.mkdir(parents=True, exist_ok=True)
+            ev_data: dict[str, dict[str, object]] = {}
+            for wid, ev in state.evidence.items():
+                if isinstance(ev, EvidenceBase):
+                    ev_data[wid] = ev.model_dump(mode="json")
+                # Non-EvidenceBase entries are runtime-only and not
+                # checkpointed.
+            payload = {
+                "evidence": ev_data,
+                "evidence_paths": dict(state.evidence_paths),
+            }
+            cp = self._checkpoint_path(root)
+            tmp = cp.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, indent=2, default=str),
+                encoding="utf-8",
+            )
+            tmp.replace(cp)
+        except Exception as exc:  # noqa: BLE001
+            state.errors.append(f"checkpoint save failed: {exc}")
+
+    def _load_checkpoint(self, state: "DispatchState", root: Path | None = None) -> None:
+        """Restore evidence from a prior ``.checkpoint.json`` if present.
+
+        Each persisted evidence dict carries an ``evidence_schema``
+        field.  We look up the concrete Pydantic class via
+        :data:`EVIDENCE_SCHEMAS` and call ``model_validate`` so
+        downstream code receives fully-typed evidence objects – the
+        same as if the wave had just completed.
+
+        Only entries whose schema name is found in ``EVIDENCE_SCHEMAS``
+        are restored; unknown schemas are silently skipped.
+        """
+        cp = self._checkpoint_path(root)
+        if not cp.is_file():
+            return
+        try:
+            raw = json.loads(cp.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            state.errors.append(f"checkpoint load failed (ignored): {exc}")
+            return
+
+        ev_raw: dict[str, dict[str, object]] = raw.get("evidence", {})
+        for wid, ev_dict in ev_raw.items():
+            schema_name = ev_dict.get("evidence_schema")
+            if not schema_name or schema_name not in EVIDENCE_SCHEMAS:
+                continue
+            schema_cls = EVIDENCE_SCHEMAS[schema_name]
+            try:
+                state.evidence[wid] = schema_cls.model_validate(ev_dict)
+            except Exception as exc:  # noqa: BLE001
+                state.errors.append(
+                    f"checkpoint restore {wid} ({schema_name}) failed: {exc}"
+                )
+
+        for wid, path_str in raw.get("evidence_paths", {}).items():
+            if wid not in state.evidence_paths:
+                state.evidence_paths[wid] = path_str
 
     # -- public -------------------------------------------------------------
 
@@ -619,6 +807,9 @@ class DispatchExecutor:
             return self._run_via_per_subdomain(target, state)
         if state is None:
             state = DispatchState()
+        if self.resume:
+            self._load_checkpoint(state)
+        self._overflow_retries.clear()  # reset per-session overflow counters
         started_at = datetime.now(timezone.utc)
         # Ensure trail.md exists on disk before any wave runs so the
         # in-prompt hook (StepTrailRebuilderHook) can read it on the
@@ -630,6 +821,7 @@ class DispatchExecutor:
             state.evidence["W0_peer_attach"] = peer_w0
         for wave in WAVE_NAMES:
             self.run_wave(wave, state, target=target)
+            self._save_checkpoint(state)
         finished_at = datetime.now(timezone.utc)
         # Manifest write failure is non-fatal; the in-memory results are
         # still returned. The orchestrator decides whether to abort the
@@ -705,13 +897,17 @@ class DispatchExecutor:
         # 1) Run the prelude (W0 + W0.5) once for the main domain.
         prelude_state = state
         prelude_state.target_queue = list(prelude_state.target_queue)  # in-place safe
+        if self.resume:
+            self._load_checkpoint(prelude_state)
         # 1a) W0
         prelude_state.evidence.get("W0")  # may already exist (peer attach)
         if "W0" not in prelude_state.evidence:
             self.run_wave("W0", prelude_state, target=target)
+            self._save_checkpoint(prelude_state)
         # 1b) W0.5
         if "W0.5" not in prelude_state.evidence:
             self.run_wave("W0.5", prelude_state, target=target)
+            self._save_checkpoint(prelude_state)
         # 2) Read the subdomain handle list produced by W0.5.
         w05 = prelude_state.evidence.get("W0.5")
         if not isinstance(w05, SubTargetHandleList) or not w05.handles:
@@ -743,6 +939,8 @@ class DispatchExecutor:
             sub_state.evidence["W0_subdomain_handle"] = handle
             sub_root = self.artifact_root / self._subdomain_dirname(sub)
             sub_state.subdomain_artifact_roots[sub] = str(sub_root)
+            if self.resume:
+                self._load_checkpoint(sub_state, root=sub_root)
             sub_results: list[WaveResult] = []
             # Optional W1.5 (off by default; the per-subdomain driver
             # does its own per-subdomain recon inline as W1).
@@ -754,6 +952,7 @@ class DispatchExecutor:
                 sub_results.append(
                     self.run_wave(wave, sub_state, target=sub)
                 )
+                self._save_checkpoint(sub_state, root=sub_root)
             results[sub] = sub_results
             # Mirror per-subdomain evidence back into the engagement
             # state so the W8 reporting specialist (which reads from
@@ -1813,6 +2012,102 @@ class DispatchExecutor:
     # the helper re-invokes the specialist(s) with a
     # retry brief that carries the score report. The
     # loop runs up to ``quality_max_retries`` times. The
+    def _call_specialist_with_retry(
+        self,
+        env: HandoffEnvelope,
+        brief: str,
+        state: DispatchState | None = None,
+        wave: str | None = None,
+    ) -> dict | EvidenceBase:
+        """Call ``self.specialist_fn`` with transient and overflow retry.
+
+        Retry strategy (v3.3):
+          1. **Transient retry** (ConnectionError / TimeoutError /
+             OSError): up to ``self.transient_max_retries`` attempts
+             with exponential backoff.
+          2. **Context-overflow slim-respawn**: when the specialist
+             raises an exception or returns a result containing a
+             context-overflow terminal reason, the executor computes a
+             stripped-down "slim" brief and retries — up to
+             ``self.overflow_max_retries`` per specialist.
+
+        Args:
+            env: The handoff envelope for the specialist.
+            brief: The brief string.
+            state: Optional ``DispatchState`` for error recording.
+            wave: Optional wave name for error recording.
+        """
+        max_retries = max(0, int(self.transient_max_retries))
+        overflow_max = max(0, int(self.overflow_max_retries))
+        backoff = max(0.1, float(self.transient_retry_backoff))
+        transient_types = (ConnectionError, TimeoutError, OSError)
+
+        # Overflow retry key: unique per (wave, specialist identity)
+        overflow_key = (
+            (wave or "??") + ":"
+            + (getattr(env, "handoff_id", None)
+               or getattr(env, "target_domain", "unknown"))
+        )
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = self.specialist_fn(env, brief)
+            except transient_types as exc:
+                if attempt < max_retries:
+                    delay = backoff * (2 ** attempt)
+                    log.info(
+                        "transient_retry wave=%s attempt=%d/%d error=%s",
+                        wave or env.wave,
+                        attempt + 1,
+                        max_retries,
+                        str(exc)[:200],
+                    )
+                    import time as _time
+                    _time.sleep(delay)
+                else:
+                    # Exhausted retries — record and re-raise.
+                    if state is not None and wave is not None:
+                        state.errors.append(
+                            f"[{wave}] transient failure after "
+                            f"{max_retries + 1} attempts: {exc}"
+                        )
+                    raise
+            except Exception as exc:
+                # v3.3: check for context overflow in exception
+                if _is_context_overflow(exc):
+                    used = self._overflow_retries.get(overflow_key, 0)
+                    if used < overflow_max:
+                        self._overflow_retries[overflow_key] = used + 1
+                        brief = _compute_slim_brief(brief)
+                        log.info(
+                            "context_overflow_retry wave=%s key=%s attempt=%d/%d",
+                            wave or getattr(env, "wave", "??"),
+                            overflow_key,
+                            used + 1,
+                            overflow_max,
+                        )
+                        continue  # retry with slim brief
+                if state is not None and wave is not None:
+                    state.errors.append(
+                        f"[{wave}] {type(exc).__name__}: {exc}"
+                    )
+                raise
+            else:
+                # v3.3: check result dict for context overflow
+                if _is_context_overflow(None, result):
+                    used = self._overflow_retries.get(overflow_key, 0)
+                    if used < overflow_max:
+                        self._overflow_retries[overflow_key] = used + 1
+                        brief = _compute_slim_brief(brief)
+                        log.info(
+                            "context_overflow_retry wave=%s key=%s attempt=%d/%d",
+                            wave or getattr(env, "wave", "??"),
+                            overflow_key,
+                            used + 1,
+                            overflow_max,
+                        )
+                        continue  # retry with slim brief
+                return result
     # caller uses the final (raw_results, evidence,
     # verified, downgraded, briefs_by_env, quality_score)
     # tuple to build the WaveResult and (if score
@@ -1916,8 +2211,8 @@ class DispatchExecutor:
             # Invoke specialist(s).
             raw_results = []
             for env in envelopes:
-                raw = self.specialist_fn(
-                    env, briefs_by_env[env.handoff_id]
+                raw = self._call_specialist_with_retry(
+                    env, briefs_by_env[env.handoff_id], state=state, wave=wave,
                 )
                 raw_results.append(raw)
                 state.raw_calls.append(
@@ -2059,7 +2354,13 @@ class DispatchExecutor:
             f"Detail: {d_spec.reason_detail}. "
             f"Target: {target_str}."
         )
-        raw = self.specialist_fn(env, brief)
+        try:
+            raw = self._call_specialist_with_retry(env, brief, state=state, wave=d_spec.slot)
+        except Exception as exc:  # noqa: BLE001
+            state.errors.append(
+                f"drill-in slot {d_spec.slot} specialist failed: {exc}"
+            )
+            return {}
         state.raw_calls.append(
             {
                 "wave": d_spec.slot,

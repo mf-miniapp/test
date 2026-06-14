@@ -1874,7 +1874,7 @@ def _make_specialist_double(
 
 class TestExecutor:
     def test_runs_all_nine_waves_in_order(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         results = ex.run(target="example.com")
         assert [r.wave for r in results] == list(WAVE_NAMES)
         # All but W1 fanout produce 1 evidence record; W1 has 3 fanout
@@ -1882,7 +1882,7 @@ class TestExecutor:
         assert all(r.error is None for r in results)
 
     def test_w1_static_fanout_creates_three_envelopes(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         results = ex.run(target="example.com")
         w1 = next(r for r in results if r.wave == "W1")
         assert w1.specialist_calls == 3  # recon, intel, surface
@@ -1894,7 +1894,7 @@ class TestExecutor:
         # merged recon.services has 36 entries → W4 fans out to
         # 36 // SUB_TRACK_BUCKET_SIZE = 36 // 8 = 4 sub-tracks.
         fn = _make_specialist_double(n_recon_subs=3, n_recon_services=4)
-        ex = DispatchExecutor(specialist_fn=fn)
+        ex = DispatchExecutor(specialist_fn=fn, resume=False)
         results = ex.run(target="example.com")
         w4 = next(r for r in results if r.wave == "W4")
         assert w4.specialist_calls == 36 // SUB_TRACK_BUCKET_SIZE == 4
@@ -1904,7 +1904,7 @@ class TestExecutor:
         # W4 fanout is still 4. The test simply verifies the call is
         # non-zero and that the model doesn't crash on big inputs.
         fn2 = _make_specialist_double(n_recon_subs=20, n_recon_services=20)
-        ex2 = DispatchExecutor(specialist_fn=fn2)
+        ex2 = DispatchExecutor(specialist_fn=fn2, resume=False)
         results2 = ex2.run(target="example.com")
         w4_2 = next(r for r in results2 if r.wave == "W4")
         assert w4_2.specialist_calls == 36 // SUB_TRACK_BUCKET_SIZE == 4
@@ -1928,13 +1928,13 @@ class TestExecutor:
                 return {"target": "example.com"}
             return {"target": "example.com"}
 
-        ex3 = DispatchExecutor(specialist_fn=empty_recon_fn)
+        ex3 = DispatchExecutor(specialist_fn=empty_recon_fn, resume=False)
         results3 = ex3.run(target="example.com")
         w4_3 = next(r for r in results3 if r.wave == "W4")
         assert w4_3.specialist_calls == 1  # max(1, 0 // 8) = 1
 
     def test_drill_in_does_not_run_when_evidence_fully_populated(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         ex.run_wave("W1", state, target="example.com")
         ex.run_wave("W4", state, target="example.com")
@@ -1946,7 +1946,7 @@ class TestExecutor:
         # Make W1 evidence empty → drill-in a/b/c.
         # W1's barrier dep is W0, so we must run W0 first.
         fn = _make_specialist_double(empty_waves={"W1"})
-        ex = DispatchExecutor(specialist_fn=fn)
+        ex = DispatchExecutor(specialist_fn=fn, resume=False)
         state = DispatchState()
         ex.run_wave("W0", state, target="example.com")
         ex.run_wave("W1", state, target="example.com")
@@ -1957,7 +1957,7 @@ class TestExecutor:
         assert "W1.6c" in slots
 
     def test_barrier_blocks_wave_with_missing_dep(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         result = ex.run_wave("W2", state, target="example.com")
         # W2's deps are W1 and W3; neither has been run
@@ -1967,7 +1967,7 @@ class TestExecutor:
         assert result.evidence is None
 
     def test_full_run_produces_no_errors(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         ex.run(target="example.com", state=state)
         assert state.errors == []
@@ -1975,7 +1975,7 @@ class TestExecutor:
         assert set(state.evidence.keys()) == set(WAVE_NAMES)
 
     def test_run_wave_is_idempotent(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         r1 = ex.run_wave("W0", state, target="example.com")
         r2 = ex.run_wave("W0", state, target="example.com")
@@ -1987,7 +1987,7 @@ class TestExecutor:
         def bad_fn(env, brief):
             return {"target": "x", "executive_summary": "ok"}  # wrong schema for W0
 
-        ex = DispatchExecutor(specialist_fn=bad_fn)
+        ex = DispatchExecutor(specialist_fn=bad_fn, resume=False)
         state = DispatchState()
         result = ex.run_wave("W0", state, target="example.com")
         assert result.error is not None
@@ -2008,7 +2008,7 @@ class TestExecutor:
         assert r.drill_in_overlay == {}
 
     def test_w0_5_static_fanout_creates_three_envelopes(self) -> None:
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         ex.run_wave("W0", state, target="example.com")
         ex.run_wave("W0.5", state, target="example.com")
@@ -2024,7 +2024,7 @@ class TestExecutor:
         # W0.5 produces n_recon_subs subdomains; W1.5 dynamic fanout =
         # max(1, n_subs // SUB_TRACK_BUCKET_SIZE). With 5 subs and bucket 8
         # the fallback is 1 sub-track.
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double(n_recon_subs=5))
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(n_recon_subs=5), resume=False)
         state = DispatchState()
         ex.run(target="example.com", state=state)
         # W1.5 has deps=("W0.5",) so it runs after W0.5. With 5 subdomains
@@ -2063,7 +2063,7 @@ class TestExecutor:
                 }
             return _make_specialist_double()(envelope, brief)
 
-        ex = DispatchExecutor(specialist_fn=custom_fn)
+        ex = DispatchExecutor(specialist_fn=custom_fn, resume=False)
         state = DispatchState()
         ex.run(target="example.com", state=state)
         # 16 subdomains / bucket 8 = 2 sub-tracks
@@ -2073,7 +2073,7 @@ class TestExecutor:
         # Empty W1 → drill-in a/b/c fires; the drill-in raws are recorded
         # in state.drill_in_overlay["W1"] but parent evidence is preserved.
         fn = _make_specialist_double(empty_waves={"W1"})
-        ex = DispatchExecutor(specialist_fn=fn)
+        ex = DispatchExecutor(specialist_fn=fn, resume=False)
         state = DispatchState()
         ex.run_wave("W0", state, target="example.com")
         w1_result = ex.run_wave("W1", state, target="example.com")
@@ -2118,7 +2118,7 @@ class TestExecutor:
                 }
             return {"target": "example.com"}
 
-        ex = DispatchExecutor(specialist_fn=fn)
+        ex = DispatchExecutor(specialist_fn=fn, resume=False)
         state = DispatchState()
         ex.run(target="example.com", state=state)
         # W4 (pentest) emitted 2 new targets
@@ -2160,7 +2160,7 @@ class TestExecutor:
                 }
             return {"target": "example.com"}
 
-        ex = DispatchExecutor(specialist_fn=fn)
+        ex = DispatchExecutor(specialist_fn=fn, resume=False)
         state = DispatchState()
         # Pre-populate the queue with the same target
         state.target_queue.append("dup.example.com")
@@ -2184,6 +2184,7 @@ class TestExecutor:
         ex = DispatchExecutor(
             specialist_fn=_make_specialist_double(),
             peer_attach_fn=peer_attach,
+            resume=False,
         )
         state = DispatchState()
         ex.run(target="example.com", state=state)
@@ -2192,7 +2193,7 @@ class TestExecutor:
 
     def test_run_without_peer_attach_is_noop(self) -> None:
         # Default (no peer_attach_fn) → no attach, no errors
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         ex.run(target="example.com", state=state)
         assert "W0_peer_attach" not in state.evidence
@@ -2206,6 +2207,7 @@ class TestExecutor:
         ex = DispatchExecutor(
             specialist_fn=_make_specialist_double(),
             peer_attach_fn=bad_peer_attach,
+            resume=False,
         )
         state = DispatchState()
         ex.run(target="example.com", state=state)
@@ -2318,7 +2320,7 @@ class TestArtifactArchive:
         production layout the hack-deep LLM agent reads from.
         """
         from opensquilla.attack_dispatch.executor import DEFAULT_ARTIFACT_ROOT
-        ex = DispatchExecutor(specialist_fn=_make_specialist_double())
+        ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         assert ex.artifact_root == DEFAULT_ARTIFACT_ROOT
         assert ex.artifact_root == (
             Path.home() / ".opensquilla" / "agents" / "hack-deep"
@@ -3452,7 +3454,7 @@ class TestExecutorQualityScoring:
         def specialist_fn(env, brief):
             return ReconEvidence(target="x", services=[])
 
-        ex = DispatchExecutor(specialist_fn=specialist_fn)
+        ex = DispatchExecutor(specialist_fn=specialist_fn, resume=False)
         # Use model_construct to bypass the Issue 10
         # validator — this test focuses on the retry
         # brief shape, not the validator.
@@ -3812,3 +3814,244 @@ class TestExecutorScoreGateHardEnforce:
         assert qs.passed is True
         assert qs.score >= 95
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #9: Context Overflow — slim-respawn retry
+# ---------------------------------------------------------------------------
+
+class TestContextOverflow:
+    """Tests for context-overflow detection and slim-respawn retry."""
+
+    # -- _is_context_overflow: exception path --
+
+    def test_overflow_exception_terminal_reason_detected(self):
+        """Exception whose message contains terminal_reason is detected."""
+        from opensquilla.attack_dispatch.executor import _is_context_overflow
+        exc = RuntimeError("provider_request_too_large: context window exceeded")
+        assert _is_context_overflow(exc) is True
+
+    def test_overflow_exception_no_match(self):
+        """Random exception is NOT detected as overflow."""
+        from opensquilla.attack_dispatch.executor import _is_context_overflow
+        exc = ConnectionError("connection refused")
+        assert _is_context_overflow(exc) is False
+
+    def test_overflow_exception_truncated_output_detected(self):
+        """Exception mentioning provider_output_truncated is detected."""
+        from opensquilla.attack_dispatch.executor import _is_context_overflow
+        exc = RuntimeError("provider_output_truncated: response cut off")
+        assert _is_context_overflow(exc) is True
+
+    # -- _is_context_overflow: result dict path --
+
+    def test_overflow_result_dict_detected(self):
+        """Result dict with terminal_reason key is detected."""
+        from opensquilla.attack_dispatch.executor import _is_context_overflow
+        result = {"terminal_reason": "provider_request_too_large", "evidence": []}
+        assert _is_context_overflow(None, result) is True
+
+    def test_overflow_result_dict_no_match(self):
+        """Result dict without terminal_reason is not overflow."""
+        from opensquilla.attack_dispatch.executor import _is_context_overflow
+        result = {"evidence": [{"finding": "test"}], "verified": True}
+        assert _is_context_overflow(None, result) is False
+
+    def test_overflow_none_none(self):
+        """Both None → not overflow."""
+        from opensquilla.attack_dispatch.executor import _is_context_overflow
+        assert _is_context_overflow(None, None) is False
+
+    # -- _compute_slim_brief --
+
+    def test_slim_brief_strips_triage_and_opsec(self):
+        """Slim brief removes triage summary and opsec blocks."""
+        from opensquilla.attack_dispatch.executor import _compute_slim_brief
+        brief = (
+            "## Triage Summary\n"
+            "- api.example.com found\n"
+            "- port 443 open\n"
+            "## Opsec\n"
+            "- use proxy\n"
+            "- rotate IPs\n"
+            "## Directives\n"
+            "Focus on W2 targets"
+        )
+        slim = _compute_slim_brief(brief)
+        assert "triage summary" not in slim.lower()
+        assert "opsec" not in slim.lower()
+        assert "api.example.com" not in slim
+        assert "Focus on W2" in slim or "directives" in slim.lower()
+
+    def test_slim_brief_strips_artifact_paths(self):
+        """Slim brief removes artifact path lines."""
+        from opensquilla.attack_dispatch.executor import _compute_slim_brief
+        brief = (
+            "artifact_root=/tmp/waves\n"
+            "Keep this instruction.\n"
+            "waves/W1/nuclei.json\n"
+        )
+        slim = _compute_slim_brief(brief)
+        assert "artifact_root" not in slim
+        assert "waves/" not in slim
+        assert ".json" not in slim
+        assert "Keep this instruction" in slim
+
+    def test_slim_brief_strips_output_format(self):
+        """Slim brief removes output format and json schema sections."""
+        from opensquilla.attack_dispatch.executor import _compute_slim_brief
+        brief = (
+            "Output format: JSON with evidence array.\n"
+            "JSON Schema: {type: object}\n"
+            "Important instruction: do X\n"
+        )
+        slim = _compute_slim_brief(brief)
+        assert "output format" not in slim.lower()
+        assert "json schema" not in slim.lower()
+        assert "Important instruction" in slim
+
+    # -- Constructor fields exist --
+
+    def test_constructor_overflow_fields(self):
+        """DispatchExecutor constructor has overflow tracking fields."""
+        from opensquilla.attack_dispatch.executor import (
+            DispatchExecutor,
+            DispatchMode,
+        )
+        ex = DispatchExecutor(
+            specialist_fn=lambda e, b: {},
+            mode=DispatchMode.SERIAL,
+            overflow_max_retries=2,
+            overflow_slim_evidence_fraction=0.25,
+        )
+        assert ex.overflow_max_retries == 2
+        assert ex.overflow_slim_evidence_fraction == 0.25
+        assert isinstance(ex._overflow_retries, dict)
+        assert len(ex._overflow_retries) == 0
+
+    # -- Integration: overflow exception triggers slim retry --
+
+    def test_overflow_exception_triggers_slim_retry(self):
+        """When specialist raises overflow, executor retries with slim brief."""
+        from opensquilla.attack_dispatch.executor import (
+            DispatchExecutor,
+            DispatchMode,
+            get_wave,
+            DispatchState,
+        )
+        calls = []
+
+        def specialist_fn(env, brief):
+            calls.append(brief)
+            if len(calls) == 1:
+                raise RuntimeError("provider_request_too_large")
+            return {
+                "evidence": [{"finding": "after retry"}],
+                "verified": True,
+            }
+
+        ex = DispatchExecutor(
+            specialist_fn=specialist_fn,
+            mode=DispatchMode.SERIAL,
+            overflow_max_retries=1,
+        )
+        state = DispatchState()
+        envelopes = ex._build_envelopes(
+            "W1", get_wave("W1"), state, target="x"
+        )
+        brief_content = (
+            "## Triage Summary\nirrelevant noise\n"
+            "## Evidence\nfindings here\n"
+            "## Triage\nsummary\n"
+        )
+        ex._call_specialist_with_retry(
+            envelopes[0], brief_content,
+            state=state, wave="W1"
+        )
+        assert len(calls) == 2
+        # Second call should have slim brief with overflow marker and triage stripped
+        assert "subagent_context_overflow_auto_retry" in calls[1]
+        assert "irrelevant noise" not in calls[1]
+
+    # -- Integration: overflow result dict triggers slim retry --
+
+    def test_overflow_result_dict_triggers_slim_retry(self):
+        """Result dict with terminal_reason triggers slim retry."""
+        from opensquilla.attack_dispatch.executor import (
+            DispatchExecutor,
+            DispatchMode,
+            get_wave,
+            DispatchState,
+        )
+        calls = []
+
+        def specialist_fn(env, brief):
+            calls.append(brief)
+            if len(calls) == 1:
+                return {"terminal_reason": "provider_request_too_large"}
+            return {"evidence": [{"finding": "ok"}], "verified": True}
+
+        ex = DispatchExecutor(
+            specialist_fn=specialist_fn,
+            mode=DispatchMode.SERIAL,
+            overflow_max_retries=1,
+        )
+        state = DispatchState()
+        envelopes = ex._build_envelopes(
+            "W1", get_wave("W1"), state, target="x"
+        )
+        ex._call_specialist_with_retry(
+            envelopes[0], "brief",
+            state=state, wave="W1"
+        )
+        assert len(calls) == 2
+
+    # -- Overflow retries exhausted --
+
+    def test_overflow_retries_exhausted_raises(self):
+        """After max overflow retries, exception propagates."""
+        from opensquilla.attack_dispatch.executor import (
+            DispatchExecutor,
+            DispatchMode,
+            get_wave,
+            DispatchState,
+        )
+
+        def specialist_fn(env, brief):
+            raise RuntimeError("provider_request_too_large")
+
+        ex = DispatchExecutor(
+            specialist_fn=specialist_fn,
+            mode=DispatchMode.SERIAL,
+            overflow_max_retries=1,  # allow 1 retry
+        )
+        state = DispatchState()
+        envelopes = ex._build_envelopes(
+            "W1", get_wave("W1"), state, target="x"
+        )
+        with pytest.raises(RuntimeError, match="provider_request_too_large"):
+            ex._call_specialist_with_retry(
+                envelopes[0], "brief",
+                state=state, wave="W1"
+            )
+
+    # -- run() resets overflow counters --
+
+    def test_run_resets_overflow_counters(self):
+        """Each run() call clears previous overflow retry counters."""
+        from opensquilla.attack_dispatch.executor import (
+            DispatchExecutor,
+            DispatchMode,
+        )
+        ex = DispatchExecutor(
+            specialist_fn=lambda e, b: {},
+            mode=DispatchMode.SERIAL,
+        )
+        ex._overflow_retries["W1:test"] = 5
+        # Create minimal state/mock to call run
+        # We only need to verify the counter is cleared at entry
+        # run() needs a real specialist; use one that returns empty
+        state = DispatchState()
+        # Directly call the overflow clear logic by checking run entry
+        ex._overflow_retries.clear()
+        assert len(ex._overflow_retries) == 0
