@@ -519,6 +519,67 @@ class TestJSONFallbackMode:
 # ── Snapshot diff (Batch 5 time-dimension wiring) ─────
 
 
+class TestBannerDismissal:
+    """The DB-not-configured banner must be dismissible (× button +
+    localStorage persistence) so it doesn't take up vertical space
+    in the operator's normal workflow. A small sidebar status pill
+    re-opens it on click."""
+
+    @pytest.fixture()
+    def client_with_banner(self, tmp_path, monkeypatch):
+        from opensquilla.asset_tree.db import backend as _be_mod
+        from opensquilla.asset_tree.web import store as _store_mod
+        from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+        from opensquilla.asset_tree.web.store import TreeStore
+        from opensquilla.asset_tree.web.routes import create_asset_tree_routes
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        state_dir = tmp_path / "state" / "asset_trees"
+        state_dir.mkdir(parents=True)
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(state_dir))
+
+        _be_mod.set_default_backend(None)
+        monkeypatch.setattr(
+            _store_mod, "_backend",
+            lambda: (_ for _ in ()).throw(AssetTreeConfigError("unset")),
+        )
+        store = TreeStore()
+        app = Starlette(routes=[Mount("/asset-tree", routes=create_asset_tree_routes(store))])
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_banner_has_dismiss_button(self, client_with_banner):
+        resp = client_with_banner.get("/asset-tree/")
+        assert resp.status_code == 200
+        assert 'id="dbBannerClose"' in resp.text
+        assert "dismiss" in resp.text.lower() or "Dismiss" in resp.text
+
+    def test_banner_has_data_mode_for_localstorage_key(self, client_with_banner):
+        """The banner's data-mode attribute is the localStorage key
+        suffix — verifies the page is correctly tagged for the
+        client-side IIFE that wires the dismiss handler."""
+        resp = client_with_banner.get("/asset-tree/")
+        assert resp.status_code == 200
+        assert 'data-mode="json_fallback"' in resp.text
+
+    def test_sidebar_has_status_pill(self, client_with_banner):
+        """The sidebar header must show a small '⚠️ fallback' pill
+        so the operator can re-open the banner."""
+        resp = client_with_banner.get("/asset-tree/")
+        assert resp.status_code == 200
+        assert 'id="dbStatusPill"' in resp.text
+        assert "fallback" in resp.text
+
+    def test_banner_dismiss_persistence_is_localstorage(self, client_with_banner):
+        """The JS uses localStorage; the server side just needs to
+        not regress. Check that the page references the right key."""
+        resp = client_with_banner.get("/asset-tree/")
+        assert resp.status_code == 200
+        # The IIFE references this exact localStorage key
+        assert "opensquilla:db-banner-dismissed" in resp.text
+
+
 class TestSnapshotDiffRoutes:
     """The web layer exposes ``recon_diff_snapshots`` as
     ``GET /api/trees/{id}/diff`` so operators can see
