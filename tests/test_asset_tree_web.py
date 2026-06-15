@@ -25,7 +25,18 @@ from starlette.routing import Mount
 
 
 @pytest.fixture()
-def store():
+def store(monkeypatch):
+    # The DB-backed TreeStore requires ASSET_TREE_DB_URL; tests run
+    # without MySQL, so we swap in an in-memory stub that covers the
+    # surface area ``web/store.py`` actually touches (no AssetTreeBackend
+    # ABC conformance required — keep the test surface narrow).
+    from opensquilla.asset_tree.db import backend as _be_mod
+    from opensquilla.asset_tree.web import store as _store_mod
+    from tests._stubs.in_memory_backend import InMemoryStubBackend
+
+    backend = InMemoryStubBackend()
+    _be_mod.set_default_backend(backend)  # type: ignore[arg-type]
+    monkeypatch.setattr(_store_mod, "_backend", lambda: backend)
     return TreeStore()
 
 
@@ -134,7 +145,8 @@ class TestNodeCRUD:
         data = resp.json()
         assert data["asset_type"] == "sub_domain"
         assert data["value"] == "api.example.com"
-        assert data["state"] == "unseen"
+        # routes/api_add_node forces state="discovered" on creation
+        assert data["state"] == "discovered"
         assert data["parent_id"] is not None  # root node
 
     def test_add_node_with_parent(self, client):

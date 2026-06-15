@@ -116,7 +116,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
 
     async def api_list_trees(request: Request) -> Response:
         """GET /api/trees — list all trees."""
-        trees = store.list_trees()
+        trees = await store.list_trees()
         return JSONResponse({"trees": trees})
 
     async def api_create_tree(request: Request) -> Response:
@@ -128,7 +128,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         tree_id = body.get("tree_id")
         description = body.get("description", "")
         try:
-            meta = store.create_tree(root_domain, tree_id=tree_id, description=description)
+            meta = await store.create_tree(root_domain, tree_id=tree_id, description=description)
         except ValueError as e:
             return _json_error(str(e), status=409)
         return JSONResponse(meta, status_code=201)
@@ -137,8 +137,8 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         """GET /api/trees/{tree_id} — get tree metadata + structure."""
         tree_id = request.path_params["tree_id"]
         try:
-            meta = store.get_tree_meta(tree_id)
-            tree = store.get_tree(tree_id)
+            meta = await store.get_tree_meta(tree_id)
+            tree = await store.get_tree(tree_id)
             data = {**meta, "tree": _tree_to_dict(tree)}
             return JSONResponse(data)
         except KeyError:
@@ -148,7 +148,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         """DELETE /api/trees/{tree_id} — delete a tree."""
         tree_id = request.path_params["tree_id"]
         try:
-            store.delete_tree(tree_id)
+            await store.delete_tree(tree_id)
             return JSONResponse({"deleted": tree_id})
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
@@ -157,7 +157,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         """GET /api/trees/{tree_id}/stats — get tree statistics."""
         tree_id = request.path_params["tree_id"]
         try:
-            tree = store.get_tree(tree_id)
+            tree = await store.get_tree(tree_id)
             stats = tree.stats()
             return JSONResponse(stats)
         except KeyError:
@@ -167,7 +167,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         """GET /api/trees/{tree_id}/nodes — list nodes, optionally filtered by type."""
         tree_id = request.path_params["tree_id"]
         try:
-            tree = store.get_tree(tree_id)
+            tree = await store.get_tree(tree_id)
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
 
@@ -190,7 +190,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         """POST /api/trees/{tree_id}/nodes — add a node."""
         tree_id = request.path_params["tree_id"]
         try:
-            tree = store.get_tree(tree_id)
+            tree = await store.get_tree(tree_id)
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
 
@@ -210,16 +210,31 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         metadata = body.get("metadata", {})
 
         try:
-            node_id = tree.add_node(
-                asset_type=asset_type,
+            result = await store.add_node(
+                tree_id=tree_id,
+                asset_type=asset_type_str,
                 value=value,
                 parent_id=parent_id,
+                state="discovered",
                 source_wave=source_wave,
                 metadata=metadata if isinstance(metadata, dict) else {},
             )
-            node = tree.get_node(node_id)
-            store.touch(tree_id)
-            return JSONResponse(_node_to_dict(node), status_code=201)
+            await store.touch(tree_id)
+            return JSONResponse(
+                {
+                    "id": result["id"],
+                    "asset_type": asset_type_str,
+                    "value": value,
+                    "state": result["state"],
+                    "parent_id": parent_id,
+                    "material_path": result["material_path"],
+                    "path_depth": result["material_path"].count("/") - 1,
+                    "metadata": metadata if isinstance(metadata, dict) else {},
+                    "source_wave": source_wave,
+                    "children_ids": [],
+                },
+                status_code=201,
+            )
         except Exception as e:
             return _json_error(str(e), status=400)
 
@@ -228,7 +243,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         tree_id = request.path_params["tree_id"]
         node_id = request.path_params["node_id"]
         try:
-            tree = store.get_tree(tree_id)
+            tree = await store.get_tree(tree_id)
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
 
@@ -238,23 +253,27 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
 
         body = await _read_body(request)
 
-        # Update state
+        # Update state (db path) + optional metadata merge
         new_state = body.get("state")
-        if new_state:
-            try:
-                state = AssetState(new_state)
-                tree.update_state(node_id, state)
-            except ValueError:
-                return _json_error(f"Invalid state: {new_state}")
-
-        # Update metadata (merge)
-        new_meta = body.get("metadata")
-        if isinstance(new_meta, dict):
-            node.metadata.update(new_meta)
-
-        # Re-fetch after updates
-        node = tree.get_node(node_id)
-        store.touch(tree_id)
+        new_meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+        if new_state is None and new_meta is None:
+            return _json_error("No fields to update")
+        try:
+            await store.update_node(
+                tree_id=tree_id,
+                node_id=node_id,
+                state=new_state,
+                metadata=new_meta,
+            )
+        except ValueError as e:
+            return _json_error(str(e), status=400)
+        await store.touch(tree_id)
+        # Re-fetch via store
+        try:
+            tree = await store.get_tree(tree_id)
+            node = tree.get_node(node_id)
+        except KeyError:
+            return _json_error(f"Tree '{tree_id}' not found", status=404)
         return JSONResponse(_node_to_dict(node))
 
     async def api_delete_node(request: Request) -> Response:
@@ -262,7 +281,7 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         tree_id = request.path_params["tree_id"]
         node_id = request.path_params["node_id"]
         try:
-            tree = store.get_tree(tree_id)
+            tree = await store.get_tree(tree_id)
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
 
@@ -275,14 +294,14 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
             return _json_error("Cannot delete root node", status=400)
 
         tree.remove_subtree(node_id)
-        store.touch(tree_id)
+        await store.touch(tree_id)
         return JSONResponse({"deleted": node_id})
 
     # ── Page route ──────────────────────────────────────────────
 
     async def page_index(request: Request) -> Response:
         """GET / — HTML tree viewer."""
-        trees = store.list_trees()
+        trees = await store.list_trees()
         return _render_template("asset_tree.html", {
             "trees": trees,
             "version": "0.3.1",

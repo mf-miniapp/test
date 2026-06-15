@@ -840,7 +840,7 @@ def get_default_backend() -> AssetTreeBackend:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                     ex.submit(_asyncio.run, backend.init_schema()).result()
             _default_backend = backend
-            logger.info("asset_tree_backend_init", url=url, type=type(backend).__name__)
+            logger.info("asset_tree_backend_init url=%s type=%s", url, type(backend).__name__)
         return _default_backend
 
 

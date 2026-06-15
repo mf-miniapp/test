@@ -542,6 +542,17 @@ class AssetTree:
 
         # 恢复节点
         for nid, n_data in nodes_data.items():
+            # ``to_dict`` 走 ``model_dump(mode="json")`` 把 ``metadata`` 序列化成
+            # JSON 字符串。db-backed ``AssetTree`` 重建走的也是这条路,所以
+            # ``from_dict`` 在 ``model_validate`` 之前先把 ``metadata`` 解码回
+            # ``dict``,否则 Pydantic 会因为拿到 ``str`` 而校验失败。
+            meta = n_data.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    decoded = json.loads(meta) if meta.strip() else {}
+                    n_data["metadata"] = {} if decoded is None else decoded
+                except (ValueError, TypeError):
+                    n_data["metadata"] = {}
             node = AssetNode.model_validate(n_data)
             tree._nodes[nid] = node
             # 仅根层节点（parent_id is None）写入 _value_index，与 add_node 一致

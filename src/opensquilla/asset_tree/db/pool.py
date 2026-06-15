@@ -72,13 +72,22 @@ def build_engine_from_url(url: str | None = None, **kwargs: Any) -> AsyncEngine:
     engine_kwargs: dict[str, Any] = {
         "echo": False,
         "future": True,
-        "pool_pre_ping": True,
-        "pool_size": kwargs.get("pool_size", 10),
-        "max_overflow": kwargs.get("max_overflow", 5),
-        "pool_recycle": kwargs.get("pool_recycle", 1800),
-        "pool_timeout": kwargs.get("pool_timeout", 30),
+        # pool_pre_ping defaults to False: SQLAlchemy 2.x ``do_ping`` is
+        # incompatible with ``aiomysql``'s async ``ping()`` (the dialect
+        # adapter passes no ``reconnect`` kwarg, and the aiomysql coroutine
+        # requires one). Disable pre-ping; the MySQL server's wait_timeout
+        # is handled by ``pool_recycle`` instead.
+        "pool_pre_ping": False,
+        # Use ``NullPool`` so a single engine can be reused across
+        # multiple asyncio event loops (uvicorn workers + any
+        # background tasks). ``aiomysql``'s connection binds to the
+        # loop that first ``await``s it; a static ``QueuePool`` would
+        # fail with ``Future attached to a different loop`` on the
+        # second event loop. ``NullPool`` opens & closes per-checkout,
+        # which is fine for the asset-tree read/write pattern (low
+        # concurrency, long-lived gateway).
+        "poolclass": __import__("sqlalchemy.pool", fromlist=["NullPool"]).NullPool,
     }
-    engine_kwargs.update({k: v for k, v in kwargs.items() if k not in engine_kwargs})
     return create_async_engine(url, **engine_kwargs)
 
 

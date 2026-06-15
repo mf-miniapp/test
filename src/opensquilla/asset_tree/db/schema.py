@@ -212,16 +212,29 @@ asset_nodes = Table(
     Index("ix_asset_nodes_tree_parent", "tree_id", "parent_id"),
     # UNIQUE dedup invariant: (tree, type, parent, value). value prefix
     # because MySQL max index key length is 3072 bytes (utf8mb4 = 4 bytes
-    # per char × 768 char ceiling); 255 is universally safe.
-    UniqueConstraint(
+    # per char × 768 char ceiling); 255 is universally safe. We use
+    # ``Index(..., unique=True, mysql_length=...)`` instead of
+    # ``UniqueConstraint`` because the latter does not honour the
+    # ``mysql_length`` prefix and emits a full-length UNIQUE key, which
+    # fails on MySQL 8 with ``Specified key was too long`` (1071).
+    Index(
+        "uq_asset_nodes_dedup",
         "tree_id",
         "asset_type",
         "parent_id",
         "value",
-        name="uq_asset_nodes_dedup",
+        unique=True,
+        mysql_length={"value": 255},
     ),
-    # Cross-tree value lookup: find_nodes_by_value("1.2.3.4")
-    Index("ix_asset_nodes_tree_value", "tree_id", "value"),
+    # Cross-tree value lookup: find_nodes_by_value("1.2.3.4"). value
+    # prefix-255 for the same MySQL key-length reason as
+    # ``uq_asset_nodes_dedup`` above.
+    Index(
+        "ix_asset_nodes_tree_value",
+        "tree_id",
+        "value",
+        mysql_length={"value": 255},
+    ),
     # Subtree scan: material_path LIKE 'root/abc/%'
     Index("ix_asset_nodes_path_prefix", "tree_id", "material_path"),
     mysql_engine="InnoDB",
