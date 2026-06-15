@@ -52,6 +52,12 @@ def _render_template(name: str, context: dict[str, Any]) -> HTMLResponse:
 
 # ── JSON helpers ─────────────────────────────────────────────────
 
+def _json_state_dir_for_route() -> Path:
+    """Resolve the JSON snapshot dir (same as ``store._json_state_dir``)."""
+    from opensquilla.asset_tree.web.store import _json_state_dir
+    return _json_state_dir()
+
+
 def _json_error(message: str, status: int = 400) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
 
@@ -184,6 +190,55 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
             return JSONResponse(stats)
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
+
+    async def api_tree_snapshots(request: Request) -> Response:
+        """GET /api/trees/{tree_id}/snapshots — list historical snapshots.
+
+        Batch 5 time-dimension support: each find-run that calls
+        ``asset_tree_complete`` leaves a time-stamped copy at
+        ``<tree_id>--<iso_ts>.json``. The cumulative
+        ``<tree_id>.json`` is also returned as a baseline so the
+        operator always has at least one entry to diff against.
+
+        Query params:
+          limit: cap the number of returned snapshots (newest first).
+        """
+        tree_id = request.path_params["tree_id"]
+        limit = int(request.query_params.get("limit", "50"))
+        if not _json_state_dir_for_route().exists():  # type: ignore[attr-defined]
+            return JSONResponse({
+                "tree_id": tree_id,
+                "snapshot_count": 0,
+                "snapshots": [],
+            })
+        snaps = store.list_snapshots_for_tree(tree_id, limit=limit)  # type: ignore[attr-defined]
+        return JSONResponse({
+            "tree_id": tree_id.split("--", 1)[0] if "--" in tree_id else tree_id,
+            "snapshot_count": len(snaps),
+            "snapshots": snaps,
+        })
+
+    async def api_tree_diff(request: Request) -> Response:
+        """GET /api/trees/{tree_id}/diff — diff against the previous snapshot.
+
+        Batch 5 time-dimension wiring. Picks the two most recent
+        snapshot files for ``tree_id`` and runs the same diff
+        algorithm as ``recon_diff_snapshots`` (LLM tool). On the
+        very first compare, returns a ``first_snapshot`` diff
+        where every node is "added" relative to an empty baseline.
+
+        Query params:
+          sensitivity_field: which metadata field to compare
+            against the risk ladder (default "risk", matches the
+            COOKIE/HEADER convention from cookie-header specialist).
+        """
+        tree_id = request.path_params["tree_id"]
+        sensitivity_field = request.query_params.get("sensitivity_field", "risk")
+        result = store.diff_against_previous_snapshot(  # type: ignore[attr-defined]
+            tree_id, sensitivity_field=sensitivity_field,
+        )
+        result["tree_id"] = tree_id.split("--", 1)[0] if "--" in tree_id else tree_id
+        return JSONResponse(result)
 
     async def api_list_nodes(request: Request) -> Response:
         """GET /api/trees/{tree_id}/nodes — list nodes, optionally filtered by type."""
@@ -347,6 +402,8 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         Route("/api/trees/{tree_id}", api_get_tree, methods=["GET"]),
         Route("/api/trees/{tree_id}", api_delete_tree, methods=["DELETE"]),
         Route("/api/trees/{tree_id}/stats", api_tree_stats, methods=["GET"]),
+        Route("/api/trees/{tree_id}/snapshots", api_tree_snapshots, methods=["GET"]),
+        Route("/api/trees/{tree_id}/diff", api_tree_diff, methods=["GET"]),
         Route("/api/trees/{tree_id}/nodes", api_list_nodes, methods=["GET"]),
         Route("/api/trees/{tree_id}/nodes", api_add_node, methods=["POST"]),
         Route("/api/trees/{tree_id}/nodes/{node_id}", api_update_node, methods=["PUT"]),

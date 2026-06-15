@@ -117,75 +117,101 @@ async def recon_diff_snapshots(
     sensitivity_field: str = "risk",
     include_subtree_moves: bool = True,
 ) -> str:
-    """Diff two snapshots."""
+    """Diff two snapshots. Thin async wrapper around the sync core."""
     pa = Path(snapshot_a_path)
     pb = Path(snapshot_b_path)
     if not pa.exists():
         raise FileNotFoundError(f"snapshot_a not found: {snapshot_a_path}")
     if not pb.exists():
         raise FileNotFoundError(f"snapshot_b not found: {snapshot_b_path}")
+    payload = diff_snapshots(
+        pa, pb,
+        sensitivity_field=sensitivity_field,
+        include_subtree_moves=include_subtree_moves,
+    )
+    payload = {"snapshot_a": str(pa), "snapshot_b": str(pb), **payload}
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
-    a_nodes = _load_tree_nodes(pa)
-    b_nodes = _load_tree_nodes(pb)
 
+def _try_json(s: str) -> dict[str, Any]:
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+# ── Shared core (sync) — used by both the LLM tool (async) and ──
+# ── the web store (sync route handler).                              ──
+
+RISK_LADDER: dict[str, int] = {
+    "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
+}
+
+
+def diff_nodes(
+    a_nodes: dict[str, dict[str, Any]],
+    b_nodes: dict[str, dict[str, Any]],
+    *,
+    sensitivity_field: str = "risk",
+    include_subtree_moves: bool = True,
+) -> dict[str, Any]:
+    """Compute the diff between two node sets.
+
+    Args:
+        a_nodes: nodes from the older snapshot (id → node dict)
+        b_nodes: nodes from the newer snapshot (id → node dict)
+        sensitivity_field: metadata field whose value is compared
+            against ``RISK_LADDER`` to detect escalations
+        include_subtree_moves: if True, also report parent_id changes
+            in a separate ``moved`` bucket
+
+    Returns:
+        Dict with ``summary``, ``added``, ``removed``, ``changed``,
+        ``moved``, ``sensitivity_escalations`` keys. Shape matches
+        the LLM tool's JSON output for cross-consumer stability.
+    """
     a_ids = set(a_nodes.keys())
     b_ids = set(b_nodes.keys())
 
-    # Buckets
     added: list[dict[str, Any]] = []
     removed: list[dict[str, Any]] = []
     changed: list[dict[str, Any]] = []
     moved: list[dict[str, Any]] = []
 
-    # Added: in B, not in A
     for nid in b_ids - a_ids:
         n = b_nodes[nid]
-        added.append(
-            {
-                "node_id": nid,
-                "asset_type": n.get("asset_type"),
-                "value": n.get("value"),
-                "parent_id": n.get("parent_id"),
-                "metadata": n.get("metadata") or {},
-            }
-        )
-    # Removed: in A, not in B
+        added.append({
+            "node_id": nid,
+            "asset_type": n.get("asset_type"),
+            "value": n.get("value"),
+            "parent_id": n.get("parent_id"),
+            "metadata": n.get("metadata") or {},
+        })
     for nid in a_ids - b_ids:
         n = a_nodes[nid]
-        removed.append(
-            {
-                "node_id": nid,
-                "asset_type": n.get("asset_type"),
-                "value": n.get("value"),
-                "parent_id": n.get("parent_id"),
-            }
-        )
-    # Common: check value / metadata / parent_id changes
+        removed.append({
+            "node_id": nid,
+            "asset_type": n.get("asset_type"),
+            "value": n.get("value"),
+            "parent_id": n.get("parent_id"),
+        })
     for nid in a_ids & b_ids:
         a, b = a_nodes[nid], b_nodes[nid]
         diffs: dict[str, Any] = {}
-        # value
         if a.get("value") != b.get("value"):
             diffs["value"] = {"from": a.get("value"), "to": b.get("value")}
-        # parent_id
         if include_subtree_moves and a.get("parent_id") != b.get("parent_id"):
             diffs["parent_id"] = {"from": a.get("parent_id"), "to": b.get("parent_id")}
-            moved.append(
-                {
-                    "node_id": nid,
-                    "asset_type": a.get("asset_type"),
-                    "value": b.get("value"),
-                    "from_parent": a.get("parent_id"),
-                    "to_parent": b.get("parent_id"),
-                }
-            )
-        # state
+            moved.append({
+                "node_id": nid,
+                "asset_type": a.get("asset_type"),
+                "value": b.get("value"),
+                "from_parent": a.get("parent_id"),
+                "to_parent": b.get("parent_id"),
+            })
         if a.get("state") != b.get("state"):
             diffs["state"] = {"from": a.get("state"), "to": b.get("state")}
-        # metadata: diff EVERY key (added/removed/changed). The
-        # `sensitivity_field` parameter is used downstream only to
-        # detect ladder escalations; it does NOT limit which
-        # metadata diffs contribute to the "changed" bucket.
         a_meta = a.get("metadata") or {}
         b_meta = b.get("metadata") or {}
         if isinstance(a_meta, str):
@@ -199,27 +225,19 @@ async def recon_diff_snapshots(
             if av != bv:
                 diffs[k] = {"from": av, "to": bv}
         if diffs:
-            changed.append(
-                {
-                    "node_id": nid,
-                    "asset_type": a.get("asset_type"),
-                    "value": b.get("value"),
-                    "diffs": diffs,
-                }
-            )
+            changed.append({
+                "node_id": nid,
+                "asset_type": a.get("asset_type"),
+                "value": b.get("value"),
+                "diffs": diffs,
+            })
 
-    # Summary by asset_type
     by_type: dict[str, dict[str, int]] = {}
     for bucket_name, items in (("added", added), ("removed", removed), ("changed", changed)):
         for it in items:
             t = it.get("asset_type") or "unknown"
             by_type.setdefault(t, {"added": 0, "removed": 0, "changed": 0})[bucket_name] += 1
 
-    # Sensitivity escalations: 'to' is higher than 'from' in the risk ladder.
-    # The diffs key for a metadata field is the bare key name (e.g. "risk",
-    # "sensitivity", "http_only"). The `sensitivity_field` parameter
-    # selects which key to look at for ladder escalation.
-    RISK_LADDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
     escalations = [
         c for c in changed
         if sensitivity_field in c.get("diffs", {})
@@ -227,35 +245,45 @@ async def recon_diff_snapshots(
         > RISK_LADDER.get(c["diffs"][sensitivity_field].get("from", ""), 0)
     ]
 
-    return json.dumps(
-        {
-            "snapshot_a": str(pa),
-            "snapshot_b": str(pb),
-            "summary": {
-                "added": len(added),
-                "removed": len(removed),
-                "changed": len(changed),
-                "moved": len(moved),
-                "sensitivity_escalations": len(escalations),
-                "by_type": by_type,
-            },
-            "added": added,
-            "removed": removed,
-            "changed": changed,
-            "moved": moved,
-            "sensitivity_escalations": escalations,
+    return {
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "moved": len(moved),
+            "sensitivity_escalations": len(escalations),
+            "by_type": by_type,
         },
-        ensure_ascii=False,
-        default=str,
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "moved": moved,
+        "sensitivity_escalations": escalations,
+    }
+
+
+def diff_snapshots(
+    snapshot_a_path: str | Path,
+    snapshot_b_path: str | Path,
+    *,
+    sensitivity_field: str = "risk",
+    include_subtree_moves: bool = True,
+) -> dict[str, Any]:
+    """Sync diff: read two snapshot files and return the diff dict.
+
+    File-not-found errors are NOT raised here — the caller (the LLM
+    tool) wants to surface them, but the web layer just wants
+    graceful "no prior snapshot" results.
+    """
+    pa = Path(snapshot_a_path)
+    pb = Path(snapshot_b_path)
+    a_nodes = _load_tree_nodes(pa)
+    b_nodes = _load_tree_nodes(pb)
+    return diff_nodes(
+        a_nodes, b_nodes,
+        sensitivity_field=sensitivity_field,
+        include_subtree_moves=include_subtree_moves,
     )
-
-
-def _try_json(s: str) -> dict[str, Any]:
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        return {}
 
 
 # ── 2. recon_list_snapshots ──────────────────────────

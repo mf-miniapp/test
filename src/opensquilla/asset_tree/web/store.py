@@ -34,6 +34,7 @@ import json
 import os
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from opensquilla.asset_tree.models import (
@@ -50,6 +51,10 @@ from opensquilla.asset_tree.tree import AssetTree
 def _backend():
     from opensquilla.asset_tree.db import get_default_backend
     return get_default_backend()
+
+
+# ── snapshot diff (re-uses the recon tool's core) ───────────
+from opensquilla.tools.builtin.recon.diff import diff_snapshots as _recon_diff_snapshots  # noqa: E402
 
 
 class DBUnavailableError(RuntimeError):
@@ -551,6 +556,146 @@ class TreeStore:
             "description": "(JSON fallback — DB not configured)",
             "node_count": len(nodes),
         }
+
+    # ── Snapshot history (Batch 5 time-dimension wiring) ────
+
+    def list_snapshots_for_tree(
+        self, tree_id: str, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List all snapshot files for ``tree_id``, newest first.
+
+        A snapshot is any file matching ``<tree_id>--<iso_ts>.json``
+        (per Batch 5's snapshot_id format). The cumulative
+        ``<tree_id>.json`` is also returned as the most recent
+        entry (mtime-ordered) so the UI always has at least one
+        baseline to diff against, even if the operator never
+        called ``asset_tree_complete``.
+
+        Each entry has: ``snapshot_id``, ``tree_id``, ``snapshot_ts``
+        (or ``None`` for the cumulative), ``file_path``,
+        ``file_mtime_iso``, ``node_count``, ``node_count_by_type``.
+        """
+        canonical = tree_id.split("--", 1)[0] if "--" in tree_id else tree_id
+        d = _json_state_dir()
+        if not d.exists():
+            return []
+        # Match "<canonical>--<iso>.json" + the bare "<canonical>.json"
+        results: list[Path] = []
+        for p in d.glob(f"{canonical}*.json"):
+            results.append(p)
+        # Newest first
+        results.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        out: list[dict[str, Any]] = []
+        for p in results[:limit]:
+            stem = p.stem
+            if "--" in stem and stem.startswith(canonical + "--"):
+                snap_id = stem
+                snap_ts = stem.split("--", 1)[1]
+            elif stem == canonical:
+                snap_id = stem  # cumulative = baseline
+                snap_ts = None
+            else:
+                # Substring match but different tree (e.g. canonical="tree-x"
+                # matching "tree-xyz--<ts>"). Skip.
+                continue
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            nodes = doc.get("nodes") or {}
+            by_type_count: dict[str, int] = {}
+            for n in nodes.values():
+                t = n.get("asset_type", "unknown")
+                by_type_count[t] = by_type_count.get(t, 0) + 1
+            out.append({
+                "snapshot_id": snap_id,
+                "tree_id": canonical,
+                "snapshot_ts": snap_ts,
+                "is_cumulative": snap_ts is None,
+                "file_path": str(p),
+                "file_mtime_iso": (
+                    datetime.fromtimestamp(
+                        p.stat().st_mtime, tz=timezone.utc
+                    ).isoformat()
+                ),
+                "node_count": len(nodes),
+                "node_count_by_type": by_type_count,
+            })
+        return out
+
+    def diff_against_previous_snapshot(
+        self,
+        tree_id: str,
+        *,
+        sensitivity_field: str = "risk",
+    ) -> dict[str, Any]:
+        """Diff the current tree against the previous snapshot.
+
+        Picks the two most recent snapshot files for ``tree_id``:
+        if only one exists, returns a "all added" diff (every node
+        is new relative to an empty baseline) so the operator
+        always gets a useful answer on the first compare.
+
+        Returns a dict with ``summary``, ``added``, ``removed``,
+        ``changed``, ``moved``, ``sensitivity_escalations`` plus
+        ``snapshot_a`` / ``snapshot_b`` paths and a ``mode``:
+          - ``"normal"`` — both snapshots present
+          - ``"first_snapshot"`` — no prior baseline; everything
+            shows up as ``added`` (useful as a "what's in this
+            tree at all" view)
+          - ``"no_snapshots"`` — no JSON file at all; return empty
+        """
+        snaps = self.list_snapshots_for_tree(tree_id, limit=2)
+        if not snaps:
+            return {
+                "mode": "no_snapshots",
+                "snapshot_a": None,
+                "snapshot_b": None,
+                "summary": {
+                    "added": 0, "removed": 0, "changed": 0,
+                    "moved": 0, "sensitivity_escalations": 0,
+                    "by_type": {},
+                },
+                "added": [], "removed": [], "changed": [],
+                "moved": [], "sensitivity_escalations": [],
+            }
+        if len(snaps) == 1:
+            # First-time diff: treat the single snapshot as "all added"
+            only = snaps[0]
+            try:
+                doc = json.loads(Path(only["file_path"]).read_text(encoding="utf-8"))
+            except Exception:
+                return {
+                    "mode": "no_snapshots",
+                    "snapshot_a": None,
+                    "snapshot_b": only["file_path"],
+                    "summary": {
+                        "added": 0, "removed": 0, "changed": 0,
+                        "moved": 0, "sensitivity_escalations": 0,
+                        "by_type": {},
+                    },
+                    "added": [], "removed": [], "changed": [],
+                    "moved": [], "sensitivity_escalations": [],
+                }
+            # Build the diff against an empty baseline by hand
+            # (avoids a file-existence check in the recon core).
+            from opensquilla.tools.builtin.recon.diff import diff_nodes
+            b_nodes = doc.get("nodes") or {}
+            result = diff_nodes({}, b_nodes, sensitivity_field=sensitivity_field)
+            result["mode"] = "first_snapshot"
+            result["snapshot_a"] = None
+            result["snapshot_b"] = only["file_path"]
+            return result
+
+        # Normal case: 2+ snapshots, diff the two newest
+        newer = snaps[0]
+        older = snaps[1]
+        result = _recon_diff_snapshots(
+            older["file_path"], newer["file_path"],
+            sensitivity_field=sensitivity_field,
+        )
+        result["mode"] = "normal"
+        return result
 
 
 class _TreeEntry:

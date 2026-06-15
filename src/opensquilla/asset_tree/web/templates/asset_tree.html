@@ -215,6 +215,60 @@
       border-radius: 3px;
       font-size: 11px;
     }
+
+    /* ── Diff modal ────────────────────────── */
+    .diff-stat {
+      padding: 8px 14px;
+      border-radius: var(--radius);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 90px;
+    }
+    .diff-stat-num { font-size: 22px; font-weight: 600; }
+    .diff-stat-num.added { color: var(--green); }
+    .diff-stat-num.removed { color: var(--red); }
+    .diff-stat-num.changed { color: var(--orange); }
+    .diff-stat-num.escalations { color: var(--purple); }
+    .diff-stat-label { color: var(--text-dim); font-size: 11px; }
+
+    .diff-section { margin: 14px 0; }
+    .diff-section h4 {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .diff-item {
+      padding: 6px 10px;
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border);
+      margin-bottom: 4px;
+      font-size: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .diff-item-type { color: var(--accent); font-weight: 500; min-width: 90px; }
+    .diff-item-value { flex: 1; word-break: break-all; }
+    .diff-item-diffs {
+      flex-basis: 100%;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 4px;
+      padding-left: 98px;
+    }
+    .diff-item-diffs code {
+      background: rgba(0,0,0,0.3);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
   </style>
 </head>
 <body>
@@ -251,6 +305,7 @@
       <div class="main-header">
         <h1 id="mainTitle">选择或创建一个资产树</h1>
         <div id="mainActions" style="display:none">
+          <button class="btn btn-sm" onclick="showDiffModal()" title="Diff this tree against the previous snapshot (Batch 5 time-dimension)">📊 Diff vs 上次</button>
           <button class="btn btn-sm" onclick="showAddNodeModal()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>+ 添加节点</button>
           <button class="btn btn-sm btn-danger" onclick="deleteCurrentTree()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>删除树</button>
         </div>
@@ -317,6 +372,20 @@
       <div class="modal-actions">
         <button class="btn" onclick="hideModal('addNodeModal')">取消</button>
         <button class="btn btn-primary" onclick="addNode()">添加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Diff vs 上次 modal (Batch 5 time-dimension) -->
+  <div class="modal-overlay hidden" id="diffModal">
+    <div class="modal" style="max-width:780px">
+      <h3>📊 Diff vs 上次 <span id="diffTreeLabel" style="font-size:13px;color:var(--text-dim);font-weight:400;margin-left:8px"></span></h3>
+      <div id="diffSummary" style="margin:14px 0;display:flex;gap:14px;flex-wrap:wrap"></div>
+      <div id="diffBody" style="max-height:60vh;overflow-y:auto">
+        <div style="color:var(--text-dim);text-align:center;padding:24px">加载中...</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="hideModal('diffModal')">关闭</button>
       </div>
     </div>
   </div>
@@ -604,6 +673,99 @@
 
     // ── Helpers ────────────────────────────
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+    // ── Diff vs 上次 (Batch 5) ────────────────────
+    async function showDiffModal() {
+      if (!currentTreeId) return;
+      document.getElementById("diffTreeLabel").textContent = "— " + (currentTreeData?.root_domain || currentTreeId);
+      const summary = document.getElementById("diffSummary");
+      const body = document.getElementById("diffBody");
+      summary.innerHTML = '<div style="color:var(--text-dim)">加载中...</div>';
+      body.innerHTML = '';
+      document.getElementById("diffModal").classList.remove("hidden");
+      try {
+        const data = await api("GET", `/trees/${currentTreeId}/diff`);
+        renderDiff(data);
+      } catch (err) {
+        body.innerHTML = '<div style="color:var(--red);padding:14px">Diff 加载失败: ' + esc(String(err.message || err)) + '</div>';
+      }
+    }
+
+    function renderDiff(data) {
+      const summary = document.getElementById("diffSummary");
+      const body = document.getElementById("diffBody");
+      const s = data.summary || {};
+      const mode = data.mode || "normal";
+      const modeHint = {
+        "normal": "",
+        "first_snapshot": '<div style="width:100%;color:var(--text-dim);font-size:12px">⚠️ 这是首次 diff — 没有上一次 snapshot, 所有节点都显示为新增</div>',
+        "no_snapshots": '<div style="width:100%;color:var(--red);font-size:12px">❌ 找不到任何 snapshot 文件</div>',
+      }[mode] || "";
+      summary.innerHTML = `
+        <div class="diff-stat"><span class="diff-stat-num added">${s.added || 0}</span><span class="diff-stat-label">➕ 新增</span></div>
+        <div class="diff-stat"><span class="diff-stat-num removed">${s.removed || 0}</span><span class="diff-stat-label">➖ 消失</span></div>
+        <div class="diff-stat"><span class="diff-stat-num changed">${s.changed || 0}</span><span class="diff-stat-label">🔄 变化</span></div>
+        <div class="diff-stat"><span class="diff-stat-num escalations">${s.sensitivity_escalations || 0}</span><span class="diff-stat-label">⚠️ 风险升级</span></div>
+        ${modeHint}
+      `;
+      // Per-type breakdown
+      let html = "";
+      const byType = s.by_type || {};
+      const typeKeys = Object.keys(byType).sort();
+      if (typeKeys.length > 0) {
+        html += '<div class="diff-section"><h4>按资产类型</h4>';
+        for (const t of typeKeys) {
+          const b = byType[t];
+          html += `<div class="diff-item"><span class="diff-item-type">${esc(TYPE_NAMES[t] || t)}</span><span class="diff-item-value">+${b.added} / -${b.removed} / ~${b.changed}</span></div>`;
+        }
+        html += '</div>';
+      }
+      // Escalations first (most actionable)
+      if (data.sensitivity_escalations && data.sensitivity_escalations.length) {
+        html += '<div class="diff-section"><h4>⚠️ 风险升级</h4>';
+        for (const e of data.sensitivity_escalations) {
+          const diffs = e.diffs || {};
+          const k = Object.keys(diffs)[0];
+          const d = k ? diffs[k] : {from: "?", to: "?"};
+          html += `<div class="diff-item"><span class="diff-item-type">${esc(TYPE_NAMES[e.asset_type] || e.asset_type)}</span><span class="diff-item-value">${esc(e.value || "")}</span><div class="diff-item-diffs">${esc(k || "risk")}: <code>${esc(String(d.from))}</code> → <code>${esc(String(d.to))}</code></div></div>`;
+        }
+        html += '</div>';
+      }
+      // Added
+      if (data.added && data.added.length) {
+        html += '<div class="diff-section"><h4>➕ 新增 (前 ' + Math.min(data.added.length, 100) + ' / 共 ' + data.added.length + ')</h4>';
+        for (const a of data.added.slice(0, 100)) {
+          html += `<div class="diff-item"><span class="diff-item-type">${esc(TYPE_NAMES[a.asset_type] || a.asset_type)}</span><span class="diff-item-value">${esc(a.value || "")}</span></div>`;
+        }
+        html += '</div>';
+      }
+      // Changed
+      if (data.changed && data.changed.length) {
+        html += '<div class="diff-section"><h4>🔄 变化 (前 ' + Math.min(data.changed.length, 100) + ' / 共 ' + data.changed.length + ')</h4>';
+        for (const c of data.changed.slice(0, 100)) {
+          const diffs = c.diffs || {};
+          let diffHtml = '';
+          for (const k of Object.keys(diffs)) {
+            const d = diffs[k];
+            diffHtml += `${esc(k)}: <code>${esc(String(d.from))}</code> → <code>${esc(String(d.to))}</code> &nbsp;`;
+          }
+          html += `<div class="diff-item"><span class="diff-item-type">${esc(TYPE_NAMES[c.asset_type] || c.asset_type)}</span><span class="diff-item-value">${esc(c.value || "")}</span><div class="diff-item-diffs">${diffHtml}</div></div>`;
+        }
+        html += '</div>';
+      }
+      // Removed
+      if (data.removed && data.removed.length) {
+        html += '<div class="diff-section"><h4>➖ 消失 (前 ' + Math.min(data.removed.length, 100) + ' / 共 ' + data.removed.length + ')</h4>';
+        for (const r of data.removed.slice(0, 100)) {
+          html += `<div class="diff-item"><span class="diff-item-type">${esc(TYPE_NAMES[r.asset_type] || r.asset_type)}</span><span class="diff-item-value">${esc(r.value || "")}</span></div>`;
+        }
+        html += '</div>';
+      }
+      if (!html) {
+        html = '<div style="color:var(--text-dim);text-align:center;padding:24px">没有差异</div>';
+      }
+      body.innerHTML = html;
+    }
 
     // ── Init ───────────────────────────────
     loadTreeList();

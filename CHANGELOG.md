@@ -77,12 +77,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     usage guide (e.g. `opensquilla cron add --every "0 3 * * *" ...`).
   - **Total now**: 16 specialists + 53 recon tools + 13 tool groups.
 
+  **Batch 5 followup: snapshot diff in web UI (2026-06-15)**:
+  - 2 new web endpoints (in `asset_tree/web/`):
+    - `GET /asset-tree/api/trees/{id}/snapshots` — list historical
+      snapshots (newest first), with `node_count` + `is_cumulative`
+      flags. Works in JSON-fallback mode.
+    - `GET /asset-tree/api/trees/{id}/diff` — diff current tree
+      against the previous snapshot. Returns `mode` (normal /
+      first_snapshot / no_snapshots), full added/removed/changed/
+      moved/sensitivity_escalations breakdown, and a per-type
+      `by_type` summary.
+  - The diff core (`diff_nodes` + `diff_snapshots`) is now a sync
+    helper in `recon/diff.py`, called by both the LLM tool
+    (`recon_diff_snapshots`) and the web store. No logic duplication.
+  - "📊 Diff vs 上次" button added to the asset-tree web UI's
+    `mainActions` row. Opens a modal showing the per-bucket
+    diff with risk-escalations highlighted (purple) at the top.
+    Button works in JSON-fallback mode (read-only, no DB needed).
+
   **Total impact (Batches 1-5)**:
   - Specialists: 6 → 16 (+10)
   - Recon tools: 10 → 53 (+43)
   - Recon tool groups: 3 → 13 (+10)
   - Evidence schemas: 7 → 12 (+5)
   - Asset tree tools: 8 → 9 (+1: asset_tree_merge)
+  - Asset tree web endpoints: 9 → 11 (+2: /snapshots, /diff)
   - Asset tree types: 18 → 19 (+1: GENERIC, was already there)
   - Asset tree parent-child edges: extended (URL → AUTH_SURFACE/COOKIE/
     HEADER; SUB_DOMAIN → STORAGE; STORAGE → STORAGE_OBJECT; SECRET
@@ -105,6 +124,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `recon_diff_snapshots.sensitivity_field` default is `"risk"`
   (matches COOKIE/HEADER convention from the cookie-header specialist;
   use `"sensitivity"` for STATIC_ASSET).
+- `asset_tree_complete` now also persists a snapshot copy at
+  `<tree_id>--<iso_ts>.json` (in addition to the cumulative
+  `<tree_id>.json`), so each find-run leaves a stable historical
+  baseline for the web UI's "Diff vs 上次" view.
+- Web UI exposes snapshot diff as `GET /asset-tree/api/trees/{id}/diff`
+  and `GET /asset-tree/api/trees/{id}/snapshots` (Batch 5 wiring).
+  Both work in JSON-fallback mode (no DB required). A "📊 Diff vs 上次"
+  button in the main-actions row opens a modal with added/removed/
+  changed/sensitivity_escalations breakdown.
 
 ### Fixed
 
@@ -114,6 +142,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `_state_root()` in `recon/diff.py` resolves `OPEN_SQUILLA_STATE_DIR`
   lazily on every call (was cached at module import, breaking tests
   that monkeypatch the env var) (Batch 5).
+- The `asset_tree_complete` `snapshot_id` field is now backed by a
+  real on-disk file at `<tree_id>--<iso_ts>.json` (was metadata only);
+  this is what the web UI's "Diff vs 上次" view actually reads.
 
 ## [0.3.1] - 2026-06-03
 

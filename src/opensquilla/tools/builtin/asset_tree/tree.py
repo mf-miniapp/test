@@ -726,12 +726,29 @@ async def asset_tree_complete(tree_id: str) -> str:
     # ISO-8601 UTC timestamp, e.g. "2026-06-15T12-34-56Z" (filesystem-safe)
     snapshot_ts = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
     snapshot_id = f"{tree_id}--{snapshot_ts}"
+    # Persist a time-stamped snapshot copy so the web UI's
+    # "Diff vs 上次" button (and recon_diff_snapshots) can find a
+    # stable historical baseline. Without this, the snapshot_id
+    # in the response is just metadata — only ``<tree_id>.json``
+    # exists on disk, so there's nothing to diff against later.
+    snapshot_path = _default_state_root() / f"{snapshot_id}.json"
+    try:
+        snapshot_path.write_text(tree.to_json(), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover — best-effort
+        # Snapshot persistence is non-critical: the cumulative
+        # ``<tree_id>.json`` is already up to date. Log and proceed.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "snapshot_persist_failed tree_id=%s path=%s err=%s",
+            tree_id, snapshot_path, exc,
+        )
     return json.dumps(
         {
             "tree_id": tree_id,
             "tree_path": str(path),
             "snapshot_id": snapshot_id,
             "snapshot_ts": snapshot_ts,
+            "snapshot_path": str(snapshot_path),
             "stats": tree.stats(),
         },
         ensure_ascii=False,

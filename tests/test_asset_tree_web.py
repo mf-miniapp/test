@@ -421,7 +421,7 @@ class TestJSONFallbackMode:
         # Override the default fixture: use a clean tmp state dir with no snapshots
         empty_state = tmp_path / "empty_state" / "asset_trees"
         empty_state.mkdir(parents=True)
-        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(empty_state.parent))
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(empty_state))
         from opensquilla.asset_tree.db import backend as _be_mod
         from opensquilla.asset_tree.web import store as _store_mod
         from opensquilla.asset_tree.db.pool import AssetTreeConfigError
@@ -514,3 +514,225 @@ class TestJSONFallbackMode:
         assert resp.status_code == 200
         body = resp.json()
         assert body["total_nodes"] == 2
+
+
+# ── Snapshot diff (Batch 5 time-dimension wiring) ─────
+
+
+class TestSnapshotDiffRoutes:
+    """The web layer exposes ``recon_diff_snapshots`` as
+    ``GET /api/trees/{id}/diff`` so operators can see
+    added/removed/changed nodes vs. the previous snapshot
+    without needing to run an LLM session.
+
+    Same JSON-fallback rule as the rest of the web layer:
+    works with the on-disk ``<tree_id>.json`` + ``<tree_id>--<iso>.json``
+    snapshots; no DB required.
+    """
+
+    @pytest.fixture()
+    def store_two_snapshots(self, tmp_path, monkeypatch):
+        """Build a TreeStore backed by a tmp state dir with two snapshots."""
+        from opensquilla.asset_tree.db import backend as _be_mod
+        from opensquilla.asset_tree.web import store as _store_mod
+        from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+        from opensquilla.asset_tree.web.store import TreeStore
+        from opensquilla.asset_tree.tree import AssetTree
+        from opensquilla.asset_tree.models import AssetType, AssetState
+
+        state_dir = tmp_path / "state" / "asset_trees"
+        state_dir.mkdir(parents=True)
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(state_dir))
+
+        _be_mod.set_default_backend(None)
+        monkeypatch.setattr(
+            _store_mod, "_backend",
+            lambda: (_ for _ in ()).throw(AssetTreeConfigError("unset")),
+        )
+
+        # Older snapshot: 2 nodes, "cookie" (IP placeholder) has risk=low.
+        # Use id_override so the cookie node gets the SAME id in both
+        # snapshots — the diff then detects the risk change as a
+        # sensitivity_escalation, not as add+remove.
+        old = AssetTree("acme-corp.com")
+        old.add_node(
+            asset_type=AssetType.SUB_DOMAIN,
+            value="api.acme-corp.com",
+            parent_id=old.root_id,
+        )
+        old_sub_id = list(old._nodes.keys())[1]  # 2nd node = sub
+        old.update_state(old_sub_id, AssetState.DISCOVERED)
+        old_ip_id = old.add_node(
+            asset_type=AssetType.IP,  # use IP for test (cookie not a valid sub_domain child); risk metadata still triggers diff
+            value="1.2.3.4",
+            parent_id=old_sub_id,
+            id_override="node-ip-stable",  # matches in both snapshots
+        )
+        old.update_metadata(old_ip_id, risk="low", http_only=True)
+        # Manual: use update_node_metadata which exists in the tree
+        (state_dir / "tree-acme-corp.com--2026-06-01.json").write_text(
+            old.to_json(), encoding="utf-8"
+        )
+
+        # Newer snapshot: 3 nodes, same sub, new sub2, cookie risk escalated
+        new = AssetTree("acme-corp.com")
+        new.add_node(
+            asset_type=AssetType.SUB_DOMAIN,
+            value="api.acme-corp.com",
+            parent_id=new.root_id,
+        )
+        new_sub_id = list(new._nodes.keys())[1]
+        new.update_state(new_sub_id, AssetState.DISCOVERED)
+        new.add_node(
+            asset_type=AssetType.SUB_DOMAIN,
+            value="staging.acme-corp.com",
+            parent_id=new.root_id,
+        )
+        new_ip_id = new.add_node(
+            asset_type=AssetType.IP,
+            value="1.2.3.4",
+            parent_id=new_sub_id,
+            id_override="node-ip-stable",  # same id as the old snapshot
+        )
+        new.update_metadata(new_ip_id, risk="high", http_only=False)
+        (state_dir / "tree-acme-corp.com.json").write_text(
+            new.to_json(), encoding="utf-8"
+        )
+
+        return TreeStore()
+
+    @pytest.fixture()
+    def client_two_snapshots(self, store_two_snapshots):
+        routes = create_asset_tree_routes(store_two_snapshots)
+        app = Starlette(routes=[Mount("/asset-tree", routes=routes)])
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_list_snapshots_finds_both_files(self, client_two_snapshots):
+        resp = client_two_snapshots.get(
+            "/asset-tree/api/trees/tree-acme-corp.com/snapshots"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["snapshot_count"] == 2
+        # Newest first
+        ids = [s["snapshot_id"] for s in body["snapshots"]]
+        # cumulative (no --) should be first because it's the latest mtime
+        assert ids[0] == "tree-acme-corp.com"
+        assert "2026-06-01" in ids[1]
+
+    def test_diff_normal_two_snapshots(self, client_two_snapshots):
+        resp = client_two_snapshots.get(
+            "/asset-tree/api/trees/tree-acme-corp.com/diff"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["mode"] == "normal"
+        # staging.acme-corp.com is new
+        added_values = {a["value"] for a in body["added"]}
+        assert "staging.acme-corp.com" in added_values
+        # cookie risk escalated low → high
+        assert body["summary"]["sensitivity_escalations"] >= 1
+        # Find the escalation entry — risk field is what we look at
+        esc = [
+            e for e in body["sensitivity_escalations"]
+            if e["diffs"].get("risk", {}).get("from") == "low"
+        ]
+        assert len(esc) == 1
+        assert esc[0]["diffs"]["risk"]["to"] == "high"
+
+    def test_diff_first_snapshot_only(self, tmp_path, monkeypatch):
+        """When only the cumulative JSON exists, return 'first_snapshot' mode."""
+        from opensquilla.asset_tree.db import backend as _be_mod
+        from opensquilla.asset_tree.web import store as _store_mod
+        from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+        from opensquilla.asset_tree.web.store import TreeStore
+        from opensquilla.asset_tree.tree import AssetTree
+        from opensquilla.asset_tree.models import AssetType
+
+        state_dir = tmp_path / "state" / "asset_trees"
+        state_dir.mkdir(parents=True)
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(state_dir))
+
+        _be_mod.set_default_backend(None)
+        monkeypatch.setattr(
+            _store_mod, "_backend",
+            lambda: (_ for _ in ()).throw(AssetTreeConfigError("unset")),
+        )
+
+        tree = AssetTree("first.com")
+        tree.add_node(
+            asset_type=AssetType.SUB_DOMAIN,
+            value="api.first.com",
+            parent_id=tree.root_id,
+        )
+        (state_dir / "tree-first.com.json").write_text(
+            tree.to_json(), encoding="utf-8"
+        )
+        store = TreeStore()
+        routes = create_asset_tree_routes(store)
+        app = Starlette(routes=[Mount("/asset-tree", routes=routes)])
+        c = TestClient(app, raise_server_exceptions=False)
+
+        resp = c.get("/asset-tree/api/trees/tree-first.com/diff")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["mode"] == "first_snapshot"
+        assert body["snapshot_a"] is None
+        # Everything in the tree shows as "added"
+        added_values = {a["value"] for a in body["added"]}
+        assert "api.first.com" in added_values
+        # And the root_domain
+        assert "first.com" in added_values
+
+    def test_diff_no_snapshots(self, tmp_path, monkeypatch):
+        """When the state dir is empty, return 'no_snapshots' mode."""
+        from opensquilla.asset_tree.db import backend as _be_mod
+        from opensquilla.asset_tree.web import store as _store_mod
+        from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+        from opensquilla.asset_tree.web.store import TreeStore
+        empty_state = tmp_path / "empty" / "asset_trees"
+        empty_state.mkdir(parents=True)
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(empty_state))
+        _be_mod.set_default_backend(None)
+        monkeypatch.setattr(
+            _store_mod, "_backend",
+            lambda: (_ for _ in ()).throw(AssetTreeConfigError("unset")),
+        )
+        store = TreeStore()
+        routes = create_asset_tree_routes(store)
+        app = Starlette(routes=[Mount("/asset-tree", routes=routes)])
+        c = TestClient(app, raise_server_exceptions=False)
+        resp = c.get("/asset-tree/api/trees/nonexistent.com/diff")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["mode"] == "no_snapshots"
+        assert body["summary"]["added"] == 0
+
+    def test_diff_custom_sensitivity_field(self, client_two_snapshots):
+        resp = client_two_snapshots.get(
+            "/asset-tree/api/trees/tree-acme-corp.com/diff"
+            "?sensitivity_field=http_only"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # http_only: True → False is not in the risk ladder, so 0 escalations
+        # (but the change is still in `changed` bucket)
+        assert body["summary"]["sensitivity_escalations"] == 0
+        # changed should still capture it
+        assert body["summary"]["changed"] >= 1
+
+    def test_snapshot_diff_routes_are_read_only(self, client_two_snapshots):
+        """Diff endpoints must work in JSON-fallback mode (no writes)."""
+        # If the routes tried to write, the test would 503
+        # because DB is unconfigured.
+        for path in [
+            "/asset-tree/api/trees/tree-acme-corp.com/snapshots",
+            "/asset-tree/api/trees/tree-acme-corp.com/diff",
+        ]:
+            resp = client_two_snapshots.get(path)
+            assert resp.status_code == 200, f"{path} should not 503"
+            # Success responses don't have a "code" field at all;
+            # 503 responses would have code="db_unavailable". So
+            # check via "code" key absence or value.
+            body = resp.json()
+            assert body.get("code") != "db_unavailable"
