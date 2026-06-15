@@ -8,9 +8,112 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **hack-deep-find complete asset surface** (Batches 1-5, 2026-06-15):
+  extended asset discovery from 6 to 16 specialists, surfaced 9 new
+  asset types (URL / API_SCHEMA / PARAMETER / STATIC_ASSET / COMPONENT
+  / AUTH_SURFACE / COOKIE / HEADER / STORAGE / STORAGE_OBJECT / SECRET)
+  in active production, added horizontal multi-seed expansion, and added
+  time-dimension support (snapshot diff via cron). See
+  `docs/plans/2026-06-15-hack-deep-find-batch-1-plan.md` for Batch 1
+  RFC; Batches 2-5 follow the same pattern in the codebase.
+
+  **Batch 1 (web surface + CVE component view, 5 specialists + 17 tools + 5 schemas)**:
+  - Specialists: `service-detailed`, `webapp-discoverer`, `api-surface`,
+    `parameter-extract`, `static-asset`.
+  - Tools: `group:recon:webapp` (5), `group:recon:api` (5),
+    `group:recon:component` (4), `group:recon:sensitive` (3).
+  - Schemas: `component-v1`, `webapp-v1`, `api-surface-v1`,
+    `parameter-v1`, `static-asset-v1`.
+  - Orchestrator: Step N.5 layered loop with dual-specialist
+    parallelism at SERVICE and URL layers.
+
+  **Batch 2 (auth + cookie/header security posture, 2 specialists + 9 tools + 2 schemas)**:
+  - Specialists: `auth-mapper` (URL → AUTH_SURFACE), `cookie-header`
+    (URL → COOKIE + HEADER, dual-output).
+  - Tools: `group:recon:auth` (5), `group:recon:header` (4).
+  - Schemas: `auth-surface-v1`, `cookie-header-v1`.
+  - URL layer now runs 4 specialist in parallel.
+
+  **Batch 3 (cloud storage + cross-layer secret, 2 specialists + 12 tools + 2 schemas)**:
+  - Specialists: `cloud-storage` (SUB_DOMAIN → STORAGE + STORAGE_OBJECT),
+    `secret-scanner` (cross-layer → SECRET, scans 8 parent types).
+  - Tools: `group:recon:storage` (6: S3/OSS/GCS/Azure + bucket naming +
+    list), `group:recon:secret` (6: text scan + JS bundle + git history
+    + env dump + classify + AWS validate).
+  - Schemas: `cloud-storage-v1`, `secret-v1`.
+  - SUB_DOMAIN layer now runs 2 specialist in parallel.
+
+  **Batch 4 (horizontal seed expansion, 1 specialist + 5 tools + 1 schema + asset_tree tool layer changes)**:
+  - Specialist: `seed-expander` (ROOT_DOMAIN → seed list, does NOT write
+    to AssetTree; orchestrator feeds seeds into extra_seeds or merges).
+  - Tools: `group:recon:seed` (5: WHOIS / ASN lookup / crt.sh CT enum /
+    passive DNS / related-domain mining).
+  - Schema: `seed-v1`.
+  - `asset_tree_create` extended with `extra_seeds` parameter (multi-
+    seed expansion under one tree).
+  - New tool: `asset_tree_merge` (cross-tree consolidation; 8 → 9
+    asset_tree tools).
+  - ROOT_DOMAIN layer now runs 2 specialist in parallel (subdomain +
+    seed-expander).
+  - Orchestrator Step 0 extended with multi-seed flow + Step 0.5
+    decision (same tree vs. multi-tree + merge).
+
+  **Batch 5 (time-dimension: snapshot diff, 0 new specialists + 2 orchestrator tools + asset_tree_complete extension)**:
+  - **0 new specialists** — Batch 5 is purely an orchestrator-level enhancement
+    that reuses all 16 specialists from Batches 1-4 and the existing
+    `opensquilla cron` scheduler. No new infrastructure.
+  - **2 new tools in `group:recon:diff`**:
+    - `recon_list_snapshots(root_domain_substr?, limit=50)` — list historical
+      `~/.opensquilla/state/asset_trees/*.json`, with mtime-desc ordering
+      and per-type node count summary.
+    - `recon_diff_snapshots(snapshot_a_path, snapshot_b_path, sensitivity_field="risk", include_subtree_moves=True)` —
+      diff two snapshots and bucket by added/removed/changed/moved +
+      `sensitivity_escalations` (info<low<medium<high<critical ladder, one-way).
+  - **`asset_tree_complete` extended with `snapshot_id` field**:
+    now returns `{tree_id, tree_path, snapshot_id, snapshot_ts, stats}`
+    where `snapshot_id = "<tree_id>--<iso_timestamp>"` (filesystem-safe).
+    Each find-run produces a distinct snapshot for time-dimension diff.
+  - **Docs**: `docs/operations/hack-deep-find-scheduled-scan.md` — cron
+    usage guide (e.g. `opensquilla cron add --every "0 3 * * *" ...`).
+  - **Total now**: 16 specialists + 53 recon tools + 13 tool groups.
+
+  **Total impact (Batches 1-5)**:
+  - Specialists: 6 → 16 (+10)
+  - Recon tools: 10 → 53 (+43)
+  - Recon tool groups: 3 → 13 (+10)
+  - Evidence schemas: 7 → 12 (+5)
+  - Asset tree tools: 8 → 9 (+1: asset_tree_merge)
+  - Asset tree types: 18 → 19 (+1: GENERIC, was already there)
+  - Asset tree parent-child edges: extended (URL → AUTH_SURFACE/COOKIE/
+    HEADER; SUB_DOMAIN → STORAGE; STORAGE → STORAGE_OBJECT; SECRET
+    cross-layer across 8 parent types).
+
 ### Changed
 
+- `asset_tree_create` signature extended: now accepts `extra_seeds`
+  parameter (list of `{kind, value}` dicts) for multi-seed expansion.
+- `asset_tree` tool list in SOUL_BODY: 8 → 9 (added asset_tree_merge).
+- Orchestrator SOUL_BODY: specialist table extended with 10 new
+  specialists, parallel rules extended at SUB_DOMAIN (2-way), URL
+  (4-way), and ROOT_DOMAIN (2-way) layers; Step 0 now includes
+  multi-seed flow.
+- `asset_tree_complete` return shape extended: now includes
+  `snapshot_id` (string, `<tree_id>--<iso_ts>`) and `snapshot_ts`
+  (string) for time-dimension snapshot diff (Batch 5).
+- `recon_diff_snapshots` and `recon_list_snapshots` are new
+  orchestrator-level tools in `group:recon:diff` (Batch 5).
+- `recon_diff_snapshots.sensitivity_field` default is `"risk"`
+  (matches COOKIE/HEADER convention from the cookie-header specialist;
+  use `"sensitivity"` for STATIC_ASSET).
+
 ### Fixed
+
+- `recon_diff_snapshots` now detects ALL metadata field changes (not just
+  the named `sensitivity_field`); the named field is only used to decide
+  whether a metadata change is a ladder escalation (Batch 5).
+- `_state_root()` in `recon/diff.py` resolves `OPEN_SQUILLA_STATE_DIR`
+  lazily on every call (was cached at module import, breaking tests
+  that monkeypatch the env var) (Batch 5).
 
 ## [0.3.1] - 2026-06-03
 

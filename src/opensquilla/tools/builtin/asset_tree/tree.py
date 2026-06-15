@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -171,7 +172,11 @@ def _validate_state(state_str: str) -> AssetState:
     params={
         "root_domain": {
             "type": "string",
-            "description": "Root domain (e.g. 'example.com').",
+            "description": (
+                "Primary root domain (e.g. 'example.com'). This is the "
+                "tree's canonical root; all other seeds are attached as "
+                "child ROOT_DOMAIN nodes."
+            ),
         },
         "tree_id": {
             "type": "string",
@@ -180,15 +185,44 @@ def _validate_state(state_str: str) -> AssetState:
                 "or '..'). Default: 'tree-<sanitized-root_domain>'."
             ),
         },
+        "extra_seeds": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["domain", "asn", "ip_range", "org_name", "keyword"],
+                    },
+                    "value": {"type": "string"},
+                },
+                "required": ["kind", "value"],
+            },
+            "description": (
+                "Optional additional seeds (Batch 4, multi-seed expansion). "
+                "Each seed becomes a child ROOT_DOMAIN node under the "
+                "primary root. `kind` indicates the seed type so the "
+                "orchestrator can dispatch the right specialist."
+            ),
+        },
     },
     required=["root_domain"],
 )
-async def asset_tree_create(root_domain: str, tree_id: str | None = None) -> str:
+async def asset_tree_create(
+    root_domain: str,
+    tree_id: str | None = None,
+    extra_seeds: list[dict[str, str]] | None = None,
+) -> str:
     """Create a new AssetTree.
 
     Phase 4: persists BOTH to JSON (read-through cache + sync test
     compat) AND to the configured MySQL/SQLite backend. The backend
     is the durable source of truth.
+
+    Batch 4 (2026-06-15): supports multi-seed expansion via
+    `extra_seeds` parameter. Each extra seed becomes a child
+    ROOT_DOMAIN node so the orchestrator can iterate seeds in
+    parallel within a single tree.
     """
     if not root_domain or not root_domain.strip():
         raise ToolError("root_domain must be non-empty")
@@ -237,6 +271,26 @@ async def asset_tree_create(root_domain: str, tree_id: str | None = None) -> str
             pass
         raise ToolError(f"Backend persistence failed: {exc}") from exc
 
+    # Batch 4: attach extra seeds as child ROOT_DOMAIN nodes
+    extra_seed_ids: list[dict[str, str]] = []
+    if extra_seeds:
+        for seed in extra_seeds:
+            kind = seed.get("kind", "domain")
+            value = seed.get("value", "").strip()
+            if not value:
+                continue
+            try:
+                child_id = tree.add_node(
+                    parent_id=tree.root_id,
+                    asset_type=AssetType.ROOT_DOMAIN,
+                    value=f"[{kind}] {value}",  # tag so kind is visible
+                    state=AssetState.UNSEEN,
+                )
+                extra_seed_ids.append({"kind": kind, "value": value, "node_id": child_id})
+            except Exception as exc:
+                # Skip on add failure; don't fail the whole tree create
+                extra_seed_ids.append({"kind": kind, "value": value, "error": str(exc)})
+
     return json.dumps(
         {
             "tree_id": tree_id,
@@ -244,6 +298,8 @@ async def asset_tree_create(root_domain: str, tree_id: str | None = None) -> str
             "root_domain": tree.root_domain,
             "persisted_path": str(path),
             "backend": type(backend).__name__,
+            "extra_seeds": extra_seed_ids,
+            "extra_seed_count": len(extra_seed_ids),
         },
         ensure_ascii=False,
     )
@@ -657,16 +713,186 @@ async def asset_tree_stats(tree_id: str) -> str:
     required=["tree_id"],
 )
 async def asset_tree_complete(tree_id: str) -> str:
-    """Mark the find run complete and return the persisted path."""
+    """Mark the find run complete and return the persisted path.
+
+    Batch 5 (2026-06-15): generates a snapshot_id of the form
+    ``<tree_id>--<iso_timestamp>`` so the same tree re-run later (e.g.
+    via `opensquilla cron add --every ...`) produces a distinct
+    snapshot that can be diffed via ``recon_diff_snapshots``.
+    """
     tree = _load_tree(tree_id)
     _save_tree(tree, tree_id)  # touch
     path = _tree_path(tree_id)
+    # ISO-8601 UTC timestamp, e.g. "2026-06-15T12-34-56Z" (filesystem-safe)
+    snapshot_ts = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
+    snapshot_id = f"{tree_id}--{snapshot_ts}"
     return json.dumps(
         {
             "tree_id": tree_id,
             "tree_path": str(path),
+            "snapshot_id": snapshot_id,
+            "snapshot_ts": snapshot_ts,
             "stats": tree.stats(),
         },
         ensure_ascii=False,
         default=str,
     )
+
+# ── Batch 4 (2026-06-15): cross-tree merge ───────────
+
+
+@tool(
+    name="asset_tree_merge",
+    description=(
+        "Merge nodes from one or more source trees into a target tree. "
+        "Useful when running multiple find-runs (e.g. seeded by different "
+        "ASN, IP range, or org-name) and you want a consolidated attack "
+        "surface view. Dedup is by (asset_type, value) per parent; "
+        "collisions preserve the target's existing node. Returns a "
+        "summary: nodes_merged, nodes_deduped, nodes_added (per source)."
+    ),
+    params={
+        "target_tree_id": {
+            "type": "string",
+            "description": "The tree to merge INTO (existing or new).",
+        },
+        "source_tree_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of source tree ids to merge from.",
+        },
+        "create_target_if_missing": {
+            "type": "boolean",
+            "default": False,
+            "description": "If True, create the target tree using source[0]'s root_domain.",
+        },
+    },
+    required=["target_tree_id", "source_tree_ids"],
+    execution_timeout_seconds=60.0,
+)
+async def asset_tree_merge(
+    target_tree_id: str,
+    source_tree_ids: list[str],
+    create_target_if_missing: bool = False,
+) -> str:
+    """Merge source trees into a target tree.
+
+    Algorithm:
+      1. Load target tree (or create it from source[0]'s root_domain).
+      2. For each source tree:
+         a. Load source tree.
+         b. For each non-root node in source:
+            - If (asset_type, value) already exists at the SAME parent_id
+              under target → skip (deduped).
+            - If (asset_type, value) exists at a DIFFERENT parent_id →
+              add new node under target's matching parent (or skip if
+              target has no matching parent — orphan).
+            - Else → add new node under target.root_id (treat as new
+              seed at the same level).
+    """
+    if not source_tree_ids:
+        raise ToolError("source_tree_ids must be non-empty")
+
+    target_path = _tree_path(target_tree_id)
+    if target_path.exists():
+        target = _load_tree(target_tree_id)
+    elif create_target_if_missing:
+        # Borrow root_domain from source[0]
+        source0 = _load_tree(source_tree_ids[0])
+        target = AssetTree(
+            source0.root_domain,
+            backend=_backend(),
+            tree_id=target_tree_id,
+        )
+        _save_tree(target, target_tree_id)
+    else:
+        raise ToolError(
+            f"Target tree not found: {target_tree_id}. "
+            "Set create_target_if_missing=True to auto-create from source[0]."
+        )
+
+    summary = {
+        "target_tree_id": target_tree_id,
+        "sources": [],
+    }
+
+    # Build a lookup: (parent_id, asset_type, value) -> node_id in target
+    def _target_index(t: AssetTree) -> dict[tuple[str | None, str, str], str]:
+        idx: dict[tuple[str | None, str, str], str] = {}
+        for nid, node in t._nodes.items():  # noqa: SLF001 (internal)
+            key = (node.parent_id, node.asset_type.value, node.value)
+            idx[key] = nid
+        return idx
+
+    target_idx = _target_index(target)
+
+    for src_id in source_tree_ids:
+        if src_id == target_tree_id:
+            summary["sources"].append({"source": src_id, "skipped": "self_merge"})
+            continue
+        try:
+            source = _load_tree(src_id)
+        except Exception as exc:
+            summary["sources"].append({"source": src_id, "error": str(exc)})
+            continue
+
+        added = 0
+        deduped = 0
+        # Iterate source nodes in BFS-ish order so parents exist before children
+        # (source tree is already coherent, so we just iterate by depth).
+        nodes_by_depth: dict[int, list[Any]] = {}
+        for nid, node in source._nodes.items():  # noqa: SLF001
+            if node.parent_id is None:
+                continue  # skip source root
+            depth = source._edges.get(node.parent_id, [])  # noqa: SLF001
+            # crude depth: count ancestors
+            cur = node
+            d = 0
+            while cur.parent_id is not None:
+                cur = source._nodes[cur.parent_id]  # noqa: SLF001
+                d += 1
+            nodes_by_depth.setdefault(d, []).append(node)
+
+        for d in sorted(nodes_by_depth):
+            for src_node in nodes_by_depth[d]:
+                # Resolve target parent: if source parent_id is the source root,
+                # attach to target root. Otherwise look up the source parent in
+                # the target's index under the same (asset_type, value).
+                target_parent_id: str | None
+                if src_node.parent_id == source.root_id:
+                    target_parent_id = target.root_id
+                else:
+                    src_parent = source._nodes.get(src_node.parent_id)  # noqa: SLF001
+                    if src_parent is None:
+                        continue
+                    key = (target.root_id, src_parent.asset_type.value, src_parent.value)
+                    target_parent_id = target_idx.get(key, target.root_id)
+
+                # Dedup check
+                dedup_key = (target_parent_id, src_node.asset_type.value, src_node.value)
+                if dedup_key in target_idx:
+                    deduped += 1
+                    continue
+
+                # Add to target
+                try:
+                    new_id = target.add_node(
+                        parent_id=target_parent_id,
+                        asset_type=src_node.asset_type,
+                        value=src_node.value,
+                        state=src_node.state,
+                        metadata=dict(src_node.metadata or {}),
+                    )
+                    target_idx[dedup_key] = new_id
+                    added += 1
+                except Exception as exc:
+                    # Skip on add failure (e.g. invalid parent-child)
+                    continue
+
+        _save_tree(target, target_tree_id)
+        summary["sources"].append(
+            {"source": src_id, "added": added, "deduped": deduped}
+        )
+
+    summary["target_stats"] = target.stats()
+    return json.dumps(summary, ensure_ascii=False, default=str)

@@ -39,6 +39,96 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
             "recon_extract_endpoints_from_js",
         }
     ),
+    # ── Recon tool groups (Batch 1, 2026-06-15) ──────────────────
+    "group:recon:webapp": frozenset(
+        {
+            "recon_vhost_bruteforce",
+            "recon_robots_sitemap",
+            "recon_tech_detect",
+            "recon_app_fingerprint",
+            "recon_url_dedupe",
+        }
+    ),
+    "group:recon:api": frozenset(
+        {
+            "recon_openapi_parse",
+            "recon_graphql_introspect",
+            "recon_js_crawl_recursive",
+            "recon_api_path_normalize",
+            "recon_auth_probe",
+        }
+    ),
+    "group:recon:component": frozenset(
+        {
+            "recon_cpe_resolve",
+            "recon_js_component_extract",
+            "recon_tls_cert_parse",
+            "recon_ico_hash_lookup",
+        }
+    ),
+    "group:recon:sensitive": frozenset(
+        {
+            "recon_sensitive_fingerprint",
+            "recon_sensitive_variants",
+            "recon_secret_extract",
+        }
+    ),
+    # ── Recon tool groups (Batch 2, 2026-06-15) ──────────────────
+    "group:recon:auth": frozenset(
+        {
+            "recon_auth_endpoint_discover",
+            "recon_oauth_flow_probe",
+            "recon_jwt_analyze",
+            "recon_default_creds_probe",
+            "recon_auth_form_parse",
+        }
+    ),
+    "group:recon:header": frozenset(
+        {
+            "recon_cookie_security_parse",
+            "recon_security_header_audit",
+            "recon_info_disclosure_header_scan",
+            "recon_cookie_jar_collect",
+        }
+    ),
+    # ── Recon tool groups (Batch 3, 2026-06-15) ──────────────────
+    "group:recon:storage": frozenset(
+        {
+            "recon_bucket_naming_variants",
+            "recon_s3_check",
+            "recon_oss_check",
+            "recon_gcs_check",
+            "recon_azure_blob_check",
+            "recon_bucket_list_objects",
+        }
+    ),
+    "group:recon:secret": frozenset(
+        {
+            "recon_secret_scan_text",
+            "recon_secret_scan_js_bundle",
+            "recon_secret_scan_git_history",
+            "recon_secret_scan_env_dump",
+            "recon_secret_classify",
+            "recon_secret_validate_aws_key",
+        }
+    ),
+    # ── Recon tool groups (Batch 4, 2026-06-15) ──────────────────
+    "group:recon:seed": frozenset(
+        {
+            "recon_whois_lookup",
+            "recon_asn_lookup",
+            "recon_ct_subdomain_enum",
+            "recon_passive_dns",
+            "recon_related_domain_mining",
+        }
+    ),
+    # ── Recon tool groups (Batch 5, 2026-06-15) ──────────────────
+    "group:recon:diff": frozenset(
+        {
+            "recon_diff_snapshots",
+            "recon_list_snapshots",
+        }
+    ),
     "group:recon": frozenset(),  # populated after dict literal as union of subgroups
     # ── AssetTree tool group (hack-deep-find LLM-coordinator) ────
     "group:asset_tree": frozenset(
