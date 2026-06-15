@@ -188,15 +188,60 @@
       .main-body { flex-direction: column; }
       .detail-panel { width: 100%; min-width: 100%; border-left: none; border-top: 1px solid var(--border); max-height: 40vh; }
     }
+
+    /* ── DB status banner ────────────────── */
+    .db-banner {
+      padding: 8px 14px;
+      font-size: 12px;
+      line-height: 1.45;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .db-banner.warn {
+      background: rgba(210, 153, 34, 0.15);
+      color: var(--orange);
+    }
+    .db-banner.ok {
+      background: rgba(63, 185, 80, 0.10);
+      color: var(--green);
+    }
+    .db-banner-icon { font-size: 14px; line-height: 1.2; }
+    .db-banner-text { flex: 1; }
+    .db-banner-text code {
+      background: rgba(0,0,0,0.3);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
   <div class="app" id="app">
+    {% if db_status and db_status.mode == "json_fallback" %}
+    <div class="db-banner warn" id="dbBanner">
+      <div class="db-banner-icon">⚠️</div>
+      <div class="db-banner-text">
+        <strong>DB not configured.</strong>
+        Reads work from the on-disk JSON snapshots
+        (<code>~/.opensquilla/state/asset_trees/</code>);
+        writes are disabled. Set
+        <code>ASSET_TREE_DB_URL=mysql+aiomysql://user:pass@host:3306/opensquilla</code>
+        and restart the gateway to enable full DB mode.
+      </div>
+    </div>
+    {% elif db_status and db_status.mode == "db" %}
+    <div class="db-banner ok" id="dbBanner" style="display:none">
+      <div class="db-banner-icon">✓</div>
+      <div class="db-banner-text">DB mode active.</div>
+    </div>
+    {% endif %}
     <!-- Sidebar: tree list -->
     <div class="sidebar">
       <div class="sidebar-header">
         <h2>🌳 Asset Trees</h2>
-        <button class="btn btn-sm btn-primary" onclick="showCreateTreeModal()">+ 新建</button>
+        <button class="btn btn-sm btn-primary" onclick="showCreateTreeModal()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>+ 新建</button>
       </div>
       <div class="tree-list" id="treeList"></div>
     </div>
@@ -206,8 +251,8 @@
       <div class="main-header">
         <h1 id="mainTitle">选择或创建一个资产树</h1>
         <div id="mainActions" style="display:none">
-          <button class="btn btn-sm" onclick="showAddNodeModal()">+ 添加节点</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteCurrentTree()">删除树</button>
+          <button class="btn btn-sm" onclick="showAddNodeModal()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>+ 添加节点</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteCurrentTree()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>删除树</button>
         </div>
       </div>
       <div class="stats-bar" id="statsBar" style="display:none"></div>
@@ -300,7 +345,30 @@
         opts.body = JSON.stringify(body);
       }
       const resp = await fetch('/asset-tree/api' + path, opts);
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        if (resp.status === 503 && err.code === "db_unavailable") {
+          showDbUnavailableToast(err.error || "DB unavailable");
+        }
+        throw new Error(err.error || resp.statusText);
+      }
       return resp.json();
+    }
+
+    function showDbUnavailableToast(message) {
+      // If a banner already exists, just make sure it is visible.
+      let banner = document.getElementById("dbBanner");
+      if (banner && banner.classList.contains("warn")) {
+        banner.style.display = "flex";
+        return;
+      }
+      // Otherwise prepend a transient inline banner.
+      const div = document.createElement("div");
+      div.className = "db-banner warn";
+      div.style.cssText = "position:fixed;top:8px;right:8px;z-index:9999;max-width:480px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+      div.innerHTML = '<div class="db-banner-icon">⚠️</div><div class="db-banner-text"><strong>DB unavailable.</strong> ' + (window.esc ? esc(message) : message) + '</div>';
+      document.body.appendChild(div);
+      setTimeout(() => div.remove(), 6000);
     }
 
     // ── Tree list ──────────────────────────

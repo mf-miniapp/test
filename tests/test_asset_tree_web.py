@@ -334,3 +334,183 @@ class TestPageRendering:
         resp = client.get("/asset-tree/")
         assert resp.status_code == 200
         assert "example.com" in resp.text
+
+
+# ── JSON-fallback mode (DB not configured) ──────────────────────
+
+
+class TestJSONFallbackMode:
+    """When ASSET_TREE_DB_URL is unset, the web layer must:
+
+    - render the index page (not 500)
+    - read trees from the on-disk JSON snapshots
+    - disable / reject write operations with 503 ``db_unavailable``
+    - show a banner in the page hinting at the fallback
+    """
+
+    @pytest.fixture()
+    def store_no_db(self, tmp_path, monkeypatch):
+        """Build a TreeStore with the default backend neutralized.
+
+        This simulates ``ASSET_TREE_DB_URL`` being unset. We also seed
+        one JSON snapshot in a tmp state dir so the read path can find it.
+        """
+        # Make sure the default backend is reset, then point the store
+        # module's ``_backend()`` helper at a function that raises
+        # ``AssetTreeConfigError`` — exactly what the production code
+        # does when the env var is unset.
+        from opensquilla.asset_tree.db import backend as _be_mod
+        from opensquilla.asset_tree.web import store as _store_mod
+        from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+        from opensquilla.asset_tree.web.store import TreeStore
+
+        # Reset any cached backend (e.g. from another test)
+        _be_mod.set_default_backend(None)
+        monkeypatch.setattr(
+            _store_mod, "_backend",
+            lambda: (_ for _ in ()).throw(AssetTreeConfigError(
+                "ASSET_TREE_DB_URL is not set (test simulation).",
+            )),
+        )
+        # Plant a JSON snapshot in a tmp state dir
+        state_dir = tmp_path / "state" / "asset_trees"
+        state_dir.mkdir(parents=True)
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(state_dir))
+
+        from opensquilla.asset_tree.tree import AssetTree
+        from opensquilla.asset_tree.models import AssetType, AssetState
+        tree = AssetTree("fallback.com")
+        sub_id = tree.add_node(
+            asset_type=AssetType.SUB_DOMAIN,
+            value="api.fallback.com",
+            parent_id=tree.root_id,
+        )
+        tree.update_state(sub_id, AssetState.DISCOVERED)
+        (state_dir / "tree-fallback.json").write_text(tree.to_json(), encoding="utf-8")
+
+        return TreeStore()
+
+    @pytest.fixture()
+    def client_no_db(self, store_no_db):
+        routes = create_asset_tree_routes(store_no_db)
+        app = Starlette(routes=[Mount("/asset-tree", routes=routes)])
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_db_available_is_false(self, store_no_db):
+        """The store probes and discovers no DB is configured."""
+        assert store_no_db.db_available is False
+        status = store_no_db.db_status_payload()
+        assert status["mode"] == "json_fallback"
+        assert "ASSET_TREE_DB_URL" in status["hint"]
+
+    def test_index_page_renders(self, client_no_db):
+        """The HTML page must render (200), not 500."""
+        resp = client_no_db.get("/asset-tree/")
+        assert resp.status_code == 200
+        assert "Asset Tree" in resp.text
+
+    def test_index_page_shows_warning_banner(self, client_no_db):
+        """The page must include the DB-not-configured banner."""
+        resp = client_no_db.get("/asset-tree/")
+        assert resp.status_code == 200
+        assert "DB not configured" in resp.text
+        assert "ASSET_TREE_DB_URL" in resp.text
+
+    def test_index_page_renders_no_trees_when_empty(self, tmp_path, monkeypatch):
+        """When the JSON state dir is empty, the page still renders (banner only)."""
+        # Override the default fixture: use a clean tmp state dir with no snapshots
+        empty_state = tmp_path / "empty_state" / "asset_trees"
+        empty_state.mkdir(parents=True)
+        monkeypatch.setenv("OPEN_SQUILLA_STATE_DIR", str(empty_state.parent))
+        from opensquilla.asset_tree.db import backend as _be_mod
+        from opensquilla.asset_tree.web import store as _store_mod
+        from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+        from opensquilla.asset_tree.web.store import TreeStore
+        from opensquilla.asset_tree.web.routes import create_asset_tree_routes
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+        _be_mod.set_default_backend(None)
+        monkeypatch.setattr(
+            _store_mod, "_backend",
+            lambda: (_ for _ in ()).throw(AssetTreeConfigError("unset")),
+        )
+        store = TreeStore()
+        app = Starlette(routes=[Mount("/asset-tree", routes=create_asset_tree_routes(store))])
+        c = TestClient(app, raise_server_exceptions=False)
+        resp = c.get("/asset-tree/")
+        assert resp.status_code == 200
+        assert "DB not configured" in resp.text
+
+    def test_list_trees_returns_json_fallback(self, client_no_db):
+        """GET /api/trees must return the JSON-fallback tree list."""
+        resp = client_no_db.get("/asset-tree/api/trees")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["trees"]) == 1
+        assert body["trees"][0]["root_domain"] == "fallback.com"
+        assert body["trees"][0]["node_count"] == 2  # root + sub_domain
+
+    def test_get_tree_returns_json_fallback(self, client_no_db):
+        """GET /api/trees/{id} must reconstruct from JSON."""
+        resp = client_no_db.get("/asset-tree/api/trees/tree-fallback")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["root_domain"] == "fallback.com"
+        assert "tree" in body
+
+    def test_get_tree_404_for_unknown(self, client_no_db):
+        resp = client_no_db.get("/asset-tree/api/trees/nonexistent")
+        assert resp.status_code == 404
+
+    def test_create_tree_returns_503(self, client_no_db):
+        """POST /api/trees must return 503 db_unavailable in fallback mode."""
+        resp = client_no_db.post(
+            "/asset-tree/api/trees",
+            json={"root_domain": "blocked.com"},
+        )
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["code"] == "db_unavailable"
+        assert "ASSET_TREE_DB_URL" in body["error"]
+
+    def test_add_node_returns_503(self, client_no_db):
+        resp = client_no_db.post(
+            "/asset-tree/api/trees/tree-fallback/nodes",
+            json={"asset_type": "sub_domain", "value": "x.fallback.com"},
+        )
+        assert resp.status_code == 503
+        assert resp.json()["code"] == "db_unavailable"
+
+    def test_update_node_returns_503(self, client_no_db):
+        # Look up a real node id from the JSON-fallback tree, then
+        # try to update it. The route should still 503 because
+        # store.update_node is a write op.
+        meta = client_no_db.get("/asset-tree/api/trees/tree-fallback").json()
+        # tree.nodes is a list (see _tree_to_dict) — pick the first
+        # non-root node.
+        nodes = meta.get("tree", {}).get("nodes", [])
+        real_node_id = None
+        for n in nodes:
+            if n.get("asset_type") != "root_domain":
+                real_node_id = n.get("id")
+                break
+        assert real_node_id is not None, "fixture must have a non-root node"
+        resp = client_no_db.put(
+            f"/asset-tree/api/trees/tree-fallback/nodes/{real_node_id}",
+            json={"state": "verified"},
+        )
+        assert resp.status_code == 503
+        assert resp.json()["code"] == "db_unavailable"
+
+    def test_delete_tree_returns_503(self, client_no_db):
+        resp = client_no_db.delete("/asset-tree/api/trees/tree-fallback")
+        assert resp.status_code == 503
+        assert resp.json()["code"] == "db_unavailable"
+
+    def test_get_stats_still_works_via_json(self, client_no_db):
+        """Stats endpoint is a read — should work in JSON-fallback mode."""
+        resp = client_no_db.get("/asset-tree/api/trees/tree-fallback/stats")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_nodes"] == 2

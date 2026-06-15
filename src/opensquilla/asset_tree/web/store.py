@@ -30,7 +30,10 @@ first place).
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from opensquilla.asset_tree.models import (
@@ -49,6 +52,64 @@ def _backend():
     return get_default_backend()
 
 
+class DBUnavailableError(RuntimeError):
+    """Raised when an AssetTree operation requires a configured DB but
+    ``ASSET_TREE_DB_URL`` is unset / points to a non-MySQL URL.
+
+    Read operations fall back to the on-disk JSON snapshots at
+    ``~/.opensquilla/state/asset_trees/*.json``; write operations
+    raise this so the web routes can return 503 ``db_unavailable``
+    with a clear hint for the operator.
+    """
+
+
+def is_db_config_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or any cause in its chain) is a DB config error.
+
+    Mirrors the production contract: ``ASSET_TREE_DB_URL`` unset or
+    non-MySQL means the operator hasn't wired up the persistent
+    backend, so we transparently fall back to JSON reads.
+    """
+    from opensquilla.asset_tree.db.pool import AssetTreeConfigError
+    cur: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, AssetTreeConfigError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _json_state_dir() -> Path:
+    """Resolve the JSON snapshot dir (same as the tool layer uses)."""
+    env = os.environ.get("OPEN_SQUILLA_STATE_DIR")
+    return Path(env) if env else (Path.home() / ".opensquilla" / "state" / "asset_trees")
+
+
+def _read_json_tree(tree_id: str) -> Optional[dict[str, Any]]:
+    """Read a tree's JSON snapshot from disk; return None if absent."""
+    # Strip any "--<iso_ts>" suffix to get the canonical tree_id
+    # (Batch 5 snapshot_id format: "<tree_id>--<iso_ts>")
+    canonical = tree_id.split("--", 1)[0] if "--" in tree_id else tree_id
+    path = _json_state_dir() / f"{canonical}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _list_json_trees() -> list[Path]:
+    """List all tree JSON files in the state dir, newest first."""
+    d = _json_state_dir()
+    if not d.exists():
+        return []
+    files = sorted(d.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
 class TreeStore:
     """Async DB-backed tree storage.
 
@@ -62,12 +123,71 @@ class TreeStore:
 
     def __init__(self) -> None:
         self._auto_id_counter = 0
+        # Cached DB status. ``None`` = not yet probed. ``True`` = a
+        # backend is wired up (or the test stub is installed).
+        # ``False`` = ``ASSET_TREE_DB_URL`` is unset or non-MySQL,
+        # so reads fall back to JSON files.
+        self._db_available: Optional[bool] = None
+
+    # ── DB status ─────────────────────────────────────────
+
+    @property
+    def db_available(self) -> bool:
+        """True iff the production DB backend (or a test stub) is wired.
+
+        Probing is lazy and cached. The first call tries to resolve
+        ``_backend()``; if that raises ``AssetTreeConfigError`` the
+        store flips into JSON-fallback mode and stays there for the
+        process lifetime.
+        """
+        if self._db_available is not None:
+            return self._db_available
+        try:
+            _backend()
+            self._db_available = True
+        except Exception as exc:
+            if is_db_config_error(exc):
+                self._db_available = False
+            else:
+                # Some other error — treat as unavailable, but the
+                # routes will surface the real message on first use.
+                self._db_available = False
+        return self._db_available
+
+    def db_status_payload(self) -> dict[str, Any]:
+        """Return a JSON-serializable status dict for the UI banner.
+
+        - ``mode``: ``"db"`` (production) or ``"json_fallback"``
+        - ``hint``: operator action when in fallback
+        """
+        if self.db_available:
+            return {"mode": "db", "hint": None}
+        return {
+            "mode": "json_fallback",
+            "hint": (
+                "ASSET_TREE_DB_URL is unset. Reads work via the on-disk "
+                "JSON snapshots under ~/.opensquilla/state/asset_trees/. "
+                "Writes are disabled. Set ASSET_TREE_DB_URL to a "
+                "'mysql+aiomysql://...' string to enable full DB mode."
+            ),
+        }
 
     # ── Public read API ─────────────────────────────────────
 
     async def list_trees(self) -> list[dict[str, Any]]:
         """Return metadata for all stored trees (one row per tree)."""
+        if not self.db_available:
+            return self._list_trees_from_json()
         be = _backend()
+        try:
+            return await self._list_trees_from_db(be)
+        except Exception as exc:
+            if is_db_config_error(exc):
+                self._db_available = False
+                return self._list_trees_from_json()
+            raise
+
+    async def _list_trees_from_db(self, be: Any) -> list[dict[str, Any]]:
         # Cheap "list all" query: SELECT tree_id, root_domain,
         # description, created_at, updated_at FROM asset_trees.
         async with be._engine.begin() as conn:  # type: ignore[attr-defined]
@@ -99,9 +219,27 @@ class TreeStore:
         Reads all ``asset_nodes`` + ``asset_edges`` rows, materialises
         them through ``AssetTree.from_dict``, and returns the live
         object so route handlers can call ``tree.stats()`` etc.
+
+        Falls back to the on-disk JSON snapshot when the DB is
+        not configured (``ASSET_TREE_DB_URL`` unset) — see
+        ``self.db_available``.
         """
+        if not self.db_available:
+            tree = await self.get_tree_from_json(tree_id)
+            if tree is None:
+                raise KeyError(f"Tree '{tree_id}' not found")
+            return tree
         be = _backend()
-        tree_row = await be.get_tree(tree_id)
+        try:
+            tree_row = await be.get_tree(tree_id)
+        except Exception as exc:
+            if is_db_config_error(exc):
+                self._db_available = False
+                tree = await self.get_tree_from_json(tree_id)
+                if tree is None:
+                    raise KeyError(f"Tree '{tree_id}' not found") from exc
+                return tree
+            raise
         if tree_row is None:
             raise KeyError(f"Tree '{tree_id}' not found")
 
@@ -172,8 +310,22 @@ class TreeStore:
         return AssetTree.from_dict(from_dict)
 
     async def get_tree_meta(self, tree_id: str) -> dict[str, Any]:
+        if not self.db_available:
+            meta = self.get_tree_meta_from_json(tree_id)
+            if meta is None:
+                raise KeyError(f"Tree '{tree_id}' not found")
+            return meta
         be = _backend()
-        tree_row = await be.get_tree(tree_id)
+        try:
+            tree_row = await be.get_tree(tree_id)
+        except Exception as exc:
+            if is_db_config_error(exc):
+                self._db_available = False
+                meta = self.get_tree_meta_from_json(tree_id)
+                if meta is None:
+                    raise KeyError(f"Tree '{tree_id}' not found") from exc
+                return meta
+            raise
         if tree_row is None:
             raise KeyError(f"Tree '{tree_id}' not found")
         stats = await be.stats(tree_id)
@@ -187,6 +339,11 @@ class TreeStore:
         }
 
     async def delete_tree(self, tree_id: str) -> None:
+        if not self.db_available:
+            raise DBUnavailableError(
+                "Cannot delete trees: ASSET_TREE_DB_URL is not set. "
+                "Set it to a 'mysql+aiomysql://...' URL to enable writes."
+            )
         be = _backend()
         try:
             await be.delete_tree(tree_id)
@@ -223,6 +380,11 @@ class TreeStore:
         tree_id: Optional[str] = None,
         description: str = "",
     ) -> dict[str, Any]:
+        if not self.db_available:
+            raise DBUnavailableError(
+                "Cannot create trees: ASSET_TREE_DB_URL is not set. "
+                "Set it to a 'mysql+aiomysql://...' URL to enable writes."
+            )
         be = _backend()
         if tree_id is None:
             self._auto_id_counter += 1
@@ -263,6 +425,11 @@ class TreeStore:
         source_wave: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        if not self.db_available:
+            raise DBUnavailableError(
+                "Cannot add nodes: ASSET_TREE_DB_URL is not set. "
+                "Set it to a 'mysql+aiomysql://...' URL to enable writes."
+            )
         be = _backend()
         import secrets
         node_id = secrets.token_hex(6)
@@ -292,6 +459,11 @@ class TreeStore:
         state: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        if not self.db_available:
+            raise DBUnavailableError(
+                "Cannot update nodes: ASSET_TREE_DB_URL is not set. "
+                "Set it to a 'mysql+aiomysql://...' URL to enable writes."
+            )
         be = _backend()
         if state is not None:
             await be.update_node_state(tree_id=tree_id, node_id=node_id, new_state=state)
@@ -306,9 +478,79 @@ class TreeStore:
         # SQLAlchemy backend has no node-level delete; cascade via
         # the FK on delete_tree, or leave a TODO for the bulk path.
         # For now: not exposed in the UI's "delete node" action.
+        if not self.db_available:
+            raise DBUnavailableError(
+                "Cannot delete nodes: ASSET_TREE_DB_URL is not set. "
+                "Set it to a 'mysql+aiomysql://...' URL to enable writes."
+            )
         raise NotImplementedError(
             "DB-backed store does not yet support single-node delete"
         )
+
+    # ── JSON-fallback read methods ────────────────────────────
+
+    def _list_trees_from_json(self) -> list[dict[str, Any]]:
+        """List trees by scanning the JSON snapshot dir.
+
+        Used as a read-only fallback when the DB isn't configured.
+        Returns the same shape as ``_list_trees_from_db`` so the
+        page renderer doesn't need to special-case.
+        """
+        results: list[dict[str, Any]] = []
+        for p in _list_json_trees():
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            nodes = doc.get("nodes") or {}
+            # Derive root_domain from the root_domain node's value
+            root_domain = ""
+            for n in nodes.values():
+                if n.get("asset_type") == "root_domain":
+                    root_domain = n.get("value", "")
+                    break
+            results.append({
+                "id": p.stem,  # canonical tree_id (no --<iso> suffix)
+                "root_domain": root_domain,
+                "description": "(JSON fallback — DB not configured)",
+                "node_count": len(nodes),
+                "created_at": p.stat().st_ctime,
+                "updated_at": p.stat().st_mtime,
+            })
+        return results
+
+    async def get_tree_from_json(self, tree_id: str) -> Optional[AssetTree]:
+        """Read-only tree reconstruction from the JSON snapshot.
+
+        Returns None if no JSON file exists for the given tree_id.
+        """
+        doc = _read_json_tree(tree_id)
+        if doc is None:
+            return None
+        try:
+            return AssetTree.from_dict(doc)
+        except Exception:
+            return None
+
+    def get_tree_meta_from_json(self, tree_id: str) -> Optional[dict[str, Any]]:
+        """Read-only tree metadata from the JSON snapshot."""
+        doc = _read_json_tree(tree_id)
+        if doc is None:
+            return None
+        nodes = doc.get("nodes") or {}
+        root_domain = ""
+        root_id = doc.get("root_id", "")
+        for n in nodes.values():
+            if n.get("asset_type") == "root_domain":
+                root_domain = n.get("value", "")
+                break
+        return {
+            "id": tree_id.split("--", 1)[0] if "--" in tree_id else tree_id,
+            "root_domain": root_domain,
+            "root_id": root_id,
+            "description": "(JSON fallback — DB not configured)",
+            "node_count": len(nodes),
+        }
 
 
 class _TreeEntry:

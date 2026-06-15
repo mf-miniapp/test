@@ -34,7 +34,7 @@ from opensquilla.asset_tree.models import (
     validate_parent_child,
 )
 from opensquilla.asset_tree.tree import AssetTree
-from opensquilla.asset_tree.web.store import TreeStore
+from opensquilla.asset_tree.web.store import DBUnavailableError, TreeStore
 
 # ── Template loader ──────────────────────────────────────────────
 
@@ -54,6 +54,24 @@ def _render_template(name: str, context: dict[str, Any]) -> HTMLResponse:
 
 def _json_error(message: str, status: int = 400) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
+
+
+def _db_unavailable(request: Request) -> JSONResponse:
+    """Return 503 ``db_unavailable`` with operator hint.
+
+    Triggered when a write op fires while the store is in JSON-fallback
+    mode (DB not configured), or when a read fails for the same reason.
+    """
+    return JSONResponse(
+        {
+            "error": (
+                "AssetTree database is not configured. "
+                "Set ASSET_TREE_DB_URL to a 'mysql+aiomysql://...' string."
+            ),
+            "code": "db_unavailable",
+        },
+        status_code=503,
+    )
 
 
 def _parse_body(request: Request, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -129,6 +147,8 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         description = body.get("description", "")
         try:
             meta = await store.create_tree(root_domain, tree_id=tree_id, description=description)
+        except DBUnavailableError:
+            return _db_unavailable(request)
         except ValueError as e:
             return _json_error(str(e), status=409)
         return JSONResponse(meta, status_code=201)
@@ -150,6 +170,8 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         try:
             await store.delete_tree(tree_id)
             return JSONResponse({"deleted": tree_id})
+        except DBUnavailableError:
+            return _db_unavailable(request)
         except KeyError:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
 
@@ -235,6 +257,8 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
                 },
                 status_code=201,
             )
+        except DBUnavailableError:
+            return _db_unavailable(request)
         except Exception as e:
             return _json_error(str(e), status=400)
 
@@ -265,6 +289,8 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
                 state=new_state,
                 metadata=new_meta,
             )
+        except DBUnavailableError:
+            return _db_unavailable(request)
         except ValueError as e:
             return _json_error(str(e), status=400)
         await store.touch(tree_id)
@@ -294,7 +320,10 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
             return _json_error("Cannot delete root node", status=400)
 
         tree.remove_subtree(node_id)
-        await store.touch(tree_id)
+        try:
+            await store.touch(tree_id)
+        except DBUnavailableError:
+            return _db_unavailable(request)
         return JSONResponse({"deleted": node_id})
 
     # ── Page route ──────────────────────────────────────────────
@@ -302,8 +331,10 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
     async def page_index(request: Request) -> Response:
         """GET / — HTML tree viewer."""
         trees = await store.list_trees()
+        db_status = store.db_status_payload()
         return _render_template("asset_tree.html", {
             "trees": trees,
+            "db_status": db_status,
             "version": "0.3.1",
         })
 
