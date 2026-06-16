@@ -271,6 +271,15 @@ WAVES: dict[str, WaveSpec] = {
                      # ffuf/feroxbuster/gobuster for missing paths. Single
                      # specialist (recon) — not a fanout — because the work is
                      # bounded to the same target, just deeper.
+                     #
+                     # 2026-06-16 v2 protocol note: W1.5c is a REGISTERED
+                     # sub-wave that find EXECUTES itself in its F1.5c step
+                     # (see agents/hack-deep-find/SOUL_BODY.md). It is NOT
+                     # the same as W1.6c drill-in (which is declared via
+                     # drill-in-request-v1 and executed by hack-deep). The
+                     # two live in different namespaces by design:
+                     #   W1.5c = ".5c" suffix = registered sub-wave, find-executed
+                     #   W1.6c = ".6c" suffix = drill-in slot, deep-executed
         deps=("W1",),
         fanout="single",
         drill_in_allowed=False,
@@ -379,15 +388,38 @@ WAVE_NAMES: tuple[str, ...] = tuple(WAVES.keys())
 # of allowed drill-in slot names so the orchestrator can validate.
 DRILL_IN_SLOTS: dict[str, tuple[str, ...]] = {
     # parent wave -> allowed drill-in names (canonical order: a, b, c).
-    # W1's drill-in slots are intentionally W1.6a/b/c (not W1.5a/b/c) because
-    # W1.5 is now a registered wave (per-subdomain fan-out). The numeric
-    # suffix .5 is reserved for registered sub-waves; drill-in slots of a
-    # parent P use suffix .(P+1).N to stay distinguishable.
     #
-    # 2026-06-15 (3-harness split): each drill-in inherits its parent
-    # wave's owner_agent. W1.6* (attack-surface prep) -> hack-deep,
-    # W4.5* (attack vector expansion) -> hack-deep,
-    # W6.5* (lateral pivot expansion) -> hack-deep-ex.
+    # Naming convention (2026-06-10):
+    #   - The numeric suffix ``.5`` is reserved for **registered sub-waves**
+    #     (W0.5 / W1.5 / W1.5c / W2.5 / W3.5 / W4.5 / W6.5 ...).
+    #   - Drill-in slots of a parent P use the suffix ``.(P+1).N`` so they
+    #     stay distinguishable from registered sub-waves.
+    #
+    # Concretely: W1's drill-in slots are W1.6a/b/c (NOT W1.5a/b/c)
+    # because W1.5 is a registered wave (per-subdomain fan-out). The
+    # W1.5c entry further reserves the suffix .5c for the W1 follow-up
+    # expand scan, leaving no room for W1.5a / W1.5b drill-ins.
+    #
+    # 3-harness split (2026-06-15) and v2 cross-owner protocol (2026-06-16):
+    #   Each drill-in inherits its parent wave's ``owner_agent`` at the
+    #   code layer. At the protocol layer, the actual spawn may be
+    #   RELAYED across owners via the cross-owner evidence schemas
+    #   (``w2.5-dispatch-v1`` / ``drill-in-request-v1`` in
+    #   ``attack_dispatch.evidence``). The table below lists the
+    #   code-layer owner; the protocol-layer actor is documented in
+    #   the relevant SOUL_BODY.md.
+    #
+    #   W1.6* (W1 attack-surface prep)        -> code: hack-deep-find
+    #                                            protocol: hack-deep (relay
+    #                                            from drill-in-request-v1)
+    #   W4.5* (W4 attack vector expansion)    -> hack-deep
+    #   W6.5* (W6 lateral pivot expansion)     -> hack-deep-ex
+    #
+    #   W1.5c distinction: W1.5c is a registered sub-wave (not a drill-in)
+    #   that find EXECUTES itself in its F1.5c step. W1.6c is a drill-in
+    #   slot that find DECLARES (via drill-in-request-v1) for hack-deep
+    #   to execute later. The two have different owners at the protocol
+    #   layer; this table only governs the code layer.
     "W1": ("W1.6a", "W1.6b", "W1.6c"),
     "W4": ("W4.5a", "W4.5b", "W4.5c"),
     "W6": ("W6.5a", "W6.5b", "W6.5c"),

@@ -445,6 +445,71 @@ class TestV2WaveDAGContract:
         with pytest.raises(UnauthorizedOwnerError):
             check_authorization("W0.5", "hack-deep-ex")
 
+    def test_w15c_is_registered_wave_not_drill_in(self):
+        """v2 namespace lock: W1.5c must be a registered sub-wave in
+        WAVES, NOT a member of DRILL_IN_SLOTS['W1'].
+
+        This guards against the v1-era mistake of conflating the two:
+        W1.5c is find-executed; W1.6c is deep-executed drill-in.
+        """
+        from opensquilla.attack_dispatch.waves import (
+            DRILL_IN_SLOTS,
+            WAVES,
+            get_wave,
+        )
+
+        # W1.5c is a registered wave
+        assert "W1.5c" in WAVES
+        spec = get_wave("W1.5c")
+        assert spec.fanout == "single"
+        assert spec.owner_agent == "hack-deep-find"
+
+        # W1.5c is NOT a drill-in slot for W1
+        assert "W1.5c" not in DRILL_IN_SLOTS["W1"]
+
+    def test_w16c_is_drill_in_not_registered_wave(self):
+        """v2 namespace lock (other side): W1.6c must be a drill-in
+        slot for W1, NOT a registered sub-wave in WAVES.
+
+        Registered sub-waves use the '.5' suffix; drill-ins use '.6' for
+        W1 (because W1.5 is already taken by the per-subdomain fan-out).
+        """
+        from opensquilla.attack_dispatch.waves import (
+            DRILL_IN_SLOTS,
+            WAVES,
+        )
+
+        # W1.6c is a drill-in slot
+        assert "W1.6c" in DRILL_IN_SLOTS["W1"]
+
+        # W1.6c is NOT a registered wave (drill-ins are constructed on
+        # demand by the orchestrator, not pre-registered).
+        assert "W1.6c" not in WAVES
+
+    def test_drill_in_slots_table_unchanged(self):
+        """The DRILL_IN_SLOTS table is part of the public contract
+        (3-harness split 2026-06-15). v2 may update the *docstring*
+        explaining protocol-layer ownership, but the slot NAMES must
+        stay stable. Lock the exact set.
+        """
+        from opensquilla.attack_dispatch.waves import DRILL_IN_SLOTS
+
+        assert set(DRILL_IN_SLOTS.keys()) == {"W1", "W4", "W6"}
+        assert DRILL_IN_SLOTS["W1"] == ("W1.6a", "W1.6b", "W1.6c")
+        assert DRILL_IN_SLOTS["W4"] == ("W4.5a", "W4.5b", "W4.5c")
+        assert DRILL_IN_SLOTS["W6"] == ("W6.5a", "W6.5b", "W6.5c")
+
+    def test_w16_owner_inherits_from_w1(self):
+        """At the CODE layer, W1.6* inherits W1's owner_agent. The v2
+        protocol layer adds a 'find DECLARES, deep EXECUTES' rule on
+        top of this; tests for the protocol are in the SOUL tests."""
+        from opensquilla.attack_dispatch.waves import owner_of_wave
+
+        # Code layer: W1.6* inherits W1 (find)
+        assert owner_of_wave("W1.6a") == "hack-deep-find"
+        assert owner_of_wave("W1.6b") == "hack-deep-find"
+        assert owner_of_wave("W1.6c") == "hack-deep-find"
+
 
 # ── V2 SOUL CONTRACT (F-final artifacts schema) ──────────────
 
