@@ -2526,6 +2526,123 @@ class FindCompleteEvidence(EvidenceBase):
 
 
 # ---------------------------------------------------------------------------
+# 3-harness cross-owner dispatch (2026-06-16, hack-deep-find v2)
+# ---------------------------------------------------------------------------
+
+
+class W25DispatchEvidence(EvidenceBase):
+    """hack-deep-find → hack-deep W2.5 cross-owner dispatch.
+
+    The W2.5 wave (per-port attack plan) is registered with
+    ``owner_agent="hack-deep-find"`` in ``attack_dispatch.waves`` because
+    the orchestration logic is find-side, BUT the actual
+    ``vulnerability-triage`` specialist lives in hack-deep's allow_agents
+    list (and is intentionally NOT in find's allow_agents, since find
+    never runs triage directly).
+
+    This evidence is the bridge: the find orchestrator plans the W2.5
+    sub-track fan-out and emits this envelope to hack-deep, which then
+    issues the actual ``sessions_spawn(vulnerability-triage, ...)`` calls
+    on the per-port basis. The receiving side reads the dispatch plan
+    from the persisted evidence JSON.
+
+    Returned by find, NOT consumed by a specialist. The Typed Envelope
+    envelope header on the spawn still lists ``schema="w2.5-dispatch-v1"``
+    so the executor's evidence path index is uniform across waves.
+    """
+
+    evidence_schema: Literal["w2.5-dispatch-v1"] = "w2.5-dispatch-v1"
+    sub_tracks: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Per-port sub-track plan. Each entry: ``track_id`` (S###), "
+            "``ports`` (list of ip:port strings), ``vector_class`` "
+            "(e.g. ``http_sqli``), ``eta_s`` (int seconds). The receiving "
+            "hack-deep orchestrator spawns one vulnerability-triage "
+            "specialist per track."
+        ),
+    )
+    trigger_wave: str = Field(
+        default="W2.5",
+        description="Source wave for this dispatch (always W2.5 today).",
+    )
+    recon_evidence_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the ReconEvidence file this plan was derived from. "
+            "The receiving hack-deep may load it for vector prioritization."
+        ),
+    )
+    triage_evidence_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the upstream TriageEvidence (W2 output from "
+            "hack-deep's own vulnerability-triage specialist). W2.5 reads "
+            "this to bucket services into 6-port sub-tracks."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_target(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "target" not in data:
+            data = {**data, "target": "cross-owner-w2.5-dispatch"}
+        return data
+
+
+class DrillInRequestEvidence(EvidenceBase):
+    """hack-deep-find → hack-deep drill-in declaration.
+
+    When the find orchestrator's W1 evidence shows that the main recon
+    was incomplete (port_scan_complete == false, dir_bust_evidence
+    missing or thin, no wayback / katana pass, etc.), the find LLM
+    DOES NOT spawn the W1.6* drill-in directly — those slots are owned
+    by hack-deep. Instead, it emits this evidence in the find-complete-v1
+    artifacts so hack-deep can decide whether to issue W1.6a/b/c in the
+    W0/W2 gap.
+
+    This evidence is purely declarative; it is never a child of
+    sessions_spawn. The Typed Envelope for the find-complete handoff
+    embeds it as an ``artifacts`` field entry.
+    """
+
+    evidence_schema: Literal["drill-in-request-v1"] = "drill-in-request-v1"
+    requested_slots: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Drill-in slot names the find LLM recommends opening. Each "
+            "must be a member of ``DRILL_IN_SLOTS['W1']`` in "
+            "attack_dispatch.waves. Today the valid set is "
+            "``['W1.6a', 'W1.6b', 'W1.6c']``."
+        ),
+    )
+    reasons: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Free-form justification per slot, e.g. "
+            "``['W1.6c: port_scan_complete=false on 4 hosts']``. The "
+            "receiving hack-deep LLM may downgrade any request based on "
+            "its own judgement, but a populated reason is a strong "
+            "signal to honour the request."
+        ),
+    )
+    evidence_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Paths to the W1 evidence files the recommendation is based "
+            "on. hack-deep may re-read these before deciding."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_target(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "target" not in data:
+            data = {**data, "target": "cross-owner-drill-in-request"}
+        return data
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -2550,11 +2667,13 @@ EVIDENCE_SCHEMAS: dict[str, type[EvidenceBase]] = {
     "port-attack-plan-v1": PortAttackPlanEvidence,  # 2026-06-11 v4.0 R3 (W2.5 output)
     "web-crawl-v1": WebCrawlEvidence,  # 2026-06-11 v4.0 R4 (W3.5 output)
     "find-complete-v1": FindCompleteEvidence,  # 2026-06-14 hack-deep-find handoff
+    "w2.5-dispatch-v1": W25DispatchEvidence,  # 2026-06-16 hack-deep-find v2 cross-owner
+    "drill-in-request-v1": DrillInRequestEvidence,  # 2026-06-16 hack-deep-find v2 cross-owner
 }
 
 EVIDENCE_SCHEMA_NAMES: tuple[str, ...] = tuple(EVIDENCE_SCHEMAS.keys())
-assert len(EVIDENCE_SCHEMA_NAMES) == 19, (
-    "expected 19 evidence schemas (18 + find-complete-v1)"
+assert len(EVIDENCE_SCHEMA_NAMES) == 21, (
+    "expected 21 evidence schemas (19 + 2 cross-owner)"
 )
 
 

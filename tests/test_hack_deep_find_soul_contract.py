@@ -118,8 +118,8 @@ class TestHandoffWiring:
     """Phase 3: SOUL must encode the handoff turn the LLM-coordinator runs."""
 
     def test_soul_has_handoff_step(self):
-        """SOUL must have a 'Step FINAL' that explicitly mentions handoff."""
-        assert "Step FINAL" in SOUL_BODY
+        """SOUL must have a 'Step F-final' (v2 rename from 'Step FINAL') that explicitly mentions handoff."""
+        assert "F-final" in SOUL_BODY
         assert "handoff" in SOUL_BODY.lower()
 
     def test_soul_has_handoff_envelope_template(self):
@@ -138,7 +138,7 @@ class TestHandoffWiring:
 
     def test_soul_uses_sessions_yield_after_handoff(self):
         """After spawn, LLM must yield — enforce by checking SOUL mentions yield alongside handoff."""
-        # Step FINAL should reference sessions_yield() (or "yield")
+        # Step F-final should reference sessions_yield() (or "yield")
         # adjacent to the hack-deep spawn
         idx_spawn = SOUL_BODY.find("sessions_spawn")
         idx_yield = SOUL_BODY.find("sessions_yield")

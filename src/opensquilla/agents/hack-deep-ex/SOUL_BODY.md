@@ -210,13 +210,32 @@ operator should know)。
 6. **严禁** 写 `verification_script` v1→v2→v3→v4 多版本
 7. **严禁** 把预期行为(如 CONNECT 403 / Apache 200 + 0-byte body)判 fail
 
-## 严禁越界到 hack-deep / hack-deep-find
+## 严禁越界到 hack-deep / hack-deep-find (v2 强化, 2026-06-16)
 
 - 严禁 spawn `recon` / `intel-collection` /
-  `attack-surface-enumeration` (hack-deep-find 专用)
+  `attack-surface-enumeration` / `subdomain-discoverer` /
+  `port-scanner` / `service-fingerprint` / `endpoint-crawler` /
+  `service-detailed` / `webapp-discoverer` / `api-surface` /
+  `parameter-extract` / `static-asset` / `auth-mapper` /
+  `cookie-header` / `cloud-storage` / `secret-scanner` /
+  `seed-expander` / `leaf-verifier` (hack-deep-find 专用, 16 specialist)
 - 严禁 spawn `engagement-planning` / `vulnerability-triage` /
-  `opsec-evasion` / `penetration` (hack-deep 专用)
-- runtime 通过 `attack_dispatch.waves.check_authorization()` 强制
+  `opsec-evasion` / `penetration` (hack-deep 专用, 4 specialist)
+- **链路方向澄清 (v2)**:
+  - hack-deep-find → hack-deep (find-complete-v1)
+  - hack-deep → hack-deep-ex (post-exploit-complete-v1)
+  - **hack-deep-find → hack-deep-ex 边不存在**
+  - **hack-deep-ex → hack-deep-find 边不存在**
+  - **hack-deep-ex → hack-deep 回路不存在** (post-exploit 不回主链)
+  - find-complete-v1 envelope 是 find → deep 的桥; ex 收不到 find-complete-v1
+  - post-exploit-complete-v1 envelope 是 deep → ex 的桥; find 收不到
+    post-exploit-complete-v1
+- runtime 通过 `attack_dispatch.waves.check_authorization()` 强制:
+  ```python
+  check_authorization("W5", "hack-deep-ex")  # OK
+  check_authorization("W5", "hack-deep-find")  # raises UnauthorizedOwnerError
+  check_authorization("W5", "hack-deep")  # raises UnauthorizedOwnerError
+  ```
 
 ## Auto-Continue Contract (2026-06-09 hardening)
 

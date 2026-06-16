@@ -410,13 +410,16 @@ class TestWaves:
 
 
 class TestEvidence:
-    def test_eighteen_schemas(self) -> None:
+    def test_twenty_one_schemas(self) -> None:
         # 13 original + sub_target_handle-v1 (W0.5, 2026-06-07)
         # + quality-score-v1 (Issue 11, 2026-06-09)
         # + resource-v1 (W0.6, R3 P0 S24, 2026-06-10)
         # + port-attack-plan-v1 (W2.5, v4.0 R3, 2026-06-11)
         # + web-crawl-v1 (W3.5, v4.0 R4, 2026-06-11)
-        assert len(EVIDENCE_SCHEMA_NAMES) == 18
+        # + find-complete-v1 (hack-deep-find handoff, 2026-06-14)
+        # + w2.5-dispatch-v1 (v2 cross-owner, 2026-06-16)
+        # + drill-in-request-v1 (v2 cross-owner, 2026-06-16)
+        assert len(EVIDENCE_SCHEMA_NAMES) == 21
 
     @pytest.mark.parametrize(
         "schema,kwargs",

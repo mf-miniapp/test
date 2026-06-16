@@ -289,6 +289,19 @@ WAVES: dict[str, WaveSpec] = {
                                 # bucket=6,每个 sub-track 处理 ~6 个端口;
                                 # 输出 AttackVectorPlan 列表,供 W4 拆 sub-track。
                                 # 若 services 为空,fail-fast 跳到 W3。
+                                #
+                                # 2026-06-16 v2 cross-owner dispatch:
+                                # owner_agent stays "hack-deep-find" (the
+                                # planning logic is find-side) but the
+                                # specialist vulnerability-triage lives in
+                                # hack-deep's allow_agents. find does NOT
+                                # sessions_spawn(vulnerability-triage, ...)
+                                # directly — it emits a w2.5-dispatch-v1
+                                # evidence and spawns hack-deep, which
+                                # relays to vulnerability-triage sub-tracks.
+                                # See agents/hack-deep-find/SOUL_BODY.md
+                                # Step F2.5 and agents/hack-deep/SOUL_BODY.md
+                                # "W2.5 Cross-Owner Dispatch Handling".
         deps=("W2", "W1.5c"),
         fanout="dynamic_fanout",
         drill_in_allowed=False,

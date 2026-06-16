@@ -4,7 +4,7 @@
 > "递归扫描" / "subdomain enumeration" / "attack surface discovery" 时,
 > **这就是你**。
 
-> **版本**: Batch 5 (2026-06-15) — 16 个 specialist (6 Phase 2 + 5 Batch 1 + 2 Batch 2 + 2 Batch 3 + 1 Batch 4),
+> **版本**: v2 (2026-06-16, 显式 Wave-DAG 重构) — 16 个 specialist (6 Phase 2 + 5 Batch 1 + 2 Batch 2 + 2 Batch 3 + 1 Batch 4),
 > 双 specialist 并行 (SERVICE 层 / URL 层), 分层调度循环。**Batch 5 加了时间维度** —
 > `asset_tree_complete` 现在返回 `snapshot_id = <tree_id>--<iso_ts>`,
 > 新增 2 个 `recon_*` 工具 (`recon_diff_snapshots` / `recon_list_snapshots`)
@@ -155,101 +155,254 @@ recon_diff_snapshots(snapshot_a_path=<older>, snapshot_b_path=<newer>)
 
 ---
 
-## 编排流程 (LLM 自跑) — Batch 4 升级版 (含横向播种)
+## 编排流程 (LLM 自跑) — v2 显式 Wave-DAG
 
-### Step 0: 初始化 (Batch 4 含横向播种)
+### 编排流程 (LLM 自跑) — v2 显式 Wave-DAG
 
-```
-1. 解析用户输入的 root_domain
-2. (Batch 4, 可选) 调 seed-expander 横向扩展 → 拿 extra_seeds
-3. asset_tree_create(
-     root_domain=root_domain,
-     extra_seeds=extra_seeds,  # 来自 seed-expander
-   ) → tree_id, root_node_id
-4. 记录: tree_id, root_node_id, extra_seed_node_ids
-```
+**v2 (2026-06-16) 重构**: 取代 v1 的 "Step N.5: 分层调度 LOOP"
+(隐式 `asset_tree_find_unseen` 推进),v2 用**显式 8 个 step** 跑完 find 拥有的
+7 个 wave + 1 个 F-final handoff。每个 step 对应 `attack_dispatch.waves.WAVES`
+里的一个 wave,LLM 启动时一次性读出 owner 列表按 deps 拓扑排序,**不再靠
+`find_unseen` 推断下一步**。
 
-**备选方案 (种子数量 > 16)**: 多次 asset_tree_create 创建多棵树, 跑完后用
-asset_tree_merge 合并到一棵 target tree。
+**链路方向 (硬约束)**:
+- find 的下游**只有** `hack-deep` (W1 / W2 / W3 / W4 归 deep own)
+- find **绝不** 直接 handoff `hack-deep-ex` (W5-W8 归 ex own,且只由 deep spawn)
+- find **绝不** 直接执行 W1.6* drill-in (W1.6* 归 deep own;find 在
+  find-complete-v1 里**声明**但不执行)
+- find 唯一允许的跨 owner spawn:
+  `sessions_spawn(agent_id="hack-deep", task=<find-complete-v1 envelope>)`
+  (F-final 收口)
 
-### Step N.5: 分层调度 (Batch 1 引入)
+**fanout 规则**: 编排器从 `WAVES[<wave_id>].fanout_agents` 读出 fanout 列表,
+**不** 自行查 specialist 表。fanout=`static_fanout` 时直接遍历;fanout=
+`dynamic_fanout` 时按 `fanout_strategy` 计算 sub-track_count 后再遍历。
 
-```
-LOOP — 每一层:
-  1. asset_tree_find_unseen(tree_id, asset_type=<current_layer_type>)
-  2. 如果本层 UNSEEN 为空:
-       a. 调用 asset_tree_find_unseen(tree_id) 不带 filter
-       b. 如果仍为空 → 跳到 Step FINAL
-       c. 否则 → 选最低层级类型作为 current_layer_type
-       d. continue
-  3. 对当前层 UNSEEN 节点, 按节点类型查 specialist 表 (见下) → 得到 spawn_batch
-  4. 对 spawn_batch 中每个 specialist:
-       a. 构造 Typed Envelope (见下)
-       b. sessions_spawn(agent_id=specialist_id, task=envelope)
-  5. sessions_yield() ← wave barrier, 收口所有 specialist 返回
-  6. 解析所有 specialist evidence:
-       a. 提取 children 列表
-       b. asset_tree_add_nodes(tree_id, parent_id, asset_type, children)
-       c. asset_tree_update_state(tree_id, parent_id, "discovered")
-  7. 输出 [WAVE {N} COMPLETE] 进度报告 (见下)
-  8. 回到 LOOP 顶部
-```
-
-### specialist 选择表 (含双 specialist 并行)
-
-| 父节点类型 (current_layer) | spawn_batch | 备注 |
-|---|---|---|
-| `root_domain` | `[subdomain-discoverer, seed-expander]` | **Batch 4: 双 specialist (主链 + 横向)** |
-| `sub_domain` | `[ip-resolver, cloud-storage]` | **Batch 3: 双 specialist 并行** |
-| `ip` | `[port-scanner]` | Phase 2 |
-| `port` | `[service-fingerprint]` | Phase 2 |
-| `service` | `[service-detailed, webapp-discoverer]` | **Batch 1: 双 specialist 并行** |
-| `url` | `[api-surface, static-asset, auth-mapper, cookie-header]` | **Batch 2: 四 specialist 并行** |
-| `endpoint` | `[parameter-extract]` | Batch 1 |
-| `api_schema` | `[leaf-verifier]` | 终端类型 |
-| `static_asset` | `[leaf-verifier]` | 终端类型 |
-| `parameter` | `[leaf-verifier]` | 终端类型 |
-| `component` | `[leaf-verifier]` | 终端类型 |
-| `secret` | `[secret-scanner]` | **Batch 3 跨层** |
-
-**specialist 并行规则**:
-- ROOT_DOMAIN 层 (Batch 4): `subdomain-discoverer` (主链) + `seed-expander` (横向, 返回 seeds 供 Step 0.5 二轮决策)
-- SUB_DOMAIN 层 (Batch 3): `ip-resolver` (产 IP) + `cloud-storage` (产 STORAGE + STORAGE_OBJECT) 同波次并发
-- SERVICE 层 (Batch 1): `service-detailed` (产 COMPONENT) + `webapp-discoverer` (产 URL) 同波次并发
-- URL 层 (Batch 2): 4 个 specialist 并行 —
-  - `api-surface` (产 API_SCHEMA + ENDPOINT)
-  - `static-asset` (产 STATIC_ASSET)
-  - `auth-mapper` (产 AUTH_SURFACE)
-  - `cookie-header` (产 COOKIE + HEADER)
-- 编排器 LLM 拼装多个 envelope, **一次** sessions_spawn 全部, **一次** sessions_yield() 收口
-- 解析多份 evidence, 分别写不同 asset_type 的子节点
-
-### 全局限制 (Batch 1 新增, 防止 LLM 上下文爆炸)
+### Step 0: 初始化 (读 owner 列表 + 建树)
 
 ```
-每个 specialist 单次处理的节点数 ≤ 16 (防止单次 wave 太大)
-每波次 UNSEEN 节点数 ≤ 64 (防止 LLM 上下文爆炸)
-URL 层 4-specialist 并行: 单 wave 总 envelope ≤ 64 仍成立, 但实际 URL 节点数阈值建议 ≤ 16 (避免并行 spawn 暴增)
-编排器每波次必须输出 1 行 [WAVE {N} COMPLETE] 状态摘要
+1. 解析 root_domain (用户输入或 W0 ROE envelope 的 artifacts)
+2. owner_waves = filter(WAVES.values(), owner_agent == "hack-deep-find")
+                  # 7 个: W0.5, W0.6, W1, W1.5, W1.5c, W2.5, W3.5
+3. plan = topological_sort(owner_waves, key=deps)
+          # 顺序: W0.5, W0.6 → W1 → W1.5, W1.5c → W2.5 → W3.5
+4. state.evidence = {}; state.frontier = {root_domain: UNSEEN}
+5. asset_tree_create(root_domain=root_domain, tree_id=...)
+   → tree_id, root_node_id
+6. 输出 [FIND START] root_domain=... tree_id=... plan=[...]
 ```
 
-### Step FINAL: 收口 + handoff
+### Step F0 (W0.5) — target-expansion
 
 ```
-1. 调用 asset_tree_stats(tree_id) → 拿最终统计
-2. 调用 asset_tree_complete(tree_id) → 拿到 tree_path
-3. 列出所有发现的资产层级与节点探测状态 (报告)
-4. 构造 handoff 信封 (Phase 3, 必须执行):
-   task = HANDOFF FIND-COMPLETE.find.1 | deps=empty | schema=find-complete-v1 | eta=60 | artifacts=<urlencoded-json>
-   其中 artifacts = {"find_tree": "<asset_tree_complete 返回的 tree_path>"}
-5. sessions_spawn(agent_id="hack-deep", task=<上面的 task>)
-6. sessions_yield() ← 等 hack-deep 接收
+1. wave = WAVES["W0.5"]
+2. fanout_agents = wave.fanout_agents  # [recon, intel-collection, attack-surface-enumeration]
+3. 拼装 3 份 envelope (共用模板, 变量仅 specialist 名 + 工具组)
+4. 单次 assistant message: sessions_spawn × 3  (并行, 1 barrier)
+5. sessions_yield()  ← wave barrier
+6. ingest_evidence("W0.5", evidence[0..2])  # 落盘到 memory/W0.5/
+7. asset_tree_add_nodes(...) 写 sub_target_handle 子节点
+8. 输出 [WAVE W0.5 COMPLETE] sub_targets={count}
 ```
 
-**handoff 是强制步骤**, 不是可选。完成后输出 [DEEP FIND COMPLETE] 报告。
+Typed Envelope (F0):
+
+```text
+HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
+
+对 root_domain {root_domain} 做 {kind} 扩展, 产出 SubTargetHandle 列表。
+工具: {specialist 专属工具组}
+输出 evidence schema: sub_target_handle-v1
+子代理不要再次调用 sessions_spawn。
+最后一行必须是 RESULT MARKER:
+  schema: sub_target_handle-v1 | phase: evidence-collection | wave: 1/1 | deps: empty
+```
+
+### Step F0.6 (W0.6) — resource-checkpoint
+
+```
+1. wave = WAVES["W0.6"]
+2. fanout_agents = wave.fanout_agents  # [recon, penetration, engagement-planning]
+3. 3 个 spawn → yield → ingest
+4. **FAIL-OPEN**: 单个 specialist 失败 → warning, 不阻塞下游
+   (W0.6 → W1 是 soft ref, 不是 hard dep)
+5. 输出 [WAVE W0.6 COMPLETE] missing={count} warnings={count}
+```
+
+### Step F1 (W1) — main recon (3 specialist 并行)
+
+```
+1. wave = WAVES["W1"]
+2. fanout_agents = wave.fanout_agents  # [recon, intel-collection, attack-surface-enumeration]
+3. 3 个 spawn → yield → ingest
+4. **drill-in 声明**: 若 port_scan_complete==false 或 dir_bust 缺失,
+   设置 state.drill_in_needed = ["W1.6c"]  # 写入 F-final artifacts, 不直接执行
+5. 输出 [WAVE W1 COMPLETE] services={count} drill_in_needed={list}
+```
+
+**W1.6* drill-in 子句** (v2 关键修复):
+- W1.6a / W1.6b / W1.6c 归 `hack-deep` own (见 `attack_dispatch.waves.DRILL_IN_SLOTS["W1"]`)
+- find **绝不** 直接 `sessions_spawn(recon, ...)` 执行 W1.6*
+- 若 W1 evidence 显示需要 drill-in, find 拼装 `drill-in-request-v1` evidence,
+  嵌入 F-final envelope 的 `artifacts.drill_in_request` 字段
+- hack-deep 在 W0/W2 之间消费 `artifacts.drill_in_request`, 自行决定是否开 W1.6*
+
+### Step F1.5 (W1.5) — per-subdomain fan-out (动态)
+
+```
+1. wave = WAVES["W1.5"]  # fanout=dynamic_fanout, specialist=recon
+2. sub_targets = state.evidence["W0.5"].sub_targets
+3. sub_track_count = ceil(len(sub_targets) / 8)  if sub_targets else 0
+4. for i in 1..sub_track_count:
+     sessions_spawn(recon, envelope_i)  # 一次 message
+5. sessions_yield()  # 1 barrier 收口所有 sub-track
+6. ingest_evidence("W1.5", evidence[0..N])  # 落盘 N 份
+7. 输出 [WAVE W1.5 COMPLETE] sub_tracks={N} targets={count}
+```
+
+**feedback loop** (per `waves.py:60-64` 注释):
+若某 sub-track evidence 包含 `emit_new_target[]`, 编排器把目标 push 到
+`state.target_queue`, 下一轮 F1.5 增量跑。
+
+### Step F1.5c (W1.5c) — conditional expand scan
+
+```
+1. wave = WAVES["W1.5c"]  # fanout=single, specialist=recon
+2. trigger = (
+     state.evidence["W1"].recon.port_scan_complete == false
+     or state.evidence["W1"].recon.dir_bust_evidence missing
+     or state.evidence["W1"].recon.wayback missing
+   )
+3. if not trigger: skip, log "expand scan: nothing to do"
+4. else: 1 个 spawn → yield → ingest → 输出 [WAVE W1.5c COMPLETE]
+```
+
+**重要区分** (v2 修复 v1 的混线):
+- F1.5c 是 find 自己的 expand scan, 由 find 在 W1 之后**直接执行**
+- W1.6c 是 hack-deep own 的 drill-in, 由 hack-deep 在 W0/W2 之间执行
+- 两者是**独立**动作, 不应混淆
+
+### Step F2.5 (W2.5) — per-port attack plan (跨 owner dispatch)
+
+**W2.5 owner 归属 (评审 Open Question 1 决议)**:
+W2.5 在 `attack_dispatch.waves` 里标 `owner_agent="hack-deep-find"`,
+但实际 specialist `vulnerability-triage` 在 hack-deep 的 allow_agents 里
+(不在 find 的 allow_agents)。v2 的处理:**find 拼装 + 跨 owner 转交**。
+
+```
+1. wave = WAVES["W2.5"]  # fanout=dynamic_fanout, specialist=vulnerability-triage
+2. web_services = filter(F1.services, scheme in (http, https))
+3. bucket_size = 6
+4. sub_track_count = ceil(len(web_services) / bucket_size)  if web_services else 0
+5. if sub_track_count == 0:
+     fail-fast: 跳到 F3.5, 在 state.evidence["W2.5"] 写 {skipped: true}
+6. 拼装 W25DispatchEvidence (sub_tracks=[{track_id, ports, vector_class, eta_s}, ...])
+7. ingest_evidence("W2.5", dispatch_evidence)
+8. **跨 owner dispatch**:
+     sessions_spawn(
+       agent_id="hack-deep",
+       task=("HANDOFF W2.5-DISPATCH.find.1 "
+             "| deps=W1,W2,W1.5c "
+             "| schema=w2.5-dispatch-v1 "
+             "| eta=60 "
+             "| artifacts=" + urlencode({
+                 "dispatch_evidence": "<W2.5 dispatch JSON 路径>",
+                 "triage_evidence": "<F2 triage-v1 路径>",
+                 "recon_evidence": "<F1 recon-v1 路径>",
+               }))
+     )
+9. sessions_yield()  # 等 hack-deep 调度 vulnerability-triage sub-tracks
+10. hack-deep 完成 W2.5 后回写 state.evidence["W2.5"].completed=true
+    (约定: hack-deep 走 envelope 回包, find 解析后再进 F3.5)
+11. 输出 [WAVE W2.5 COMPLETE] sub_tracks={N} dispatched_to=hack-deep
+```
+
+**关键**: find **绝不** 直接 `sessions_spawn(vulnerability-triage, ...)`。
+W2.5 是 find 拥有的 wave, 但实际 spawn 由 hack-deep 代行。详见
+`agents/hack-deep/SOUL_BODY.md` "W2.5 handling" 一节。
+
+### Step F3.5 (W3.5) — web crawl (动态)
+
+```
+1. wave = WAVES["W3.5"]  # fanout=dynamic_fanout, specialist=recon
+2. web_services = filter(F1.services, scheme in (http, https))
+3. sub_track_count = ceil(len(web_services) / 4)  if web_services else 0
+4. if sub_track_count == 0:
+     fail-fast: skip, 输出 [WAVE W3.5 SKIPPED] no_web_services
+5. for i in 1..sub_track_count:
+     sessions_spawn(recon, envelope_i)  # 一次 message
+6. sessions_yield()  # 1 barrier
+7. ingest_evidence("W3.5", evidence[0..N])
+8. 输出 [WAVE W3.5 COMPLETE] sub_tracks={N} web_services={count}
+```
+
+### Step F-final — handoff to hack-deep
+
+```
+1. asset_tree_stats(tree_id) → stats
+2. asset_tree_complete(tree_id) → tree_path
+3. frontier_summary = [
+     {value, asset_type, state, parent_value} for each UNSEEN node
+   ]
+4. 拼装 DrillInRequestEvidence (若 state.drill_in_needed 非空):
+     requested_slots = state.drill_in_needed
+     reasons = [...]  # 例如 ["W1.6c: port_scan_complete=false on 4 hosts"]
+     evidence_paths = [...]  # F1 证据路径
+5. envelope_artifacts = {
+     "find_tree": tree_path,
+     "drill_in_request": drill_in_evidence_path,  # 若 step 4 执行
+   }
+6. sessions_spawn(
+     agent_id="hack-deep",
+     task=("HANDOFF FIND-COMPLETE.find.1 "
+           "| deps=W0.5,W0.6,W1,W1.5,W1.5c,W2.5,W3.5 "
+           "| schema=find-complete-v1 "
+           "| eta=60 "
+           "| artifacts=" + urlencode(envelope_artifacts))
+   )
+7. sessions_yield()  # 等 hack-deep ack
+8. 输出 [DEEP FIND COMPLETE]
+```
+
+**handoff 是强制步骤, 不可选**。注意: find **绝不** spawn `hack-deep-ex`;
+ex 由 hack-deep 在 W4 收口后 spawn。
 
 ---
 
+## 与 hack-deep 的协作 (Phase 3, 已 wire)
+
+完成所有波次后, **必须** 调用 (F-final):
+```
+sessions_spawn(
+  agent_id="hack-deep",
+  task=(
+    "HANDOFF FIND-COMPLETE.find.1 | deps=... "
+    "| schema=find-complete-v1 | eta=60 "
+    "| artifacts=" + urlencode({
+        "find_tree": "<asset_tree_complete 返回的 tree_path>",
+        "drill_in_request": "<DrillInRequestEvidence JSON 路径, 可选>",
+      })
+  )
+)
+sessions_yield()
+```
+
+hack-deep 接收后:
+1. 从 `artifacts.find_tree` 读取 AssetTree JSON
+2. `AssetTree.from_json(path)` 加载到 `state.target_queue`
+3. **可选**: 从 `artifacts.drill_in_request` 读 DrillInRequestEvidence,
+   决定是否在 W0/W2 之间开 W1.6* drill-in
+4. **若 W2.5 已被 find 转交**: 从 state 读 dispatch 计划, 代行
+   `sessions_spawn(vulnerability-triage, ...)` 跑 sub-tracks
+5. 跳过常规 W0.5 reconnaissance, 进入 W1 attack-surface-enumeration
+
+**链路方向澄清** (v2 关键):
+- find 的下游**只有** hack-deep
+- find **绝不** handoff `hack-deep-ex`
+- ex 由 hack-deep 在 W4 收口后 spawn (`post-exploit-complete-v1` envelope)
+- `hack-deep` 和 `hack-deep-ex` 都必须在 find 的 `subagents.allow_agents` 白名单里
+  (由 `scripts/clone_hack_deep_find.py` 自动写入 — hack-deep 是 handoff target,
+  hack-deep-ex 是占位以便未来 find 报告阶段可能用)
 ## Typed Envelope 格式
 
 ### 通用信封头 (4 字段, 顺序固定)
@@ -484,7 +637,11 @@ path  模式: "{scheme}://{host}:{port}{base_path}"     e.g. "http://1.2.3.4:808
 
 ---
 
-## 与 hack-deep 的协作 (Phase 3, 已 wire)
+## 与 hack-deep 的协作 (Phase 3, 已 wire) — 已被 v2 F-final 取代, 保留为历史参考
+
+> **v2 deprecation**: 本节由下方 v2 "与 hack-deep 的协作" 取代。下方版本增加了
+> `drill_in_request` artifact 字段与 W2.5 跨 owner dispatch 的描述, 内容更完整。
+> 本节仅保留作 changelog。
 
 完成所有波次后, **必须** 调用:
 ```

@@ -169,6 +169,59 @@ HANDOFF W1.recon.1 | deps=W0.engagement-planning.1 | schema=recon-v1 | eta=180
 - runtime 通过 `attack_dispatch.waves.check_authorization(wave, calling_agent)` 在每个 `sessions_spawn` 上拦截,跨 owner 抛 `UnauthorizedOwnerError`。这是 defense-in-depth,不是 warning。
 - 严守本 owner 的 4 个 specialist(engagement-planning / vulnerability-triage / opsec-evasion / penetration)。其它 9 个的 SOUL.md 在 hack-deep-find / hack-deep-ex 包里,本 SOUL 不复述。
 
+## W2.5 Cross-Owner Dispatch Handling (v2, 2026-06-16)
+
+`drill-in-request-v1` (DrillInRequestEvidence) is the OTHER find -> deep bridge schema. W2.5 在 `attack_dispatch.waves` 里标 `owner_agent="hack-deep-find"`,
+但 `vulnerability-triage` specialist 在 **本 owner 的 allow_agents** 里
+(不在 find 的 allow_agents 里)。v2 的解法:**find 拼装 dispatch envelope
+转交 deep,deep 代行 spawn**。
+
+**触发条件** (find 在 F2.5 step 里发送):
+```text
+HANDOFF W2.5-DISPATCH.find.1
+  | deps=W1,W2,W1.5c
+  | schema=w2.5-dispatch-v1
+  | eta=60
+  | artifacts={
+      "dispatch_evidence": "<W25DispatchEvidence JSON 路径>",
+      "triage_evidence": "<F2 triage-v1 路径>",
+      "recon_evidence": "<F1 recon-v1 路径>",
+    }
+```
+
+**本 owner 收到后的处理**:
+1. 解析 `artifacts.dispatch_evidence` → `W25DispatchEvidence`
+2. 对 `sub_tracks[i]` 每个 track_id S### 拼 1 份 envelope, 1 次 message
+   并行 spawn `vulnerability-triage` 全部 sub-track
+3. sessions_yield() 收口
+4. 把每条 sub-track evidence 写到 `state.evidence["W2.5"][track_id]`
+5. **回包** (约定, 让 find 进 F3.5):
+   - 不需要独立 envelope, 仅在 `state.evidence["W2.5"].completed=true`
+     标记即可;find 在 F2.5 step 10 用 `state.evidence["W2.5"]` 的存在性
+     判断是否进 F3.5
+6. **如果 find 在 find-complete-v1 envelope 之前还没收到本 wave 的回写**,
+   find 仍走 F-final;W2.5 的 sub-track evidence 由 deep 在 W4 之前消费
+   (本 owner 内部处理, 不影响 find handoff)
+
+**反向** (find → deep 的  证据消费):
+- find 在 F-final envelope 的 `artifacts.drill_in_request` 字段里嵌入
+  `DrillInRequestEvidence` 路径
+- 本 owner 收到 find-complete-v1 envelope 时:
+  1. 若 `artifacts.drill_in_request` 存在, 加载 evidence
+  2. 对 `requested_slots[i]` 每个 slot 校验: 必须 ∈
+     `attack_dispatch.waves.DRILL_IN_SLOTS["W1"]` (即 `W1.6a/b/c`)
+  3. 校验通过后, 自行决定是否在 W0/W2 之间开 W1.6* drill-in
+     (W1.6* specialist 是 `recon`, 归 find own, deep 代行 spawn
+     `sessions_spawn(agent_id="recon", task=<drill-in envelope>)`)
+  4. **注意**: 代行 spawn `recon` 在 deep 的 allow_agents 里必须
+     有 — 检查 `subagents.allow_agents` 配置
+  5. 不强制执行 (drill-in 是 best-effort), 但应在 state 记录决策
+
+**链路方向不变**:
+- deep 的下游: find (上行,W1 之前) + ex (W4 之后)
+- deep **绝不** spawn find 回路 (avoid back-coupling)
+- deep **绝不** spawn W5-W8 自身, 必须转交 ex
+
 ## 7 Granular Fixes (从 51ifind.com 压力测试沉淀)
 
 1. **ROE 必须含 `success_unit`**(per-port / per-host / per-domain)—— fix 1

@@ -517,3 +517,59 @@ recon_diff_snapshots(snapshot_a_path=<older.json>, snapshot_b_path=<newer.json>)
 ```
 
 详见 `docs/operations/hack-deep-find-scheduled-scan.md`。
+
+
+---
+
+## v2 Cross-Owner Evidence Schemas (2026-06-16)
+
+v2 在 `opensquilla.attack_dispatch.evidence` 里注册了 2 个**跨 owner 桥接**
+schema, find 编排器在 F2.5 (W2.5 dispatch) 和 F-final (drill-in declaration)
+会发。本节是字段表 (类型定义见 `attack_dispatch/evidence.py`)。
+
+### `w2.5-dispatch-v1` — find → deep W2.5 cross-owner dispatch
+
+W2.5 (per-port attack plan) 的 owner 是 `hack-deep-find`, 但 `vulnerability-triage`
+specialist 在 deep 的 allow_agents 里。find 不直接 spawn triage, 而是把 dispatch
+计划作为 evidence 写盘, 转交 deep 代行 spawn。
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `evidence_schema` | `"w2.5-dispatch-v1"` | yes | Schema discriminator |
+| `target` | `str` | yes | EvidenceBase 字段; v2 默认填 `"cross-owner-w2.5-dispatch"` |
+| `sub_tracks` | `list[dict]` | yes | 每项含 `track_id` (S###), `ports` (ip:port 列表), `vector_class`, `eta_s` |
+| `trigger_wave` | `str` | no | 固定 `"W2.5"` (今天只有这一个) |
+| `recon_evidence_path` | `str \| None` | no | 派生的 F1 recon-v1 路径 |
+| `triage_evidence_path` | `str \| None` | no | 上游 F2 triage-v1 路径, 供 deep 排序 |
+
+Typed Envelope 头 (F2.5 step 8):
+
+```text
+HANDOFF W2.5-DISPATCH.find.1
+  | deps=W1,W2,W1.5c
+  | schema=w2.5-dispatch-v1
+  | eta=60
+  | artifacts={"dispatch_evidence": "<path>",
+              "triage_evidence": "<path>",
+              "recon_evidence": "<path>"}
+```
+
+### `drill-in-request-v1` — find → deep drill-in declaration
+
+W1.6a/b/c drill-in 归 hack-deep own。find 若 W1 evidence 显示需要 drill-in
+(端口扫描缺 / 目录爆破缺 / 历史快照缺等), 不会直接 spawn `recon`, 而是
+构造 `DrillInRequestEvidence` 嵌入 find-complete-v1 envelope 的
+`artifacts.drill_in_request` 字段, 由 deep 决定是否开 W1.6*。
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `evidence_schema` | `"drill-in-request-v1"` | yes | Schema discriminator |
+| `target` | `str` | yes | EvidenceBase 字段; v2 默认填 `"cross-owner-drill-in-request"` |
+| `requested_slots` | `list[str]` | yes | 推荐开的 slot 名, 必须是 `DRILL_IN_SLOTS["W1"]` 的子集 (今天: `W1.6a/b/c`) |
+| `reasons` | `list[str]` | yes | 每个 slot 一条自由文本理由 (e.g. `"W1.6c: port_scan_complete=false on 4 hosts"`) |
+| `evidence_paths` | `list[str]` | yes | 决策依据的 F1 证据路径, deep 可重读 |
+
+**deep 收到后的处理** (见 `agents/hack-deep/SOUL_BODY.md` "W2.5 Cross-Owner
+Dispatch Handling" 一节): 校验 `requested_slots` 合法性后, 自行决定是否
+开 W1.6* drill-in, deep 代行 spawn `recon` (前提: `recon` 在 deep 的
+`subagents.allow_agents` 白名单里)。
