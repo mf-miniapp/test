@@ -115,3 +115,7 @@ def _add_flat(table: Table, data: dict, prefix: str = "") -> None:
             _add_flat(table, v, full_key)
         else:
             table.add_row(escape(full_key), escape(str(v)))
+
+# Mount the built-in env-default sub-app (config env list/show/set/unset).
+from opensquilla.cli.config_env import app as _config_env_app  # noqa: E402
+app.add_typer(_config_env_app, name="env")

@@ -255,6 +255,14 @@ for _provider_spec in [
         support_level="compat_configured",
     ),
     _spec(
+        "mimo",
+        "openai_compat",
+        "mimo",
+        "MIMO_API_KEY",
+        "https://token-plan-cn.xiaomimimo.com/v1",
+        support_level="compat_configured",
+    ),
+    _spec(
         "volcengine",
         "openai_compat",
         "volcengine",

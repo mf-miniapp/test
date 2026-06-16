@@ -121,6 +121,16 @@
     .btn-danger { border-color: var(--red); color: var(--red); }
     .btn-danger:hover { background: rgba(248, 81, 73, 0.15); }
     .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn:disabled,
+    .btn[disabled] {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+    .btn-primary:disabled,
+    .btn-primary[disabled] { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
+    .btn-danger:disabled,
+    .btn-danger[disabled] { color: var(--red); border-color: var(--red); }
 
     /* ── Forms / inputs ─────────────────────── */
     input[type="text"], select, textarea {
@@ -351,7 +361,7 @@
         <div id="mainActions" style="display:none">
           <button class="btn btn-sm" onclick="showDiffModal()" title="Diff this tree against the previous snapshot (Batch 5 time-dimension)">📊 Diff vs 上次</button>
           <button class="btn btn-sm" onclick="showAddNodeModal()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>+ 添加节点</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteCurrentTree()"{% if db_status and db_status.mode == "json_fallback" %} disabled title="DB not configured — writes are disabled"{% endif %}>删除树</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteCurrentTree()">删除树</button>
         </div>
       </div>
       <div class="stats-bar" id="statsBar" style="display:none"></div>

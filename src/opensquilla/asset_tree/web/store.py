@@ -345,10 +345,15 @@ class TreeStore:
 
     async def delete_tree(self, tree_id: str) -> None:
         if not self.db_available:
-            raise DBUnavailableError(
-                "Cannot delete trees: ASSET_TREE_DB_URL is not set. "
-                "Set it to a 'mysql+aiomysql://...' URL to enable writes."
-            )
+            # JSON-fallback mode: the on-disk snapshot is the only
+            # source of truth, so unlink it. Strip the Batch 5
+            # "tree_id--<iso_ts>" suffix to get the canonical filename.
+            canonical = tree_id.split("--", 1)[0] if "--" in tree_id else tree_id
+            path = _json_state_dir() / f"{canonical}.json"
+            if not path.exists():
+                raise KeyError(f"Tree '{tree_id}' not found")
+            path.unlink()
+            return
         be = _backend()
         try:
             await be.delete_tree(tree_id)

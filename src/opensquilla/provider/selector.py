@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .anthropic import AnthropicProvider
@@ -199,6 +200,18 @@ class ModelSelector:
         self._chain[0] = cfg
         self.reset()
 
+    def override_primary_config(self, cfg: ProviderConfig) -> None:
+        """Update the primary provider config in place (for per-tier routing).
+
+        Unlike ``sync_primary`` this is a mutation rather than a wholesale
+        replacement of ``_config``: the SelectorConfig and chain list stay
+        intact, only ``_chain[0]`` is replaced. This is what the
+        squilla_router uses to swap a different endpoint in mid-turn
+        (e.g. a tier with its own ``base_url`` and ``api_key``) without
+        leaking those overrides back into the global primary.
+        """
+        self._chain[0] = cfg
+
     def reset(self) -> None:
         """Reset to primary provider."""
         self._index = 0
@@ -245,3 +258,77 @@ def build_provider(
             org_id=org_id,
         )
     )
+
+
+# ── Per-tier provider resolution (squilla_router multi-endpoint) ────────────
+
+
+def resolve_tier_provider_config(
+    tier_cfg: Mapping[str, Any] | dict | None,
+    baseline: ProviderConfig,
+) -> ProviderConfig:
+    """Resolve a per-tier ``ProviderConfig`` from router tier overrides.
+
+    The model router can pin a tier to a different endpoint or API key by
+    setting optional fields on the tier block::
+
+        [squilla_router.tiers.c1]
+        provider = "mimo"
+        model = "mimo-v2.5-pro"
+        base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+        api_key = "tp-..."   # or api_key_env = "MIMO_API_KEY"
+
+    Anything left blank falls back to the global ``baseline`` (the
+    ``[llm]`` config resolved at boot). The returned ``ProviderConfig``
+    always carries the tier's own ``model`` (which is required for
+    routing to mean anything), and only diverges from ``baseline`` in
+    the fields the tier actually overrides.
+
+    The function is pure: it does not read environment variables or
+    touch the network. ``api_key_env`` resolution is the caller's job
+    (we don't want boot-time secret loading to leak into a per-turn
+    routing decision path).
+    """
+    if not tier_cfg:
+        return ProviderConfig(
+            provider=baseline.provider,
+            model=baseline.model,
+            api_key=baseline.api_key,
+            base_url=baseline.base_url,
+            org_id=baseline.org_id,
+            proxy=baseline.proxy,
+            provider_routing=dict(baseline.provider_routing or {}),
+        )
+
+    # Accept both Mapping and a dict-like object.
+    def _f(key: str, default: Any = "") -> Any:
+        if isinstance(tier_cfg, Mapping):
+            return tier_cfg.get(key, default)
+        return getattr(tier_cfg, key, default)
+
+    tier_model = str(_f("model", "") or "").strip()
+    tier_provider = str(_f("provider", "") or "").strip()
+    tier_base_url = str(_f("base_url", "") or "").strip()
+    tier_api_key = _f("api_key", "")
+    tier_api_key_env = str(_f("api_key_env", "") or "").strip()
+    tier_org_id = str(_f("org_id", "") or "").strip()
+    tier_proxy = str(_f("proxy", "") or "").strip()
+    tier_routing_raw = _f("provider_routing", None)
+    tier_routing = dict(tier_routing_raw) if isinstance(tier_routing_raw, Mapping) else {}
+
+    return ProviderConfig(
+        provider=tier_provider or baseline.provider,
+        model=tier_model or baseline.model,
+        api_key=tier_api_key if tier_api_key else baseline.api_key,
+        base_url=tier_base_url or baseline.base_url,
+        org_id=tier_org_id or baseline.org_id,
+        proxy=tier_proxy or baseline.proxy,
+        provider_routing=tier_routing or dict(baseline.provider_routing or {}),
+    )
+
+
+def _resolve_tier_api_key_env(tier_cfg: Any) -> str:
+    """Pull the env-var name from a tier cfg (no resolution; the caller resolves)."""
+    if isinstance(tier_cfg, Mapping):
+        return str(tier_cfg.get("api_key_env", "") or "").strip()
+    return str(getattr(tier_cfg, "api_key_env", "") or "").strip()

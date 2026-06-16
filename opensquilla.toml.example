@@ -120,7 +120,8 @@ base_url = "https://openrouter.ai/api/v1"
 # ovms          none                     http://localhost:8000/v3
 # qianfan       QIANFAN_API_KEY          https://qianfan.baidubce.com/v2
 # aihubmix      AIHUBMIX_API_KEY         https://aihubmix.com/v1
-# minimax       MINIMAX_API_KEY          https://api.minimax.io/v1
+# minimax       MINIMAX_API_KEY          https://api.minimaxi.com/anthropic
+# minimax_v1    MINIMAX_API_KEY          https://api.minimaxi.com/v1   (OpenAI-compat, use this)
 # azure         provider-specific        unsupported_for_A
 #
 # ── Ollama long-context tuning (Ollama server env, not this client) ────

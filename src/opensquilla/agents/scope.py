@@ -84,6 +84,77 @@ def _configured_agent_model(config: object | None, normalized_agent_id: str) -> 
     return _string_value(_configured_agent_field(config, normalized_agent_id, "model"))
 
 
+def _configured_agent_provider(config: object | None, normalized_agent_id: str) -> str | None:
+    return _string_value(_configured_agent_field(config, normalized_agent_id, "provider"))
+
+
+def _configured_agent_base_url(config: object | None, normalized_agent_id: str) -> str | None:
+    return _string_value(_configured_agent_field(config, normalized_agent_id, "base_url"))
+
+
+def _configured_agent_api_key(config: object | None, normalized_agent_id: str) -> str | None:
+    value = _configured_agent_field(config, normalized_agent_id, "api_key")
+    return _string_value(value)
+
+
+def _configured_agent_api_key_env(config: object | None, normalized_agent_id: str) -> str | None:
+    return _string_value(_configured_agent_field(config, normalized_agent_id, "api_key_env"))
+
+
+def _configured_agent_tier(config: object | None, normalized_agent_id: str) -> str | None:
+    return _string_value(_configured_agent_field(config, normalized_agent_id, "tier"))
+
+
+def _configured_agent_allowed_tiers(config: object | None, normalized_agent_id: str) -> list[str] | None:
+    """Return the per-agent tier allowlist, or None.
+
+    Accepts a list of strings; returns a fresh list (caller may
+    mutate freely). Returns None when the agent does not configure
+    an allowlist (i.e. all tiers in [squilla_router.tiers] are
+    eligible).
+    """
+    raw = _configured_agent_field(config, normalized_agent_id, "allowed_tiers")
+    if raw is None:
+        return None
+    if isinstance(raw, list | tuple):
+        out = [_string_value(v) or "" for v in raw]
+        return [v for v in out if v]
+    if isinstance(raw, str):
+        # Allow a comma-separated string for terse config.
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return parts or None
+    return None
+
+
+def resolve_agent_endpoint(
+    agent_id: str,
+    config: object | None = None,
+) -> dict[str, str | None] | None:
+    """Resolve the per-agent LLM endpoint override, or None.
+
+    Returns a dict with ``provider`` / ``base_url`` / ``api_key`` /
+    ``api_key_env`` / ``tier`` / ``allowed_tiers`` keys. ``None`` is
+    returned only when the agent has no per-agent endpoint config at
+    all (i.e. should use the global [llm] baseline + global router
+    tier pool). Any individual field may be None if the agent only
+    configures a subset of the override.
+    """
+    normalized = normalize_agent_id(agent_id)
+    if normalized == "main" or config is None:
+        return None
+    out = {
+        "provider": _configured_agent_provider(config, normalized),
+        "base_url": _configured_agent_base_url(config, normalized),
+        "api_key": _configured_agent_api_key(config, normalized),
+        "api_key_env": _configured_agent_api_key_env(config, normalized),
+        "tier": _configured_agent_tier(config, normalized),
+        "allowed_tiers": _configured_agent_allowed_tiers(config, normalized),
+    }
+    if all(v is None for v in out.values()):
+        return None
+    return out
+
+
 def resolve_agent_state_dir(
     agent_id: str,
     config: object | None = None,

@@ -1352,6 +1352,27 @@ class AgentEntryConfig(BaseModel):
     enabled: bool = True
     system_prompt: str | None = None
     subagents: AgentSubagentDefaults | None = None
+    # ── Per-agent LLM endpoint (overrides the global [llm] baseline) ──
+    # All four are optional. Anything left blank inherits from the
+    # global [llm] block. ``api_key_env`` is the env-var name to
+    # resolve at routing time (preferred over an inline ``api_key``
+    # so secrets stay out of the toml).
+    provider: str | None = None
+    """Provider id (e.g. ``"mimo"``, ``"minimax_openai"``, ``"openai"``).
+    ``None`` → use the agent's resolved tier (squilla_router) or the
+    global [llm] baseline as a fallback."""
+    base_url: str | None = None
+    api_key: str | None = None
+    api_key_env: str | None = None
+    # Tier pin / allowlist (Plan A: per-agent tier routing)
+    tier: str | None = None
+    """If set, force this agent to a single tier (e.g. ``"c3"``). The
+    router still scores difficulty but the final decision is clamped
+    to this tier. ``None`` → use the global router tier pool."""
+    allowed_tiers: list[str] | None = None
+    """If set, restrict the router to a subset of tiers for this
+    agent. The router picks the best tier *within* the allowlist.
+    ``None`` → all tiers in [squilla_router.tiers] are eligible."""
     # Cap on conversation history turns the agent sees per turn. ``0``
     # means unlimited, which is the historical default and is what
     # causes the SQUILLA turn to balloon to 80K+ tokens after a few

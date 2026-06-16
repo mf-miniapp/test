@@ -42,15 +42,31 @@ HACK_DEEP_FIND_ID = "hack-deep-find"
 HACK_DEEP_FIND_NAME = "Hack Deep Find (Recursive Asset Discovery)"
 
 # Phase 1 MVP: only ip-resolver. Phase 2 will add the other 5.
-# Phase 2: 6 recon specialists wired. Phase 3: hack-deep added for the
-# post-find handoff (find-complete-v1 envelope).
+# Batch 5 (2026-06-15): 16 specialists wired (6 Phase 2 + 5 Batch 1 +
+# 2 Batch 2 + 2 Batch 3 + 1 Batch 4). hack-deep is the Phase 3 handoff
+# target (find-complete-v1 envelope).
 SPECIALIST_AGENTS: tuple[str, ...] = (
+    # Phase 2 - network surface (6)
     "subdomain-discoverer",
     "ip-resolver",
     "port-scanner",
     "service-fingerprint",
     "endpoint-crawler",
     "leaf-verifier",
+    # Batch 1 - web surface + CVE component view (5)
+    "service-detailed",
+    "webapp-discoverer",
+    "api-surface",
+    "parameter-extract",
+    "static-asset",
+    # Batch 2 - auth + cookie/header (2)
+    "auth-mapper",
+    "cookie-header",
+    # Batch 3 - cloud storage + cross-layer secret (2)
+    "cloud-storage",
+    "secret-scanner",
+    # Batch 4 - horizontal seed expansion (1)
+    "seed-expander",
     # Phase 3 handoff target.
     "hack-deep",
 )

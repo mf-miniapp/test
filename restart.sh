@@ -6,8 +6,8 @@
 #      wrapper) and shut it down gracefully (SIGTERM, then SIGKILL after a
 #      grace period).
 #   2. Wait for the listen port (default 28791) to actually free up.
-#   3. Re-launch the gateway in the background with `uv run`, redirecting
-#      stdout+stderr to /tmp/opensquilla-gateway.log.
+#   3. Re-launch the gateway in the background, redirecting stdout+stderr
+#      to /tmp/opensquilla-gateway.log.
 #   4. Poll the listen port until the new PID is bound, with a timeout.
 #   5. Print the new PID and tail a few log lines.
 #
@@ -25,7 +25,7 @@
 #   LOG_FILE          gateway log file (default /tmp/opensquilla-gateway.log)
 #   PID_FILE          PID file for the running gateway (default /tmp/opensquilla-gateway.pid)
 #   KILL_TIMEOUT      seconds to wait after SIGTERM before SIGKILL (default 8)
-#   READY_TIMEOUT     seconds to wait for the new process to bind the port (default 20)
+#   READY_TIMEOUT     seconds to wait for the new process to bind the port (default 30)
 
 set -euo pipefail
 
@@ -38,7 +38,7 @@ LISTEN_HOST="${LISTEN_HOST:-127.0.0.1}"
 LOG_FILE="${LOG_FILE:-/tmp/opensquilla-gateway.log}"
 PID_FILE="${PID_FILE:-/tmp/opensquilla-gateway.pid}"
 KILL_TIMEOUT="${KILL_TIMEOUT:-8}"
-READY_TIMEOUT="${READY_TIMEOUT:-20}"
+READY_TIMEOUT="${READY_TIMEOUT:-30}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -69,6 +69,28 @@ done
 # ---------------------------------------------------------------------------
 
 log() { printf '[restart.sh] %s\n' "$*" >&2; }
+
+# Pick the launcher. Order of preference:
+#   1. Project venv's python directly (fastest, no dep resolution).
+#   2. `uv run --no-sync` against the project venv (skips resolver, still
+#      uses the .venv). Only used as a fallback if (1) is missing.
+# `uv run` WITHOUT `--no-sync` hangs on every invocation here because uv
+# insists on re-checking the lockfile; we explicitly skip that.
+pick_launcher() {
+  if [ -x "${SCRIPT_DIR}/.venv/bin/python" ]; then
+    echo "${SCRIPT_DIR}/.venv/bin/python -m opensquilla.cli.main"
+    return
+  fi
+  if [ -x "${SCRIPT_DIR}/.venvmac/bin/python" ]; then
+    echo "${SCRIPT_DIR}/.venvmac/bin/python -m opensquilla.cli.main"
+    return
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    echo "uv run --no-sync --project ${SCRIPT_DIR}"
+    return
+  fi
+  echo ""
+}
 
 # Print all PIDs (and PPIDs) of processes whose command line matches the
 # `opensquilla gateway run` invocation. Returns 1 if none found.
@@ -171,6 +193,12 @@ fi
 # Start step
 # ---------------------------------------------------------------------------
 
+LAUNCHER=$(pick_launcher)
+if [ -z "$LAUNCHER" ]; then
+  log "ERROR: no launcher found (need .venv/bin/python or `uv` on PATH)"
+  exit 1
+fi
+log "launcher: $LAUNCHER"
 log "starting new gateway on ${LISTEN_HOST}:${PORT}, logs → ${LOG_FILE}"
 
 # Truncate the log so the new run is easy to find. (Override with KEEP_LOG=1.)
@@ -183,17 +211,18 @@ fi
 export OPENAI_API_KEY="${OPENAI_API_KEY:-not-needed-for-llamacpp}"
 
 # nohup + disown so the gateway survives the script exiting.
-nohup uv run opensquilla gateway run \
+# shellcheck disable=SC2086
+nohup $LAUNCHER gateway run \
   --listen "$LISTEN_HOST" --port "$PORT" \
   > "$LOG_FILE" 2>&1 &
 new_pid=$!
 disown "$new_pid" 2>/dev/null || true
 
 # Stash the PID for later inspection (not authoritative — the actual python
-# child PID is what binds the port, but this points to the uv wrapper).
+# child PID is what binds the port, but this points to the wrapper).
 echo "$new_pid" > "$PID_FILE"
 
-log "spawned wrapper PID=${new_pid}; waiting for port to bind"
+log "spawned wrapper PID=${new_pid}; waiting for port to bind (timeout=${READY_TIMEOUT}s)"
 
 if wait_for_port_listen; then
   bound_pid=$(port_listen_pid)
@@ -206,5 +235,9 @@ else
   log "TIMEOUT: gateway did not bind ${LISTEN_HOST}:${PORT} within ${READY_TIMEOUT}s"
   log "log tail:"
   tail -n 30 "$LOG_FILE" | awk '{print "    " $0}' >&2
+  log "process state:"
+  ps -p "$new_pid" 2>/dev/null | sed 's/^/    /' >&2 || log "    (wrapper already exited)"
+  # Reap the orphan so the next run starts clean.
+  kill -KILL "$new_pid" 2>/dev/null || true
   exit 1
 fi

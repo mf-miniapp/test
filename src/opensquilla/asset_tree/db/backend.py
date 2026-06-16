@@ -831,14 +831,43 @@ def get_default_backend() -> AssetTreeBackend:
                 )
             backend: AssetTreeBackend = MysqlBackend(engine, factory)
             # Auto-migrate on first init so callers don't have to.
+            # The migration is best-effort: a failure here surfaces
+            # later when the first write hits a missing table, so we
+            # log and continue rather than wedging the backend into a
+            # half-initialised state.
             try:
                 import asyncio as _asyncio
-                _asyncio.run(backend.init_schema())
-            except RuntimeError:
-                # Already inside an event loop — call from a thread.
                 import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    ex.submit(_asyncio.run, backend.init_schema()).result()
+                # Detect the running loop BEFORE creating the coroutine.
+                # ``asyncio.run(coro)`` would otherwise create ``coro``
+                # eagerly and then reject it from inside a running loop,
+                # leaking the coroutine for GC to flag with
+                # ``RuntimeWarning: coroutine ... was never awaited``.
+                try:
+                    _asyncio.get_running_loop()
+                    in_running_loop = True
+                except RuntimeError:
+                    in_running_loop = False
+                if in_running_loop:
+                    # Fallback: already inside an event loop. Run the
+                    # migration in a fresh thread so ``asyncio.run`` has
+                    # its own loop. ``.result()`` blocks until the
+                    # migration completes (and the coroutine inside the
+                    # worker thread is awaited, not GC'd).
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1
+                    ) as ex:
+                        ex.submit(
+                            _asyncio.run, backend.init_schema()
+                        ).result()
+                else:
+                    # Preferred path: no running loop → asyncio.run works.
+                    _asyncio.run(backend.init_schema())
+            except Exception as exc:  # noqa: BLE001 - best-effort migration
+                logger.warning(
+                    "asset_tree_backend_init_schema_failed error=%s",
+                    exc,
+                )
             _default_backend = backend
             logger.info("asset_tree_backend_init url=%s type=%s", url, type(backend).__name__)
         return _default_backend

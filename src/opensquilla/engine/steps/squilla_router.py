@@ -903,6 +903,51 @@ def _attachments_include_image(attachments: list[dict[str, Any]] | None) -> bool
     return False
 
 
+def _agent_id_from_session_key(session_key: str) -> str:
+    """Pull ``agent_id`` out of ``agent:<aid>:...`` session keys.
+
+    Returns ``"main"`` if the key is not in the expected shape — that
+    matches the convention used elsewhere (e.g. ``resolve_agent_model``)
+    where the global config applies to the main agent.
+    """
+    if not session_key:
+        return "main"
+    parts = session_key.split(":")
+    if len(parts) < 3 or parts[0] != "agent":
+        return "main"
+    aid = parts[1].strip()
+    return aid or "main"
+
+
+def _per_agent_tier_filter(
+    agent_id: str,
+    config: object | None,
+) -> tuple[str | None, list[str] | None, str | None]:
+    """Return ``(tier_pin, allowed_tiers, provider_filter)`` for ``agent_id``.
+
+    All three may be None, meaning "no per-agent override". Read from
+    ``config.agents`` via :func:`opensquilla.agents.scope.resolve_agent_endpoint`.
+    The ``provider_filter`` is the agent's configured ``provider`` field
+    and is used to restrict the router to tiers whose own ``provider``
+    field matches it.
+    """
+    if not agent_id or agent_id == "main" or config is None:
+        return (None, None, None)
+    try:
+        from opensquilla.agents.scope import resolve_agent_endpoint
+
+        ep = resolve_agent_endpoint(agent_id, config)
+    except Exception:
+        return (None, None, None)
+    if ep is None:
+        return (None, None, None)
+    return (
+        ep.get("tier"),
+        ep.get("allowed_tiers"),
+        ep.get("provider"),
+    )
+
+
 async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     router_cfg = getattr(ctx.config, "squilla_router", None) if ctx.config else None
     if not router_cfg or not getattr(router_cfg, "enabled", False):
@@ -941,6 +986,27 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 "No image-capable SquillaRouter tier is configured for this image request. "
                 "Configure squilla_router.tiers.image_model with supports_image=true."
             )
+        # Per-agent filter for image tier: if the agent has a tier pin
+        # or allowlist, restrict image_tiers to the subset that matches.
+        _img_agent_id = _agent_id_from_session_key(ctx.session_key)
+        _img_pin, _img_allowed, _img_provider = _per_agent_tier_filter(
+            _img_agent_id, ctx.config
+        )
+        if _img_pin is not None and _img_pin in image_tiers:
+            image_tiers = {k: v for k, v in image_tiers.items() if k == _img_pin}
+        if _img_allowed:
+            image_tiers = {k: v for k, v in image_tiers.items() if k in _img_allowed}
+        if _img_provider:
+            image_tiers = {
+                k: v for k, v in image_tiers.items()
+                if (v or {}).get("provider") == _img_provider
+            }
+        if not image_tiers:
+            raise RuntimeError(
+                f"No image-capable SquillaRouter tier is configured for this "
+                f"image request under the per-agent filter (agent={_img_agent_id}, "
+                f"pin={_img_pin}, allowed={_img_allowed}, provider={_img_provider})."
+            )
         tier_name = random.choice(list(image_tiers.keys()))
         decision = RoutingDecision(
             tier=tier_name,
@@ -971,6 +1037,52 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     valid_tiers = [name for name, tier in tiers.items() if not tier.get("image_only", False)]
     if not valid_tiers:
         return ctx
+
+    # Per-agent filter: clamp the router to a single tier (pin), a
+    # subset of tiers (allowlist), or tiers whose ``provider`` matches
+    # the agent's configured provider. All three are AND-combined.
+    # This is the "Plan A" per-agent routing hook.
+    _agent_id = _agent_id_from_session_key(ctx.session_key)
+    _pin, _allowed, _provider_filter = _per_agent_tier_filter(_agent_id, ctx.config)
+    if _pin is not None and _pin in tiers:
+        valid_tiers = [_pin]
+    if _allowed:
+        valid_tiers = [t for t in valid_tiers if t in _allowed]
+    if _provider_filter:
+        valid_tiers = [
+            t for t in valid_tiers
+            if (tiers.get(t) or {}).get("provider") == _provider_filter
+        ]
+    if not valid_tiers:
+        # Per-agent config is an explicit operator intent: if the pin /
+        # allowlist / provider filter excludes every tier, that is a
+        # configuration mismatch and must surface as an error, not a
+        # silent fallback to the global pool (the latter would defeat
+        # the agent-isolation guarantee the filter exists to provide).
+        # The image-tier path above also raises here; mirror that.
+        log.error(
+            "squilla_router.no_eligible_tier",
+            agent_id=_agent_id,
+            pin=_pin,
+            allowed=_allowed,
+            provider_filter=_provider_filter,
+            note="per-agent filter excluded all tiers; check tier / allowed_tiers / provider",
+        )
+        raise RuntimeError(
+            f"No SquillaRouter tier is eligible for agent={_agent_id!r} "
+            f"under the per-agent filter (pin={_pin}, allowed={_allowed}, "
+            f"provider={_provider_filter}). Update "
+            f"agents.{_agent_id}.{{tier,allowed_tiers,provider}} or the "
+            f"[squilla_router.tiers.*] blocks."
+        )
+    # Record the per-agent filter for /healthz observability.
+    ctx.metadata["per_agent_tier_filter"] = {
+        "agent_id": _agent_id,
+        "tier_pin": _pin,
+        "allowed_tiers": list(_allowed) if _allowed else None,
+        "provider_filter": _provider_filter,
+        "resolved_tiers": list(valid_tiers),
+    }
 
     hold_store = ctx.metadata.get("router_control_hold_store")
     if isinstance(hold_store, RouterControlHoldStore):

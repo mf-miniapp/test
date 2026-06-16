@@ -99,7 +99,7 @@ class AssetType(str, enum.Enum):
 #   - ``GENERIC`` 仍保留"父位可接受任何子类型"语义不变。
 _VALID_PARENT_CHILD: dict[AssetType, set[AssetType]] = {
     # Network surface
-    AssetType.ROOT_DOMAIN: {AssetType.SUB_DOMAIN},
+    AssetType.ROOT_DOMAIN: {AssetType.SUB_DOMAIN, AssetType.ROOT_DOMAIN},  # ROOT_DOMAIN children: SUB_DOMAIN (normal) or ROOT_DOMAIN (extra_seed sibling)
     AssetType.SUB_DOMAIN: {AssetType.IP, AssetType.STORAGE, AssetType.SECRET},
     AssetType.IP: {AssetType.PORT, AssetType.SECRET},
     AssetType.PORT: {AssetType.SERVICE},

@@ -284,7 +284,6 @@ async def asset_tree_create(
                     parent_id=tree.root_id,
                     asset_type=AssetType.ROOT_DOMAIN,
                     value=f"[{kind}] {value}",  # tag so kind is visible
-                    state=AssetState.UNSEEN,
                 )
                 extra_seed_ids.append({"kind": kind, "value": value, "node_id": child_id})
             except Exception as exc:

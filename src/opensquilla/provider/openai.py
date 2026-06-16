@@ -1068,7 +1068,7 @@ class OpenAIProvider:
                                 reasoning_parts.append(reasoning_str)
 
                             # Tool calls (may stream over multiple chunks)
-                            for tc in delta.get("tool_calls", []):
+                            for tc in (delta.get("tool_calls") or []):
                                 idx = _resolve_tool_call_index(
                                     tc,
                                     pending_calls,

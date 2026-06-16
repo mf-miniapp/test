@@ -416,6 +416,24 @@ class TestJSONFallbackMode:
         assert "DB not configured" in resp.text
         assert "ASSET_TREE_DB_URL" in resp.text
 
+    def test_delete_tree_button_not_disabled_in_fallback(self, client_no_db):
+        """The 删除树 button must be clickable in fallback mode because
+        the store now unlinks the on-disk JSON snapshot on delete."""
+        resp = client_no_db.get("/asset-tree/")
+        assert resp.status_code == 200
+        # The button is rendered as part of a Jinja conditional, so
+        # its disabled attribute only appears when the fallback mode
+        # was active at render time. We assert the button is present
+        # and *not* disabled so the operator can actually use it.
+        assert "deleteCurrentTree" in resp.text
+        assert "删除树" in resp.text
+        # Snip out the delete button line and assert it has no
+        # ``disabled`` attribute.
+        import re
+        m = re.search(r"<button[^>]*deleteCurrentTree\(\)[^>]*>", resp.text)
+        assert m is not None, "delete-tree button not found in page"
+        assert "disabled" not in m.group(0)
+
     def test_index_page_renders_no_trees_when_empty(self, tmp_path, monkeypatch):
         """When the JSON state dir is empty, the page still renders (banner only)."""
         # Override the default fixture: use a clean tmp state dir with no snapshots
@@ -503,10 +521,20 @@ class TestJSONFallbackMode:
         assert resp.status_code == 503
         assert resp.json()["code"] == "db_unavailable"
 
-    def test_delete_tree_returns_503(self, client_no_db):
+    def test_delete_tree_removes_json_snapshot(self, client_no_db, tmp_path, monkeypatch):
+        """In fallback mode, DELETE /api/trees/{id} unlinks the on-disk
+        JSON snapshot (the source of truth when the DB isn't configured)."""
+        from opensquilla.asset_tree.web import store as _store_mod
+        snapshot = _store_mod._json_state_dir() / "tree-fallback.json"
+        assert snapshot.exists()
         resp = client_no_db.delete("/asset-tree/api/trees/tree-fallback")
-        assert resp.status_code == 503
-        assert resp.json()["code"] == "db_unavailable"
+        assert resp.status_code == 200
+        assert resp.json() == {"deleted": "tree-fallback"}
+        assert not snapshot.exists()
+
+    def test_delete_tree_404_for_unknown_in_fallback(self, client_no_db):
+        resp = client_no_db.delete("/asset-tree/api/trees/does-not-exist")
+        assert resp.status_code == 404
 
     def test_get_stats_still_works_via_json(self, client_no_db):
         """Stats endpoint is a read — should work in JSON-fallback mode."""

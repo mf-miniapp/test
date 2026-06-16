@@ -1378,6 +1378,22 @@ def _claims_image_without_tool_use(
     return any(p.lower() in lowered for p in _IMAGE_CLAIM_PATTERNS)
 
 
+def _agent_id_from_session_key(session_key: str) -> str:
+    """Pull ``agent_id`` out of ``agent:<aid>:...`` session keys.
+
+    Returns ``"main"`` if the key is not in the expected shape — that
+    matches the convention used elsewhere (e.g. ``resolve_agent_model``)
+    where the global config applies to the main agent.
+    """
+    if not session_key:
+        return "main"
+    parts = session_key.split(":")
+    if len(parts) < 3 or parts[0] != "agent":
+        return "main"
+    aid = parts[1].strip()
+    return aid or "main"
+
+
 class TurnRunner:
     """Orchestrates a complete agent turn: provider → tools → prompt → pipeline → Agent.
 
@@ -3903,12 +3919,202 @@ class TurnRunner:
             ],
         )
 
-        # Apply routed model back to cloned selector (local, not shared)
+        # Apply routed model + (optional) per-tier provider back to cloned
+        # selector (local, not shared). Per-tier overrides let the
+        # squilla_router route between different LLM endpoints — e.g. a
+        # local qwen3.6-35b on tier c0/c1 and a remote MiMo endpoint on
+        # tier c2/c3 — without forcing the user to swap the global [llm]
+        # block. Tiers that don't set base_url/api_key fall through to
+        # the global baseline and the legacy single-endpoint behavior.
         if turn.model and cloned_selector is not None:
             cloned_selector.override_model(turn.model)
+            tier_pc = self._build_tier_provider_config(turn, cloned_selector)
+            if tier_pc is not None:
+                cloned_selector.override_primary_config(tier_pc)
             provider = cloned_selector.resolve()
+            # Audit the routing decision for /healthz + ops dashboards.
+            # The lock-free tuple swap below lets healthz read a
+            # consistent snapshot without blocking the turn pipeline.
+            self._last_routing = {
+                "tier": turn.metadata.get("routed_tier") if turn.metadata else None,
+                "model": turn.model,
+                "provider": cloned_selector.current_config.provider,
+                "base_url": cloned_selector.current_config.base_url,
+                "tier_override_applied": tier_pc is not None,
+                "ts": time.time(),
+            }
 
         return turn, provider
+
+    # ── Per-tier provider resolution (squilla_router multi-endpoint) ──────
+    def _build_tier_provider_config(
+        self, turn: Any, cloned_selector: Any
+    ) -> Any | None:
+        """Resolve the routed tier's provider override, or None.
+
+        Returns ``None`` when the tier doesn't actually override any
+        field that the global baseline already has (i.e. the tier
+        shares the global endpoint), so the caller's
+        ``if tier_pc is not None`` branch short-circuits the no-op case.
+        """
+        import os
+
+        from opensquilla.provider.selector import (
+            ProviderConfig,
+            resolve_tier_provider_config,
+        )
+        from opensquilla.router_tiers import IMAGE_TIER, normalize_text_tier
+
+        router_cfg = getattr(self._config, "squilla_router", None)
+        if router_cfg is None or not getattr(router_cfg, "enabled", False):
+            return None
+        routed = turn.metadata.get("routed_tier") if turn.metadata else None
+        if not routed:
+            return None
+        if routed == IMAGE_TIER or normalize_text_tier(routed) is None:
+            return None
+        tiers = getattr(router_cfg, "tiers", {}) or {}
+        tier_cfg = tiers.get(routed)
+        if not tier_cfg:
+            return None
+
+        # Baseline = the global primary in the ModelSelector chain.
+        baseline_pc = cloned_selector._chain[0]  # noqa: SLF001
+        baseline_pc = ProviderConfig(
+            provider=baseline_pc.provider,
+            model=baseline_pc.model,
+            api_key=baseline_pc.api_key,
+            base_url=baseline_pc.base_url,
+            org_id=baseline_pc.org_id,
+            proxy=baseline_pc.proxy,
+            provider_routing=dict(baseline_pc.provider_routing or {}),
+        )
+
+        # Per-agent baseline override: if the routed agent has a
+        # configured ``provider`` / ``base_url`` / ``api_key`` /
+        # ``api_key_env``, layer those on top of the global baseline
+        # so the tier's resolved endpoint matches the agent's
+        # intended endpoint. Without this, the per-agent filter on
+        # the router would still pick the right *tier*, but the
+        # endpoint swap in :func:`_tier_cfg_for_routed` would use the
+        # global baseline, not the agent's preferred one.
+        agent_id = _agent_id_from_session_key(getattr(turn, "session_key", ""))
+        if agent_id and agent_id != "main":
+            try:
+                from opensquilla.agents.scope import resolve_agent_endpoint
+
+                ep = resolve_agent_endpoint(agent_id, self._config)
+            except Exception:
+                ep = None
+            if ep is not None:
+                if ep.get("provider"):
+                    baseline_pc = ProviderConfig(
+                        provider=ep["provider"],
+                        model=baseline_pc.model,
+                        api_key=baseline_pc.api_key,
+                        base_url=baseline_pc.base_url,
+                        org_id=baseline_pc.org_id,
+                        proxy=baseline_pc.proxy,
+                        provider_routing=dict(baseline_pc.provider_routing or {}),
+                    )
+                if ep.get("base_url"):
+                    baseline_pc = ProviderConfig(
+                        provider=baseline_pc.provider,
+                        model=baseline_pc.model,
+                        api_key=baseline_pc.api_key,
+                        base_url=ep["base_url"],
+                        org_id=baseline_pc.org_id,
+                        proxy=baseline_pc.proxy,
+                        provider_routing=dict(baseline_pc.provider_routing or {}),
+                    )
+                if ep.get("api_key"):
+                    baseline_pc = ProviderConfig(
+                        provider=baseline_pc.provider,
+                        model=baseline_pc.model,
+                        api_key=ep["api_key"],
+                        base_url=baseline_pc.base_url,
+                        org_id=baseline_pc.org_id,
+                        proxy=baseline_pc.proxy,
+                        provider_routing=dict(baseline_pc.provider_routing or {}),
+                    )
+                env_name = (ep.get("api_key_env") or "").strip()
+                if env_name and not (ep.get("api_key") or "").strip():
+                    env_value = os.environ.get(env_name, "").strip()
+                    if env_value:
+                        baseline_pc = ProviderConfig(
+                            provider=baseline_pc.provider,
+                            model=baseline_pc.model,
+                            api_key=env_value,
+                            base_url=baseline_pc.base_url,
+                            org_id=baseline_pc.org_id,
+                            proxy=baseline_pc.proxy,
+                            provider_routing=dict(baseline_pc.provider_routing or {}),
+                        )
+                # Per-agent model override: if the agent has a configured
+                # ``model`` and the tier does NOT have one (i.e. tier
+                # defers to baseline), substitute the agent's model.
+                if ep.get("model") and not (tier_cfg.get("model") if isinstance(tier_cfg, dict) else getattr(tier_cfg, "model", "")):
+                    baseline_pc = ProviderConfig(
+                        provider=baseline_pc.provider,
+                        model=ep["model"],
+                        api_key=baseline_pc.api_key,
+                        base_url=baseline_pc.base_url,
+                        org_id=baseline_pc.org_id,
+                        proxy=baseline_pc.proxy,
+                        provider_routing=dict(baseline_pc.provider_routing or {}),
+                    )
+
+        tier_pc = resolve_tier_provider_config(tier_cfg, baseline_pc)
+
+        # Resolve api_key_env (tier-level env-var backing) AFTER
+        # resolve_tier_provider_config so the env-var lookup doesn't get
+        # masked by an empty literal api_key on the tier.
+        if isinstance(tier_cfg, dict):
+            tier_api_key_env = str(tier_cfg.get("api_key_env", "") or "").strip()
+            tier_explicit_api_key = tier_cfg.get("api_key", "")
+        else:
+            tier_api_key_env = str(getattr(tier_cfg, "api_key_env", "") or "").strip()
+            tier_explicit_api_key = getattr(tier_cfg, "api_key", "")
+        if tier_api_key_env and not tier_explicit_api_key:
+            env_value = os.environ.get(tier_api_key_env, "").strip()
+            if env_value:
+                tier_pc = ProviderConfig(
+                    provider=tier_pc.provider,
+                    model=tier_pc.model,
+                    api_key=env_value,
+                    base_url=tier_pc.base_url,
+                    org_id=tier_pc.org_id,
+                    proxy=tier_pc.proxy,
+                    provider_routing=dict(tier_pc.provider_routing or {}),
+                )
+
+        # No-op short-circuit: if the resolved tier config is identical
+        # to the baseline, return None so the caller skips the override.
+        if (
+            tier_pc.provider == baseline_pc.provider
+            and tier_pc.model == baseline_pc.model
+            and tier_pc.api_key == baseline_pc.api_key
+            and tier_pc.base_url == baseline_pc.base_url
+            and tier_pc.proxy == baseline_pc.proxy
+        ):
+            return None
+        return tier_pc
+
+    @property
+    def last_routing(self) -> dict[str, Any] | None:
+        """Snapshot of the most recent squilla_router decision.
+
+        Returns a dict with ``tier`` / ``model`` / ``provider`` /
+        ``base_url`` / ``tier_override_applied`` / ``ts`` keys, or
+        ``None`` if no turn has been routed yet. Used by the
+        ``/healthz`` and ``/api/system/status`` endpoints to surface
+        the active routed endpoint to operators.
+
+        The dictionary is a fresh copy on every call so callers can
+        mutate freely without affecting the runtime's audit state.
+        """
+        last = getattr(self, "_last_routing", None)
+        return dict(last) if last else None
 
     async def _router_previous_assistant_context(
         self,

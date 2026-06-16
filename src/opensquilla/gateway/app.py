@@ -77,7 +77,31 @@ def create_gateway_app(
     # ── HTTP endpoint handlers ───────────────────────────────────────────────
 
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse({"ok": True, "status": "live"})
+        payload: dict[str, Any] = {"ok": True, "status": "live"}
+        # Surface the active routed endpoint so operators can verify the
+        # squilla_router picked the right LLM at a glance. Tolerates
+        # "no turn routed yet" — turn_runner / last_routing can both
+        # be absent on a freshly-started gateway.
+        try:
+            tr = turn_runner
+            if tr is not None:
+                last = getattr(tr, "last_routing", None)
+                if last is not None:
+                    payload["routing"] = {
+                        "tier": last.get("tier"),
+                        "model": last.get("model"),
+                        "provider": last.get("provider"),
+                        "base_url": last.get("base_url"),
+                        "tier_override_applied": bool(
+                            last.get("tier_override_applied")
+                        ),
+                        "ts": last.get("ts"),
+                    }
+        except Exception:
+            # Audit is best-effort: never let a routing lookup failure
+            # turn a healthy gateway into an unhealthy one.
+            pass
+        return JSONResponse(payload)
 
     async def root(request: Request) -> RedirectResponse:
         return RedirectResponse(url=f"{config.control_ui.base_path}/")
@@ -137,15 +161,36 @@ def create_gateway_app(
                     provider_name = getattr(p, "name", None) or type(p).__name__
                 except Exception:
                     pass
-        return JSONResponse(
-            {
-                "version": __version__,
-                "uptime_ms": uptime,
-                "status": "running",
-                "provider": provider_name,
-                "auth_mode": config.auth.mode,
-            }
-        )
+        payload: dict[str, Any] = {
+            "version": __version__,
+            "uptime_ms": uptime,
+            "status": "running",
+            "provider": provider_name,
+            "auth_mode": config.auth.mode,
+        }
+        # Last-routed-tier snapshot. Lets operators see which endpoint
+        # the model router picked for the most recent turn, including
+        # any per-tier base_url / provider override.
+        try:
+            tr = turn_runner
+            if tr is not None:
+                last = getattr(tr, "last_routing", None)
+                if last is not None:
+                    payload["routing"] = {
+                        "tier": last.get("tier"),
+                        "model": last.get("model"),
+                        "provider": last.get("provider"),
+                        "base_url": last.get("base_url"),
+                        "tier_override_applied": bool(
+                            last.get("tier_override_applied")
+                        ),
+                        "ts": last.get("ts"),
+                    }
+                else:
+                    payload["routing"] = None
+        except Exception:
+            payload["routing"] = None
+        return JSONResponse(payload)
 
     async def api_usage(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
