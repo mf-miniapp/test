@@ -45,6 +45,16 @@ HACK_DEEP_FIND_NAME = "Hack Deep Find (Recursive Asset Discovery)"
 # Batch 5 (2026-06-15): 16 specialists wired (6 Phase 2 + 5 Batch 1 +
 # 2 Batch 2 + 2 Batch 3 + 1 Batch 4). hack-deep is the Phase 3 handoff
 # target (find-complete-v1 envelope).
+#
+# 2026-06-17 v3: the 16 specialists are the PRIMARY execution path,
+# but in installations where any specialist fails to spawn (config
+# drift, missing workspace, agent disabled by operator, runtime
+# outage) the find LLM-coordinator falls back to a 3-agent "legacy
+# recon" family that has been in the install since the 3-harness
+# split (2026-06-15). FALLBACK_AGENTS is written to the same
+# subagents.allow_agents whitelist so the LLM can call them when
+# the primary path is unavailable. The v3 SOUL_BODY documents the
+# exact escalation order (specialist -> legacy_recon -> recon_* tool).
 SPECIALIST_AGENTS: tuple[str, ...] = (
     # Phase 2 - network surface (6)
     "subdomain-discoverer",
@@ -71,14 +81,51 @@ SPECIALIST_AGENTS: tuple[str, ...] = (
     "hack-deep",
 )
 
-# Coordinator's tool allowlist. recon:http is permitted only for endpoint
-# reachability verification after endpoint-crawler has populated ENDPOINT
-# children. See SOUL_BODY.md.
+# v3 legacy-recon fallback family. 3 agents predate the 16-specialist
+# split; they are coarser-grained (one agent per wave-tier rather than
+# per asset_type) but functional on every install. The find LLM
+# should only use these when the corresponding specialist fails
+# (ToolError / UnauthorizedAgent / not-in-allowlist).
+FALLBACK_AGENTS: tuple[str, ...] = (
+    "recon",                       # W1.5c / W2.5 / W3.5 fallback
+    "intel-collection",            # W0.5 surface intel fallback
+    "attack-surface-enumeration",  # W2.5 attack plan fallback
+)
+
+# Coordinator's tool allowlist.
+#
+# v3 (2026-06-17) re-design: the find coordinator is now an LLM
+# orchestrator with a 3-tier adaptive execution model:
+#
+#   Tier 1: sessions_spawn a 16-specialist member (preferred)
+#   Tier 2: sessions_spawn a legacy_recon agent (recon /
+#           intel-collection / attack-surface-enumeration) when the
+#           matching specialist is unavailable
+#   Tier 3: call recon_* tools directly when BOTH specialist and
+#           legacy_recon fail (last-resort; for small tasks the
+#           coordinator does it itself)
+#
+# Tier 3 needs the recon:* tool groups on the coordinator's own
+# allowlist. We grant ALL 11 groups so the LLM can self-serve
+# through any path. The 严禁 list (nmap / curl / exploit tools) is
+# still enforced by deny rules in agent config.
 COORDINATOR_TOOLS_ALLOW: tuple[str, ...] = (
     "group:asset_tree",
     "group:sessions",
     "group:fs",
+    # All 11 recon tool groups so Tier 3 fallback works.
+    "group:recon:dns",
+    "group:recon:portscan",
     "group:recon:http",
+    "group:recon:component",
+    "group:recon:webapp",
+    "group:recon:api",
+    "group:recon:sensitive",
+    "group:recon:auth",
+    "group:recon:header",
+    "group:recon:secret",
+    "group:recon:seed",
+    "group:recon:storage",
 )
 
 
@@ -132,18 +179,29 @@ async def _register_in_config() -> None:
     cfg: GatewayConfig = load_config(config_path)
     registry = AgentRegistry(cfg, config_path=str(config_path), persist_changes=False)
 
+    # v3 (2026-06-17): write SPECIALIST_AGENTS + FALLBACK_AGENTS to the
+    # allow_agents whitelist so the LLM-coordinator can call either
+    # tier. Dedup preserves SPECIALIST_AGENTS order first, then any
+    # FALLBACK_AGENTS entries that were not already in specialists.
+    _allow_agents = list(SPECIALIST_AGENTS)
+    for _a in FALLBACK_AGENTS:
+        if _a not in _allow_agents:
+            _allow_agents.append(_a)
     subagents = AgentSubagentDefaults(
-        allow_agents=list(SPECIALIST_AGENTS),
+        allow_agents=_allow_agents,
         max_children_per_session=20,  # recursive fanout
         cascade_on_parent_kill=True,
     )
 
     description = (
-        "Pure LLM orchestrator for recursive asset discovery (v2 redesign). "
-        "Drives 6 recon specialists via sessions_spawn; manages a "
-        "persistent AssetTree via asset_tree_* tools. Never invokes "
-        "scanners directly. Phase 3 wires the find-complete-v1 handoff "
-        "to hack-deep at end-of-run."
+        "Pure LLM orchestrator for recursive asset discovery (v3 redesign, "
+        "2026-06-17). Drives 16 recon specialists (Phase 2 + Batch 1-4) via "
+        "sessions_spawn; on specialist unavailability it falls back to the "
+        "3-agent legacy-recon family (recon / intel-collection / "
+        "attack-surface-enumeration), then to direct recon_* tool calls. "
+        "Manages a persistent AssetTree via asset_tree_* tools. Never "
+        "invokes exploit / payload tools. Phase 3 wires the "
+        "find-complete-v1 handoff to hack-deep at end-of-run."
     )
 
     ids = {a.id for a in cfg.agents}
@@ -176,7 +234,7 @@ async def _register_in_config() -> None:
         )
         print(
             f"  + registered {summary['id']} "
-            f"with subagents.allow_agents={list(SPECIALIST_AGENTS)} "
+            f"with subagents.allow_agents={_allow_agents} "
             f"tools.allow={list(COORDINATOR_TOOLS_ALLOW)}"
         )
 

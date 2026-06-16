@@ -573,3 +573,44 @@ W1.6a/b/c drill-in 归 hack-deep own。find 若 W1 evidence 显示需要 drill-i
 Dispatch Handling" 一节): 校验 `requested_slots` 合法性后, 自行决定是否
 开 W1.6* drill-in, deep 代行 spawn `recon` (前提: `recon` 在 deep 的
 `subagents.allow_agents` 白名单里)。
+
+
+---
+
+## v3 Adaptive Execution Fallback Table (2026-06-17)
+
+当 16 specialist 不可用时, hack-deep-find 的 3-tier fallback 协议
+按下表选 Tier 2 / Tier 3 target。
+
+| Wave (Layer) | Parent asset_type | Tier 1 specialist | Tier 2 legacy_recon | Tier 3 recon_* tool |
+|---|---|---|---|---|
+| F0 (W0.5) | root_domain (横向) | `seed-expander` | `intel-collection` | `recon_whois_lookup` + `recon_asn_lookup` |
+| F0.5 (W0.6) | resource-checkpoint | (n/a) | `recon` | n/a (resource enumeration, not recon) |
+| F1 (W1) | sub_domain (主链) | `ip-resolver` | `recon` | `recon_dns_resolve` + `recon_dns_over_https` |
+| F1 (W1) | sub_domain (横向) | `cloud-storage` | `attack-surface-enumeration` | `recon_bucket_naming_variants` |
+| F1.5 (W1.5) | ip | `port-scanner` | `recon` | `recon_port_scan_range` |
+| F1.5c (W1.5c) | port | `service-fingerprint` | `recon` | `recon_grab_banner` |
+| F5 (service) | service (comp) | `service-detailed` | `attack-surface-enumeration` | `recon_cpe_resolve` |
+| F5 (service) | service (web) | `webapp-discoverer` | `attack-surface-enumeration` | `recon_robots_sitemap` |
+| F5 (service) | service (crawl) | `endpoint-crawler` | `recon` | `recon_directory_bruteforce` (小规模) |
+| F6a (url) | url (api) | `api-surface` | `attack-surface-enumeration` | `recon_openapi_parse` |
+| F6a (url) | url (static) | `static-asset` | `recon` | `recon_sensitive_fingerprint` |
+| F6b (url) | url (auth) | `auth-mapper` | `attack-surface-enumeration` | `recon_auth_probe` |
+| F6b (url) | url (cookie) | `cookie-header` | `recon` | `recon_extract_endpoints_from_js` |
+| F7 (endpoint) | endpoint | `parameter-extract` | `attack-surface-enumeration` | (group:recon:api read-only) |
+| 终态 (leaf) | 任意 | `leaf-verifier` | `recon` | `recon_http_probe` |
+| 跨层 (secret) | 任意 (白名单) | `secret-scanner` | `recon` | `recon_secret_scan_text` |
+
+**降级触发条件** (3 个):
+
+1. `sessions_spawn(specialist_id, ...)` returns `ToolError: Agent not found`
+2. specialist evidence contains `error="specialist_disabled"`
+3. `sessions_spawn` returns `ToolError: not in allow_agents`
+
+LLM 必须在 output 里显式写 `[FALLBACK tier=N reason=...]` 状态摘要,
+否则视为协议违反(同 specialist 超时 3 次的违规级别)。
+
+**为什么 Tier 3 仍然允许**: 真正的小 install (3-5 个 host) 上, 16
+specialist 启动开销 > 自己跑一次 `recon_dns_resolve`。Tier 3 让 find
+能在资源受限 install 上**最低限度**完成 (虽然功能降级, 但**不**降
+到"自己调 bash / curl" — 这是不可降级边界)。

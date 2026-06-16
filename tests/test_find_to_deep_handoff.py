@@ -26,6 +26,10 @@ import pytest
 # importlib.
 import importlib
 _hack_deep_find_pkg = importlib.import_module("opensquilla.agents.hack-deep-find")
+# Reload so SOUL_BODY / ATTRIBUTION_BODY reflect the latest on-disk
+# .md files (the package does one-shot loading at import time and
+# won't pick up edits between runs).
+_hack_deep_find_pkg.reload()
 ATTRIBUTION_BODY = _hack_deep_find_pkg.ATTRIBUTION_BODY
 SOUL_BODY = _hack_deep_find_pkg.SOUL_BODY
 from opensquilla.asset_tree.models import AssetState, AssetType
@@ -548,8 +552,7 @@ class TestV2SoulFFinalArtifacts:
             SOUL_BODY,
         )
         assert m is not None, (
-            "find SOUL must include a 'find never spawns hack-deep-ex' "
-            "declaration (v2 hard constraint)."
+            "find SOUL must include a find->ex non-existence declaration."
         )
 
     def test_soul_documents_w16c_declaration_not_execution(self):
@@ -601,3 +604,134 @@ class TestHackDeepExSoulV2Contract:
         )
         # The ex → find reverse direction is explicitly forbidden
         assert "post-exploit-complete-v1" in soul
+
+
+
+# ── V3 ADAPTIVE EXECUTION (3-tier fallback) ──────────────
+
+
+class TestV3AdaptiveExecution:
+    def test_clone_script_writes_fallback_agents(self):
+        """clone_hack_deep_find.py must expose FALLBACK_AGENTS and
+        merge them into the allow_agents whitelist (alongside
+        SPECIALIST_AGENTS + hack-deep)."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "clone_hack_deep_find",
+            "scripts/clone_hack_deep_find.py",
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Fallback family: 3 legacy-recon agents
+        assert hasattr(mod, "FALLBACK_AGENTS")
+        assert "recon" in mod.FALLBACK_AGENTS
+        assert "intel-collection" in mod.FALLBACK_AGENTS
+        assert "attack-surface-enumeration" in mod.FALLBACK_AGENTS
+        # 16 specialists are still the primary list
+        assert "subdomain-discoverer" in mod.SPECIALIST_AGENTS
+        assert "seed-expander" in mod.SPECIALIST_AGENTS
+
+    def test_coordinator_tools_allow_all_recon_groups(self):
+        """For Tier 3 to work (find LLM calling recon_* tools
+        directly), all 11 recon tool groups must be in
+        COORDINATOR_TOOLS_ALLOW."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "clone_hack_deep_find",
+            "scripts/clone_hack_deep_find.py",
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        allow = mod.COORDINATOR_TOOLS_ALLOW
+        for grp in (
+            "group:recon:dns",
+            "group:recon:portscan",
+            "group:recon:http",
+            "group:recon:component",
+            "group:recon:webapp",
+            "group:recon:api",
+            "group:recon:sensitive",
+            "group:recon:auth",
+            "group:recon:header",
+            "group:recon:secret",
+            "group:recon:seed",
+            "group:recon:storage",
+        ):
+            assert grp in allow, f"{grp} missing from COORDINATOR_TOOLS_ALLOW"
+
+    def test_soul_documents_v3_fallback_table(self):
+        """The find SOUL must include a v3 自适应执行 section with
+        the 3-tier fallback table. Without it the LLM has no
+        authoritative source for the escalation order."""
+        assert "## 自适应执行 (v3, 2026-06-17)" in SOUL_BODY
+        assert "Tier 1 (preferred)" in SOUL_BODY
+        assert "Tier 2 (fallback)" in SOUL_BODY
+        assert "Tier 3 (last-resort)" in SOUL_BODY
+        # Fallback trigger conditions must be listed
+        assert "Agent not found" in SOUL_BODY
+        assert "not in allow_agents" in SOUL_BODY
+        # Status summary format must be specified
+        assert "[FALLBACK tier=N" in SOUL_BODY
+
+    def test_soul_forbids_tier_skipping(self):
+        """v3 forbids: 跨 Tier 跳级, Tier 2 选非表里 legacy_recon,
+        Tier 3 调 bash/curl/nmap. The SOUL must say so."""
+        assert "跨 Tier 跳级" in SOUL_BODY or "跳级" in SOUL_BODY
+        # bash/curl/nmap forbidden at Tier 3
+        import re
+        m = re.search(r"Tier 3[^\n]{0,200}(bash|curl|nmap)", SOUL_BODY)
+        assert m is not None, "v3 SOUL must explicitly forbid bash/curl/nmap at Tier 3"
+        assert m is not None, (
+            "v3 SOUL must explicitly forbid bash/curl/nmap at Tier 3"
+        )
+
+    def test_attribution_has_v3_fallback_table(self):
+        """ATTRIBUTION must include the v3 fallback table so the
+        LLM can grep for the Tier 2 / Tier 3 mapping per wave."""
+        import importlib
+
+        mod = importlib.import_module("opensquilla.agents.hack-deep-find")
+        attr = mod.ATTRIBUTION_BODY
+        assert "v3 Adaptive Execution Fallback Table" in attr
+        # The Tier 2 column must list the 3 legacy-recon agents
+        assert "`recon`" in attr
+        assert "`intel-collection`" in attr
+        assert "`attack-surface-enumeration`" in attr
+
+    def test_soul_lists_legacy_recon_as_tier2(self):
+        """The Tier 2 family must be the 3 legacy-recon agents
+        (recon / intel-collection / attack-surface-enumeration),
+        NOT additional specialists. Lock the count + names."""
+        import re
+
+        # The Tier 2 paragraph should mention exactly these 3
+        tier2_block = re.search(
+            r"\*\*Tier 2 \(fallback\)\*\*:.*?(?=---|\Z)",
+            SOUL_BODY,
+            re.DOTALL,
+        )
+        assert tier2_block is not None
+        text = tier2_block.group(0)
+        assert "recon" in text
+        assert "intel-collection" in text
+        assert "attack-surface-enumeration" in text
+
+    def test_soul_bans_bash_at_tier3(self):
+        """Tier 3 NORM: 'recon_*' tools only, NEVER bash/curl/nmap.
+        This is the floor under which find may not descend."""
+        import re
+
+        # Find the 严禁 block under v3 自适应执行
+        严禁_match = re.search(
+            r"\*\*严禁\*\*:.*?(?=---|\Z)",
+            SOUL_BODY,
+            re.DOTALL,
+        )
+        assert 严禁_match is not None
+        text = 严禁_match.group(0)
+        for forbidden in ("bash", "exec_command", "nmap", "curl"):
+            assert forbidden in text, f"Tier 3 must forbid {forbidden!r}"
