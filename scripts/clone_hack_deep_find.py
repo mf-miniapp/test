@@ -56,28 +56,33 @@ HACK_DEEP_FIND_NAME = "Hack Deep Find (Recursive Asset Discovery)"
 # the primary path is unavailable. The v3 SOUL_BODY documents the
 # exact escalation order (specialist -> legacy_recon -> recon_* tool).
 SPECIALIST_AGENTS: tuple[str, ...] = (
-    # Phase 2 - network surface (6)
-    "subdomain-discoverer",
-    "ip-resolver",
+    # v4 (2026-06-17): 13 v4-active specialists across 5 tiers.
+    # The 8 retired v3 names (subdomain-discoverer, ip-resolver,
+    # seed-expander, api-surface, parameter-extract, static-asset,
+    # auth-mapper, cookie-header) are NOT in this tuple; their
+    # subdirectories stay on disk for reference but the clone
+    # script does not register them.
+    #
+    # Tier 1 - network surface (5)
+    "domain-expander",        # v4 merge: subdomain-discoverer + ip-resolver + seed-expander
     "port-scanner",
     "service-fingerprint",
     "endpoint-crawler",
-    "leaf-verifier",
-    # Batch 1 - web surface + CVE component view (5)
-    "service-detailed",
+    "storage-discoverer",     # v4 rename: cloud-storage -> storage-discoverer
+    # Tier 2 - web surface (4)
     "webapp-discoverer",
-    "api-surface",
-    "parameter-extract",
-    "static-asset",
-    # Batch 2 - auth + cookie/header (2)
-    "auth-mapper",
-    "cookie-header",
-    # Batch 3 - cloud storage + cross-layer secret (2)
-    "cloud-storage",
+    "component-detector",     # v4 rename: service-detailed -> component-detector
+    "api-surface-mapper",     # v4 merge: api-surface + parameter-extract
+    "content-classifier",     # v4 merge: static-asset + auth-mapper + cookie-header
+    # Tier 3 - horizontal / cross-layer (2)
+    "osint-collector",        # v4 NEW
     "secret-scanner",
-    # Batch 4 - horizontal seed expansion (1)
-    "seed-expander",
-    # Phase 3 handoff target.
+    # Tier 4 - synthesis (1)
+    "surface-aggregator",     # v4 NEW
+    # Tier 5 - terminal (1)
+    "leaf-verifier",
+    # Phase 3 handoff target (not a v4 specialist but must be
+    # in allow_agents for the F-final sessions_spawn).
     "hack-deep",
 )
 
@@ -194,14 +199,20 @@ async def _register_in_config() -> None:
     )
 
     description = (
-        "Pure LLM orchestrator for recursive asset discovery (v3 redesign, "
-        "2026-06-17). Drives 16 recon specialists (Phase 2 + Batch 1-4) via "
+        "Pure LLM orchestrator for recursive asset discovery (v4 redesign, "
+        "2026-06-17). Drives 13 v4 recon specialists across 5 tiers via "
         "sessions_spawn; on specialist unavailability it falls back to the "
         "3-agent legacy-recon family (recon / intel-collection / "
         "attack-surface-enumeration), then to direct recon_* tool calls. "
+        "v4 consolidates 16 v3 specialists into 13 by merging 3 same-source "
+        "splits (subdomain+ip+seed -> domain-expander; api+parameter -> "
+        "api-surface-mapper; static+auth+cookie-header -> content-classifier) "
+        "and adding 2 new specialists (osint-collector for external-source "
+        "breadth, surface-aggregator for typed attack-priority-v1 synthesis). "
         "Manages a persistent AssetTree via asset_tree_* tools. Never "
         "invokes exploit / payload tools. Phase 3 wires the "
-        "find-complete-v1 handoff to hack-deep at end-of-run."
+        "find-complete-v1 handoff (now also carrying attack_priority_evidence "
+        "from surface-aggregator) to hack-deep at end-of-run."
     )
 
     ids = {a.id for a in cfg.agents}

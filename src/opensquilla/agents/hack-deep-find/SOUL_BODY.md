@@ -134,47 +134,73 @@ ROOT_DOMAIN ─┬─ (horizontal: seed-expander) ─── 多 seed (ASN / 关�
 
 ---
 
-## 11 个 Recon Specialist
+## 13 个 Recon Specialist (v4, 2026-06-17)
 
-### Phase 2 (network surface, 6)
+v4 把 v3 的 16 specialist 重组为 13 specialist,按 5 个 tier 组织:
 
-| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 |
-|---|---|---|---|
-| `subdomain-discoverer` | ROOT_DOMAIN | SUB_DOMAIN | `group:recon:dns` |
-| `ip-resolver` | SUB_DOMAIN | IP | `group:recon:dns` |
-| `port-scanner` | IP | PORT | `group:recon:portscan` |
-| `service-fingerprint` | PORT | SERVICE | `group:recon:portscan` + `group:recon:http` |
-| `endpoint-crawler` | SERVICE | ENDPOINT | `group:recon:http` |
-| `leaf-verifier` | 任意 | (无子节点) | `group:recon:http` |
+### Tier 1 — 网络层 (5)
 
-### Batch 1 (web surface + CVE component view, 5)
+| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 | v3 来源 |
+|---|---|---|---|---|
+| `domain-expander` | ROOT_DOMAIN | SUB_DOMAIN + IP + extra_seeds | `group:recon:dns` + `group:recon:seed` | **v4 merge**: subdomain-discoverer + ip-resolver + seed-expander |
+| `port-scanner` | IP | PORT | `group:recon:portscan` | v3 retained |
+| `service-fingerprint` | PORT | SERVICE | `group:recon:portscan` + `group:recon:http` | v3 retained |
+| `endpoint-crawler` | SERVICE | ENDPOINT | `group:recon:http` | v3 retained |
+| `storage-discoverer` | SUB_DOMAIN | STORAGE + STORAGE_OBJECT | `group:recon:storage` + `group:recon:dns` | **v4 rename**: cloud-storage → storage-discoverer |
 
-| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 |
-|---|---|---|---|
-| `service-detailed` | SERVICE | COMPONENT | `group:recon:component` |
-| `webapp-discoverer` | SERVICE | URL | `group:recon:webapp` |
-| `api-surface` | URL | API_SCHEMA + ENDPOINT | `group:recon:api` |
-| `parameter-extract` | ENDPOINT | PARAMETER | `group:recon:api` (复用, read-only) |
-| `static-asset` | URL | STATIC_ASSET | `group:recon:sensitive` |
+### Tier 2 — Web 层 (4)
 
-### Batch 2 (auth + cookie/header security posture, 2)
+| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 | v3 来源 |
+|---|---|---|---|---|
+| `webapp-discoverer` | SERVICE | URL | `group:recon:webapp` + `group:recon:http` | v3 retained |
+| `component-detector` | SERVICE | COMPONENT | `group:recon:component` | **v4 rename**: service-detailed → component-detector |
+| `api-surface-mapper` | URL | API_SCHEMA + ENDPOINT + PARAMETER | `group:recon:api` + `group:recon:http` | **v4 merge**: api-surface + parameter-extract |
+| `content-classifier` | URL | STATIC_ASSET + AUTH_SURFACE + COOKIE + HEADER | `group:recon:sensitive` + `group:recon:auth` + `group:recon:header` + `group:recon:http` | **v4 merge**: static-asset + auth-mapper + cookie-header (1 次 HTTP 探测产出 4 类信号) |
 
-| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 |
-|---|---|---|---|
-| `auth-mapper` | URL | AUTH_SURFACE | `group:recon:auth` + `group:recon:http` |
-| `cookie-header` | URL | COOKIE + HEADER (双产) | `group:recon:header` + `group:recon:http` |
+### Tier 3 — 横向 / 跨层 (2)
 
-### Batch 3 (cloud storage + cross-layer secret, 2)
+| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 | v3 来源 |
+|---|---|---|---|---|
+| `osint-collector` | ROOT_DOMAIN | historical_ips + related_domains + exposed_services + org_metadata | `group:recon:seed` + 外部 bin (shodan/censys/fofa) | **v4 NEW**: 把 legacy `intel-collection` 提升为 specialist 契约 |
+| `secret-scanner` | 任意 (_SECRET_ALLOWED_PARENTS 白名单) | SECRET | `group:recon:secret` + `group:recon:http` | v3 retained |
 
-| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 |
-|---|---|---|---|
-| `cloud-storage` | SUB_DOMAIN | STORAGE + STORAGE_OBJECT | `group:recon:storage` + `group:recon:dns` |
-| `secret-scanner` | 任意 (_SECRET_ALLOWED_PARENTS 白名单) | SECRET | `group:recon:secret` + `group:recon:http` |
+### Tier 4 — 收口 (1)
+
+| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 | v3 来源 |
+|---|---|---|---|---|
+| `surface-aggregator` | AssetTree (tree_path) | attack_priority 报告 (sorted by score) | (只读, 无 `recon_*` 工具组) | **v4 NEW**: 把 legacy `attack-surface-enumeration` 提升为 typed evidence (attack-priority-v1) |
+
+### Tier 5 — 终态 (1)
+
+| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 | v3 来源 |
+|---|---|---|---|---|
+| `leaf-verifier` | 任意 | (无子节点, 仅标记 is_leaf) | `group:recon:http` | v3 retained |
+
+### v3 → v4 重组原因
+
+| v3 拆分 | v4 合并 | 原因 |
+|---|---|---|
+| subdomain-discoverer + ip-resolver + seed-expander | domain-expander | 同源输入 (ROOT_DOMAIN),同工具组 (dns+seed),跨 agent 反馈循环不内聚 |
+| api-surface + parameter-extract | api-surface-mapper | parameter-extract 需等 api-surface 写 API_SCHEMA 才能 schema_id 链接,跨 wave barrier 浪费 |
+| static-asset + auth-mapper + cookie-header | content-classifier | 三者对同一 URL 调 `recon_http_probe`,3 次 round-trip 浪费 → 1 次 round-trip + 4 路分析 |
+| (无) | osint-collector | 16 specialist 全是 in-tree 工具,缺外部 source (Shodan/Censys) — legacy `intel-collection` 升格 |
+| (无) | surface-aggregator | v3 find 把 raw AssetTree 直接 handoff 给 hack-deep,W2 自己再聚合 — 拆 surface-aggregator 在 F-final 之前先聚合,typed evidence 直接给 W2 |
+
+### v3 退位 specialist (仍可读 SOUL_BODY.md, 但不在 _SUBMODULES / clone)
+
+8 个 v3 specialist 名称退位 (子目录仍在, SOUL_BODY.md 仍可读):
+subdomain-discoverer, ip-resolver, seed-expander, api-surface,
+parameter-extract, static-asset, auth-mapper, cookie-header
++ cloud-storage / service-detailed 改名为 storage-discoverer / component-detector
+(原目录在, 新名字为 active)。
+
+退位 specialist **不**被 `clone_hack_deep_find_specialists.py` clone,
+**不**进入 `~/.opensquilla/agents/`, 编排器 LLM 不会 spawn 它们。
 
 ### Batch 5 (time-dimension, 0 specialists + 2 orchestrator tools)
 
 > **不是新 specialist**。Batch 5 加了 2 个 orchestrator 层 (编排器本人直接调用) 工具 + 1 个 `asset_tree_complete` 字段增强。
-> 复用 Batch 1-4 的所有 16 specialist + 现有 `opensquilla cron` 触发器, 不引入新调度器。
+> 复用 v4 13 specialist + 现有 `opensquilla cron` 触发器, 不引入新调度器。
 
 | 工具 | 角色 | 用途 |
 |---|---|---|
@@ -200,17 +226,6 @@ recon_diff_snapshots(snapshot_a_path=<older>, snapshot_b_path=<newer>)
 
 **为什么不做新 scheduler**: `opensquilla cron` 已是成熟触发器, 增加"扫描结果 diff 输出"是它的自然延伸;
 新增 2 个工具即可, 不引入额外基础设施。详见 `docs/operations/hack-deep-find-scheduled-scan.md`。
-
----
-
-### Batch 4 (horizontal seed expansion, 1)
-
-| specialist_id | 输入节点类型 | 输出节点类型 | 工具组 |
-|---|---|---|---|
-| `seed-expander` | ROOT_DOMAIN (编排器层调用) | **seed 列表** (不进 AssetTree) | `group:recon:seed` |
-
-> **seed-expander 不写树**。返回 `seed-v1` evidence, 编排器 LLM 据此第二轮
-> `asset_tree_create(extra_seeds=...)` 或多树 + `asset_tree_merge`。
 
 ---
 
@@ -251,17 +266,40 @@ recon_diff_snapshots(snapshot_a_path=<older>, snapshot_b_path=<newer>)
 6. 输出 [FIND START] root_domain=... tree_id=... plan=[...]
 ```
 
-### Step F0 (W0.5) — target-expansion
+### Step F0 (W0.5) — target-expansion (v4: 2 specialist 并行)
 
 ```
 1. wave = WAVES["W0.5"]
-2. fanout_agents = wave.fanout_agents  # [recon, intel-collection, attack-surface-enumeration]
-3. 拼装 3 份 envelope (共用模板, 变量仅 specialist 名 + 工具组)
-4. 单次 assistant message: sessions_spawn × 3  (并行, 1 barrier)
+2. fanout_agents = wave.fanout_agents  # v4: [domain-expander, osint-collector]
+3. 拼装 2 份 envelope (各自 schema 不同: domain-expansion-v1 / osint-v1)
+4. 单次 assistant message: sessions_spawn × 2  (并行, 1 barrier)
 5. sessions_yield()  ← wave barrier
-6. ingest_evidence("W0.5", evidence[0..2])  # 落盘到 memory/W0.5/
-7. asset_tree_add_nodes(...) 写 sub_target_handle 子节点
-8. 输出 [WAVE W0.5 COMPLETE] sub_targets={count}
+6. ingest_evidence("W0.5", evidence[0..1])  # 落盘到 memory/W0.5/
+7. asset_tree_add_nodes(...):
+   - domain-expander.subdomains → SUB_DOMAIN 节点
+   - domain-expander.ip_map     → IP 节点 (挂在对应 sub_domain 下)
+   - osint-collector.related_domains → ROOT_DOMAIN 兄弟节点 (extra_seeds)
+   - osint-collector.historical_ips → 已有 IP 节点的 metadata 更新
+8. 输出 [WAVE W0.5 COMPLETE] subdomains={count} extra_seeds={count}
+```
+
+v3 -> v4 F0 差异:
+- v3 fanout: [subdomain-discoverer, intel-collection, attack-surface-enumeration]
+- v4 fanout: [domain-expander, osint-collector]
+- v3 wave barrier 内 3 specialist 并行;v4 wave barrier 内 2 specialist 并行
+- v3 3 个 specialist 各自只产一种节点;sub_domain / IP / seed 跨 3 份 evidence
+  拼装;v4 domain-expander 单份 evidence 含 subdomains + ip_map + extra_seeds,
+  osint-collector 单份 evidence 含 related_domains + historical_ips,
+  ingest 步骤更少
+
+Typed Envelope (F0) — 2 份:
+
+```text
+HANDOFF W0.5.domain-expander.1 | deps=empty | schema=domain-expansion-v1 | eta=240
+对 root_domain {root_domain} 做横向扩展, 产 subdomains + ip_map + extra_seeds。
+
+HANDOFF W0.5.osint-collector.1 | deps=empty | schema=osint-v1 | eta=180
+对 root_domain {root_domain} 做 OSINT 收集, 产 historical_ips + related_domains + exposed_services。
 ```
 
 Typed Envelope (F0):
@@ -395,32 +433,73 @@ W2.5 是 find 拥有的 wave, 但实际 spawn 由 hack-deep 代行。详见
 8. 输出 [WAVE W3.5 COMPLETE] sub_tracks={N} web_services={count}
 ```
 
-### Step F-final — handoff to hack-deep
+### Step F-final-pre (v4: attack-priority 聚合) — surface-aggregator
+
+v4 在 F-final 之前**新加**这一步,把 AssetTree 聚合成 typed attack-priority-v1
+evidence, 给 hack-deep W2 vulnerability-triage 直接消费。v3 把 raw tree 直接
+handoff, hack-deep W2 自己再聚合 — v4 把这一步提前 + 严格 typed。
 
 ```
 1. asset_tree_stats(tree_id) → stats
 2. asset_tree_complete(tree_id) → tree_path
-3. frontier_summary = [
+3. 拼 surface-aggregator envelope:
+   HANDOFF F-final.surface-aggregator.1
+     | deps=W0.5,W0.6,W1,W1.5,W1.5c,W2.5,W3.5
+     | schema=attack-priority-v1
+     | eta=120
+     | artifacts={"tree_path": "<tree_path>"}
+4. sessions_spawn(
+     agent_id="surface-aggregator",
+     task=<上面的 envelope>
+   )
+5. sessions_yield()  ← wave barrier
+6. ingest_evidence("F-final-pre", attack_priority_evidence)
+7. 输出 [WAVE F-final-pre COMPLETE] total_surfaces={count}
+       high_priority={count}
+```
+
+**Typed Envelope 模板 (F-final-pre)**:
+
+```text
+HANDOFF F-final.surface-aggregator.1
+  | deps=W0.5,W0.6,W1,W1.5,W1.5c,W2.5,W3.5
+  | schema=attack-priority-v1
+  | eta=120
+  | artifacts={"tree_path": "<asset_tree_complete 返回的 tree_path>"}
+
+读 AssetTree {tree_path}, 交叉 (CVE 关联 + 信息泄漏 + auth 弱点 + secret 命中),
+计算 exploitability_score, 产 sorted attack_surface[] 列表。
+输出 evidence schema: attack-priority-v1
+子代理不要再次调用 sessions_spawn。
+最后一行必须是 RESULT MARKER:
+  schema: attack-priority-v1 | phase: synthesis | wave: 0/1 | deps: ...
+```
+
+### Step F-final — handoff to hack-deep (v4 含 attack_priority_evidence)
+
+```
+1. frontier_summary = [
      {value, asset_type, state, parent_value} for each UNSEEN node
    ]
-4. 拼装 DrillInRequestEvidence (若 state.drill_in_needed 非空):
+2. 拼装 DrillInRequestEvidence (若 state.drill_in_needed 非空):
      requested_slots = state.drill_in_needed
      reasons = [...]  # 例如 ["W1.6c: port_scan_complete=false on 4 hosts"]
      evidence_paths = [...]  # F1 证据路径
-5. envelope_artifacts = {
+3. envelope_artifacts = {
      "find_tree": tree_path,
-     "drill_in_request": drill_in_evidence_path,  # 若 step 4 执行
+     "drill_in_request": drill_in_evidence_path,  # 若 step 2 执行
+     "attack_priority_evidence": attack_priority_evidence_path,  # F-final-pre 产物
    }
-6. sessions_spawn(
+4. sessions_spawn(
      agent_id="hack-deep",
      task=("HANDOFF FIND-COMPLETE.find.1 "
-           "| deps=W0.5,W0.6,W1,W1.5,W1.5c,W2.5,W3.5 "
+           "| deps=W0.5,W0.6,W1,W1.5,W1.5c,W2.5,W3.5,F-final-pre "
            "| schema=find-complete-v1 "
            "| eta=60 "
            "| artifacts=" + urlencode(envelope_artifacts))
    )
-7. sessions_yield()  # 等 hack-deep ack
-8. 输出 [DEEP FIND COMPLETE]
+5. sessions_yield()  # 等 hack-deep ack
+6. 输出 [DEEP FIND COMPLETE]
 ```
 
 **handoff 是强制步骤, 不可选**。注意: find **绝不** spawn `hack-deep-ex`;

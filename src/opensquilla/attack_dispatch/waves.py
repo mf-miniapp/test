@@ -222,10 +222,27 @@ WAVES: dict[str, WaveSpec] = {
     ),
     "W0.5": _w(
         "W0.5", LayerName.BREADTH.value, None,
-        "sub_target_handle-v1",  # NEW: produces list of SubTargetHandle
+        "sub_target_handle-v1",  # v3 name retained; v4 still produces
+                                  # SubTargetHandleList on the surface
+                                  # even though the 2 v4 specialists
+                                  # internally use domain-expansion-v1
+                                  # and osint-v1 evidence shapes.
         deps=("W0",),
         fanout="static_fanout",
-        fanout_agents=("recon", "intel-collection", "attack-surface-enumeration"),
+        # v4 (2026-06-17): W0.5 fanout is now the 2 v4 specialists
+        # that own the root_domain tier:
+        #   - domain-expander:  in-tree DNS + IP + extra_seeds (was v3's
+        #                       3-way split subdomain-discoverer +
+        #                       ip-resolver + seed-expander)
+        #   - osint-collector:  external-source breadth (Shodan / Censys
+        #                       / FOFA / VirusTotal); v3's legacy
+        #                       intel-collection promoted to the v4
+        #                       specialist contract.
+        # Net: -1 specialist in this wave (3 -> 2) with no
+        # coverage loss (domain-expander internally does what
+        # the v3 trio did; osint-collector covers the Shodan/Censys
+        # use case the v3 trio did not).
+        fanout_agents=("domain-expander", "osint-collector"),
         drill_in_allowed=False,
         owner_agent="hack-deep-find",
     ),

@@ -23,12 +23,23 @@ SOUL_BODY = _hack_deep_find_pkg.SOUL_BODY
 _specialists_pkg = importlib.import_module(
     "opensquilla.agents.hack-deep-find.specialists"
 )
+# v4 (2026-06-17): the 13 v4-active specialists. v3 retired
+# specialists (ip_resolver, subdomain_discoverer, ...) are no
+# longer aliased on the package. We keep a small set of snake_case
+# aliases here for the test body to use.
 endpoint_crawler = _specialists_pkg.endpoint_crawler
-ip_resolver = _specialists_pkg.ip_resolver
+domain_expander = _specialists_pkg.domain_expander
 leaf_verifier = _specialists_pkg.leaf_verifier
 port_scanner = _specialists_pkg.port_scanner
 service_fingerprint = _specialists_pkg.service_fingerprint
-subdomain_discoverer = _specialists_pkg.subdomain_discoverer
+storage_discoverer = _specialists_pkg.storage_discoverer
+component_detector = _specialists_pkg.component_detector
+webapp_discoverer = _specialists_pkg.webapp_discoverer
+api_surface_mapper = _specialists_pkg.api_surface_mapper
+content_classifier = _specialists_pkg.content_classifier
+osint_collector = _specialists_pkg.osint_collector
+secret_scanner = _specialists_pkg.secret_scanner
+surface_aggregator = _specialists_pkg.surface_aggregator
 
 
 class TestHackDeepFindSoul:
@@ -156,11 +167,8 @@ class TestSpecialistPackages:
             f"{name}.SOUL_BODY must forbid sessions_spawn"
         )
 
-    def test_subdomain_discoverer(self):
-        self._check("subdomain-discoverer", subdomain_discoverer.SOUL_BODY)
-
-    def test_ip_resolver(self):
-        self._check("ip-resolver", ip_resolver.SOUL_BODY)
+    def test_domain_expander(self):
+        self._check("domain-expander", domain_expander.SOUL_BODY)
 
     def test_port_scanner(self):
         self._check("port-scanner", port_scanner.SOUL_BODY)
@@ -171,24 +179,49 @@ class TestSpecialistPackages:
     def test_endpoint_crawler(self):
         self._check("endpoint-crawler", endpoint_crawler.SOUL_BODY)
 
+    def test_storage_discoverer(self):
+        self._check("storage-discoverer", storage_discoverer.SOUL_BODY)
+
+    def test_webapp_discoverer(self):
+        self._check("webapp-discoverer", webapp_discoverer.SOUL_BODY)
+
+    def test_component_detector(self):
+        self._check("component-detector", component_detector.SOUL_BODY)
+
+    def test_api_surface_mapper(self):
+        self._check("api-surface-mapper", api_surface_mapper.SOUL_BODY)
+
+    def test_content_classifier(self):
+        self._check("content-classifier", content_classifier.SOUL_BODY)
+
+    def test_osint_collector(self):
+        self._check("osint-collector", osint_collector.SOUL_BODY)
+
+    def test_secret_scanner(self):
+        self._check("secret-scanner", secret_scanner.SOUL_BODY)
+
+    def test_surface_aggregator(self):
+        self._check("surface-aggregator", surface_aggregator.SOUL_BODY)
+
     def test_leaf_verifier(self):
         self._check("leaf-verifier", leaf_verifier.SOUL_BODY)
 
-    def test_all_specialists_have_distinct_ids(self):
-        """Each specialist's SOUL must reference its own id (not a sibling's)."""
+    def test_all_v4_specialists_have_distinct_ids(self):
+        """Each v4 specialist's SOUL must reference its own id (not a sibling's)."""
         souls = {
-            "subdomain-discoverer": subdomain_discoverer.SOUL_BODY,
-            "ip-resolver": ip_resolver.SOUL_BODY,
+            "domain-expander": domain_expander.SOUL_BODY,
             "port-scanner": port_scanner.SOUL_BODY,
             "service-fingerprint": service_fingerprint.SOUL_BODY,
             "endpoint-crawler": endpoint_crawler.SOUL_BODY,
+            "storage-discoverer": storage_discoverer.SOUL_BODY,
+            "webapp-discoverer": webapp_discoverer.SOUL_BODY,
+            "component-detector": component_detector.SOUL_BODY,
+            "api-surface-mapper": api_surface_mapper.SOUL_BODY,
+            "content-classifier": content_classifier.SOUL_BODY,
+            "osint-collector": osint_collector.SOUL_BODY,
+            "secret-scanner": secret_scanner.SOUL_BODY,
+            "surface-aggregator": surface_aggregator.SOUL_BODY,
             "leaf-verifier": leaf_verifier.SOUL_BODY,
         }
         for sid, soul in souls.items():
             assert sid in soul, f"{sid}.SOUL_BODY does not self-identify"
-        # And each one should NOT confuse itself with another — sanity check
-        assert "ip-resolver" in ip_resolver.SOUL_BODY
-        assert "ip-resolver" not in subdomain_discoverer.SOUL_BODY or \
-               "subdomain-discoverer" in subdomain_discoverer.SOUL_BODY, (
-            "subdomain-discoverer should self-identify"
-        )

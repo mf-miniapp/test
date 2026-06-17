@@ -251,16 +251,29 @@ class TestCloneScriptHackDeepAllowAgent:
         spec.loader.exec_module(mod)
 
         assert "hack-deep" in mod.SPECIALIST_AGENTS
-        # Plus all 6 recon specialists
-        for sid in (
-            "subdomain-discoverer",
-            "ip-resolver",
+        # v4: 13 v4-active specialists (was 6 Phase 2 in v3)
+        v4_specialists = (
+            # Tier 1 - network surface
+            "domain-expander",
             "port-scanner",
             "service-fingerprint",
             "endpoint-crawler",
+            "storage-discoverer",
+            # Tier 2 - web surface
+            "webapp-discoverer",
+            "component-detector",
+            "api-surface-mapper",
+            "content-classifier",
+            # Tier 3 - horizontal / cross-layer
+            "osint-collector",
+            "secret-scanner",
+            # Tier 4 - synthesis
+            "surface-aggregator",
+            # Tier 5 - terminal
             "leaf-verifier",
-        ):
-            assert sid in mod.SPECIALIST_AGENTS, f"missing {sid}"
+        )
+        for sid in v4_specialists:
+            assert sid in mod.SPECIALIST_AGENTS, f"v4 specialist {sid} missing"
 
 
 # ── ATTRIBUTION ──────────────────────────────
@@ -611,7 +624,7 @@ class TestHackDeepExSoulV2Contract:
 
 
 class TestV3AdaptiveExecution:
-    def test_clone_script_writes_fallback_agents(self):
+    def test_clone_script_writes_v4_specialists(self):
         """clone_hack_deep_find.py must expose FALLBACK_AGENTS and
         merge them into the allow_agents whitelist (alongside
         SPECIALIST_AGENTS + hack-deep)."""
@@ -629,9 +642,26 @@ class TestV3AdaptiveExecution:
         assert "recon" in mod.FALLBACK_AGENTS
         assert "intel-collection" in mod.FALLBACK_AGENTS
         assert "attack-surface-enumeration" in mod.FALLBACK_AGENTS
-        # 16 specialists are still the primary list
-        assert "subdomain-discoverer" in mod.SPECIALIST_AGENTS
-        assert "seed-expander" in mod.SPECIALIST_AGENTS
+        # v4: 13 active specialists (NOT the 8 retired v3 names)
+        v4_active = (
+            "domain-expander", "port-scanner", "service-fingerprint",
+            "endpoint-crawler", "storage-discoverer", "webapp-discoverer",
+            "component-detector", "api-surface-mapper", "content-classifier",
+            "osint-collector", "secret-scanner", "surface-aggregator",
+            "leaf-verifier",
+        )
+        for name in v4_active:
+            assert name in mod.SPECIALIST_AGENTS, f"v4 specialist {name} missing"
+        # v3 retired: NOT in SPECIALIST_AGENTS
+        for name in (
+            "subdomain-discoverer", "ip-resolver", "seed-expander",
+            "api-surface", "parameter-extract", "static-asset",
+            "auth-mapper", "cookie-header",
+        ):
+            assert name not in mod.SPECIALIST_AGENTS, (
+                f"v3 retired {name} should not be in v4 SPECIALIST_AGENTS"
+            )
+        assert len(mod.SPECIALIST_AGENTS) == 14  # 13 v4 + hack-deep
 
     def test_coordinator_tools_allow_all_recon_groups(self):
         """For Tier 3 to work (find LLM calling recon_* tools

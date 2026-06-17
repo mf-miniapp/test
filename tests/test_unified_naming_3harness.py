@@ -11,9 +11,14 @@ Asserts:
    opensquilla.agents.hack_deep_find
 3. Each package exposes ``SOUL_BODY`` and ``ATTRIBUTION_BODY`` as
    non-empty strings.
-4. The 6 hack-deep-find specialist subpackages exist with hyphenated
-   names: subdomain-discoverer, ip-resolver, port-scanner,
-   service-fingerprint, endpoint-crawler, leaf-verifier.
+4. The 13 v4 hack-deep-find specialist subpackages exist with hyphenated
+   names: domain-expander, port-scanner, service-fingerprint,
+   endpoint-crawler, storage-discoverer, webapp-discoverer,
+   component-detector, api-surface-mapper, content-classifier,
+   osint-collector, secret-scanner, surface-aggregator, leaf-verifier.
+   (v3 16-specialist list was consolidated in 2026-06-17 by 3-way merge
+   + 2 NEW; the 8 retired v3 names remain on disk for historical
+   reference but are NOT exposed via the specialists package.)
 5. The specialists package's __init__ exposes BOTH the hyphenated
    attribute name (e.g. ``endpoint-crawler``) and the snake_case
    alias (``endpoint_crawler``) for backward compat.
@@ -71,11 +76,23 @@ def test_old_underscore_packages_gone() -> None:
 
 
 SPECIALISTS = (
-    "subdomain-discoverer",
-    "ip-resolver",
+    # v4 active (13). v3 retired names
+    # (subdomain-discoverer, ip-resolver, seed-expander, api-surface,
+    #  parameter-extract, static-asset, auth-mapper, cookie-header)
+    # are NOT in this tuple; their directories remain on disk for
+    # historical reference but the package no longer exposes them.
+    "domain-expander",
     "port-scanner",
     "service-fingerprint",
     "endpoint-crawler",
+    "storage-discoverer",
+    "webapp-discoverer",
+    "component-detector",
+    "api-surface-mapper",
+    "content-classifier",
+    "osint-collector",
+    "secret-scanner",
+    "surface-aggregator",
     "leaf-verifier",
 )
 
@@ -113,11 +130,18 @@ def test_specialists_package_exposes_hyphen_and_alias() -> None:
         assert len(mod.SOUL_BODY) > 200
     # Snake-case aliases (backward compat)
     for snake, hyphen in (
-        ("subdomain_discoverer", "subdomain-discoverer"),
-        ("ip_resolver", "ip-resolver"),
+        ("domain_expander", "domain-expander"),
         ("port_scanner", "port-scanner"),
         ("service_fingerprint", "service-fingerprint"),
         ("endpoint_crawler", "endpoint-crawler"),
+        ("storage_discoverer", "storage-discoverer"),
+        ("webapp_discoverer", "webapp-discoverer"),
+        ("component_detector", "component-detector"),
+        ("api_surface_mapper", "api-surface-mapper"),
+        ("content_classifier", "content-classifier"),
+        ("osint_collector", "osint-collector"),
+        ("secret_scanner", "secret-scanner"),
+        ("surface_aggregator", "surface-aggregator"),
         ("leaf_verifier", "leaf-verifier"),
     ):
         assert hasattr(pkg, snake), f"missing {snake} alias"

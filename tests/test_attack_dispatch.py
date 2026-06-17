@@ -343,11 +343,18 @@ class TestWaves:
         assert spec.drill_in_allowed is False
 
     def test_w0_5_target_expansion_registered(self) -> None:
+        # v4 (2026-06-17): W0.5 fanout_agents is now the 2 v4
+        # specialists that own the root_domain tier:
+        # domain-expander (in-tree DNS + IP + extra_seeds; v3's
+        # 3-way split subdomain-discoverer + ip-resolver +
+        # seed-expander consolidated) + osint-collector
+        # (external-source breadth; v3's legacy intel-collection
+        # promoted to specialist contract).
         spec = get_wave("W0.5")
         assert spec.layer == LayerName.BREADTH.value
         assert spec.fanout == "static_fanout"
         assert spec.fanout_agents == (
-            "recon", "intel-collection", "attack-surface-enumeration",
+            "domain-expander", "osint-collector",
         )
         assert spec.evidence_schema == "sub_target_handle-v1"
         assert spec.deps == ("W0",)
@@ -2010,16 +2017,16 @@ class TestExecutor:
         assert r.drill_in_merged is False
         assert r.drill_in_overlay == {}
 
-    def test_w0_5_static_fanout_creates_three_envelopes(self) -> None:
+    def test_w0_5_static_fanout_creates_two_envelopes(self) -> None:
+        # v4 (2026-06-17): W0.5 fanout is 2 v4 specialists
+        # (domain-expander + osint-collector), not 3 v3 agents.
         ex = DispatchExecutor(specialist_fn=_make_specialist_double(), resume=False)
         state = DispatchState()
         ex.run_wave("W0", state, target="example.com")
         ex.run_wave("W0.5", state, target="example.com")
-        # W0.5 is static_fanout of 3 agents (recon/intel/surface)
-        assert state.fanout_counts["W0.5"] == 3
+        assert state.fanout_counts["W0.5"] == 2
         w05 = next(r for r in ex.run(target="example.com", state=state)
                    if r.wave == "W0.5")
-        # already run, so specialist_calls from cached
         assert w05.wave == "W0.5"
         assert state.evidence["W0.5"].handles  # has subdomains
 
