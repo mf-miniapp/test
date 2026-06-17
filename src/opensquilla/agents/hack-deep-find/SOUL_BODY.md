@@ -483,6 +483,34 @@ go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
   `sessions_spawn(agent_id="hack-deep", task=<find-complete-v1 envelope>)`
   (F-final 收口)
 
+## v4.5.2 全局加速原则 (speedup, 2026-06-18)
+
+所有 wave 编排必须遵循以下 5 条以达到 5-10× 加速:
+
+1. **批量化 (batch)**: 一次 spawn 处理一批, 不用 1 spawn 处理 1 节点
+   - port-scanner: 5-10 IP 一批 (调 recon_port_batch)
+   - service-fingerprint: 10-20 port 一批 (调 recon_url_validate_batch for web + recon_grab_banner for others)
+   - webapp-discoverer / component-detector: 3-5 service 一批
+   - content-classifier / api-surface-mapper / webapp-discoverer: 4 url 一批
+
+2. **fire-and-forget spawn**: 同一 turn 内**多个** sessions_spawn 调用
+   可以连续写, **不 await** 返回值 (LLM 不要 sleep 等待 child session_id)
+   - max_children_per_session=30 + subagent_reserved_slots=6 → 同
+     时可跑 6 个 specialist, 总队列 30
+   - 编排器一个 turn 内 fire 6 spawn, 下一 turn 检查 status, 全部
+     complete 后才进 barrier
+
+3. **滑动 barrier (sliding batch barrier)**: 不要等"全 wave 跑完"才
+   yield, 按 batch_size=10/20/5 分批, 跑完一批 yield 一次
+   - F1: 63 IP 拆 7 批 (10 IP/batch), 跑完 1 批 yield 1 次
+   - F1.5: 30 service 拆 6 批 (5 service/batch), 跑完 1 批 yield 1 次
+
+4. **特殊 tool 优先**: batch 工具 (recon_port_batch / recon_url_validate_batch)
+   替代单条工具;naabu 替代 stdlib; nmap 替代单条 banner
+
+5. **失败跳过不死循环**: 整批失败 → 输出空 evidence + error, 留给
+   hack-deep-find F-pre 标 ABANDONED, **不重试**
+
 **fanout 规则**: 编排器从 `WAVES[<wave_id>].fanout_agents` 读出 fanout 列表,
 **不** 自行查 specialist 表。fanout=`static_fanout` 时直接遍历;fanout=
 `dynamic_fanout` 时按 `fanout_strategy` 计算 sub-track_count 后再遍历。
@@ -645,6 +673,11 @@ go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
    sessions_spawn(agent_id="osint-collector", task=<上面 envelope 2>)
    (并行, 1 barrier)
 5. sessions_yield()  ← wave barrier
+
+**v4.5.2 加速点**: W0.5 本身就是 2 specialist 并发 (domain-expander + osint-collector),
+单 barrier 已是最优。但若 root_domain 已知有多个 seed (e.g. "10jqka.com.cn" + "myhexin.com"),
+编排器可以在同一 envelope 里**带上多个 root_domain**, 让 domain-expander 一次处理,
+省 1 个 spawn 调用。
 6. ingest_evidence("W0.5", evidence[0..1])  # 落盘到 memory/W0.5/
 7. **v4.5 incremental diff** (only when state.first_run == False):
    a. current_evidence = 合并 domain-expander + osint-collector 出的
@@ -720,9 +753,11 @@ HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
 2. fanout_agents = wave.fanout_agents  # v4: [port-scanner, service-fingerprint]
 3. **前置装载**: 从 state 调 `asset_tree_find_unseen("ip")` 拿到
    所有 ip:unseen 节点, 记为 ip_list
-4. **port-scanner 阶段** (per ip, batch):
-   a. 对每个 ip 派 1 份 envelope, **agent_id 必须字面是 `port-scanner`** (来自 WAVES["W1"].fanout_agents[0]), 不得替换为 `recon` 或其它 v3 名
-   b. envelope 字符串模板 (LLM 直接按此拼, **不要改名**):
+4. **port-scanner 阶段** (per **ip batch** 5-10 IP 一组, v4.5.2):
+   a. 把 ip_list 拆为 batch_size=5-10 的子批 (per IP origin group 同 AS 优先放一起)
+   b. 对每个子批**派 1 份 envelope**, **agent_id 必须字面是 `port-scanner`** (来自 WAVES["W1"].fanout_agents[0])
+   c. 多个 batch 可在**同一 turn 内 fire-and-forget 多个 sessions_spawn 调用** (LLM 一个 turn 写 N 个 spawn, 不等返回)
+   d. envelope 字符串模板 (LLM 直接按此拼, **不要改名**):
       ```
       HANDOFF FIND-W1.port-scanner.{i} | deps=empty | tree_id={tree_id}
       root_domain={root_domain} | scope=port_scan_one_ip
@@ -736,12 +771,13 @@ HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
    c. sessions_spawn(agent_id="port-scanner", task=<上面 envelope>) × |ip_list|
       → yield → ingest
    d. ingest: port-scanner.ports → PORT 节点 (挂在 ip 下)
-5. **service-fingerprint 阶段** (per port, 全覆盖, 不允许跳过):
+5. **service-fingerprint 阶段** (per **port batch** 10-20 port 一组, v4.5.2, 全覆盖, 不允许跳过):
    a. 重新调 `asset_tree_find_unseen("port")` 拿本轮新增的 port:unseen
       节点, 记为 port_list
-   b. **硬约束**: port_list 必须非空;若空说明 port-scanner 没跑
-      (错误), 不得跳过此步直接进 F1.5
-   c. 对每个 port 派 1 份 envelope, **agent_id 必须字面是 `service-fingerprint`** (来自 WAVES["W1"].fanout_agents[1]):
+   b. 把 port_list 拆为 batch_size=10-20 的子批 (web 端口 + 非 web 端口可混合, specialist 自己分桶)
+   c. **硬约束**: 总 batch 数 * batch_size 必须覆盖 port_list, 不得丢
+   d. 对每个子批**派 1 份 envelope**, **agent_id 必须字面是 `service-fingerprint`** (来自 WAVES["W1"].fanout_agents[1])
+   e. 多个 batch 可在**同一 turn 内 fire-and-forget 多个 sessions_spawn 调用**:
       ```
       HANDOFF FIND-W1.service-fingerprint.{i} | deps=empty | tree_id={tree_id}
       root_domain={root_domain} | scope=service_one_port
@@ -810,20 +846,26 @@ HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
    - service_unseen: 所有 state=UNSEEN 的 SERVICE 节点
    - subdomain_unseen: 所有 state=UNSEEN 的 SUB_DOMAIN 节点
    - url_unseen: 所有 state=UNSEEN 的 URL 节点
-3. **per-service fan-out** (主路径, 这是 web app 探测的真正入口):
-   a. 对每个 service 派 2 个 specialist 并行, **agent_id 必须字面是
-      `webapp-discoverer` 和 `component-detector`** (来自
+3. **per-service fan-out** (主路径, 这是 web app 探测的真正入口, v4.5.2 batch):
+   a. 把 service_unseen 拆为 batch_size=3-5 (每 batch 多个 service)
+   b. 对每个 batch 派 **1 份 envelope** 给 `webapp-discoverer` (它**内部**对每个 service 调
+      `recon_vhost_bruteforce` / `recon_robots_sitemap` / `recon_tech_detect` / `recon_app_fingerprint`,
+      这 4 个工具在 webapp-discoverer 自己的 LLM turn 里**并发调用**, 1 个 specialist 跑 N 个 service)
+   c. 对每个 batch 派 **1 份 envelope** 给 `component-detector` (同样内部并发)
+   d. **结果**: 5 service 一批 = 2 spawn (webapp + component) 替代 v3 的 5×2=10 spawn
+   e. **agent_id 必须字面是 `webapp-discoverer` 和 `component-detector`** (来自
       WAVES["W1.5"].fanout_agents), 不得替换为 `recon` 或其它 v3 名
-   b. envelope 字符串模板 (per service, 2 份独立 spawn):
+   f. envelope 字符串模板 (per **batch**, 2 份独立 spawn):
       ```
       HANDOFF FIND-W1.5.webapp-discoverer.{i} | deps=empty | tree_id={tree_id}
-      root_domain={root_domain} | scope=webapp_one_service
-      ip={ip} | port={port} | service={service_value} | service_node_id={service_node_id} | eta=120
+      root_domain={root_domain} | scope=webapp_batch_services
+      services=[{service1_dict}, {service2_dict}, ...]  # 3-5 个 service 一批
+      eta=180
 
-      对 service {service_value} (ip:port) 跑 web app 边界识别,
+      对以下 {N} 个 service (ip:port) 并发跑 web app 边界识别:
       工具: recon_vhost_bruteforce / recon_robots_sitemap /
-            recon_tech_detect / recon_app_fingerprint
-      输出 evidence schema: webapp-v1, 必须含 url_candidates[]
+            recon_tech_detect / recon_app_fingerprint (每个 service 独立调)
+      输出 evidence schema: webapp-v1, 每个 service 产 1 份 url_candidates[]
       最后一行: `schema: webapp-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
       ```
       ```
@@ -991,20 +1033,24 @@ W2.5 是 find 拥有的 wave, 但实际 spawn 由 hack-deep 代行。详见
 6. for bucket in buckets:               # 编排器 LLM 自己循环
      v4_specialists = ["webapp-discoverer", "content-classifier", "api-surface-mapper"]
      # ↑ 3 个 v4 specialist 并行 (1 barrier per bucket)
-7.   for spec in v4_specialists:
-         # **v4.5.2 硬约束**: spec 字面必须是 3 个 v4 specialist 之一, 不得替换为 `recon`
-         assert spec in ("webapp-discoverer", "content-classifier", "api-surface-mapper"), (
-             f"W3.5 spec must be a v4 specialist, got {spec!r}. "
-             "Use WAVES['W3.5'].fanout_agents list verbatim."
-         )
+7.   # v4.5.2 加速: 3 specialist 同 batch 处理多个 url
+       # 把 web_services 拆 batch_size=4 (每 batch 4 个 url)
+       for batch in batches:
+         for spec in v4_specialists:
+           # **v4.5.2 硬约束**: spec 字面必须是 3 个 v4 specialist 之一, 不得替换为 `recon`
+           assert spec in ("webapp-discoverer", "content-classifier", "api-surface-mapper"), (
+               f"W3.5 spec must be a v4 specialist, got {spec!r}. "
+               "Use WAVES['W3.5'].fanout_agents list verbatim."
+           )
          envelope = f"""
 HANDOFF FIND-W3.5.{spec}.{seq} | deps=W1.5 | tree_id={tree_id}
-root_domain={root_domain} | scope={spec}_one_url
-url={url_value} | url_node_id={url_node_id} | eta=180
+root_domain={root_domain} | scope={spec}_batch_urls
+urls=[{url1}, {url2}, ...]  # 4 个 url 一批
+eta=240
 
-对 url {url_value} 跑 {spec} 专项探测,
-工具: {_TOOL_BY_SPEC[spec]}
-输出 evidence schema: {_SCHEMA_BY_SPEC[spec]}
+对以下 {N} 个 url 并发跑 {spec} 专项探测,
+工具: {_TOOL_BY_SPEC[spec]} (内部对每个 url 独立调)
+输出 evidence schema: {_SCHEMA_BY_SPEC[spec]}, 每个 url 1 份
 最后一行: `schema: {_SCHEMA_BY_SPEC[spec]} | phase: evidence-collection | wave: 0/1 | deps: empty`
 """.strip()
          sessions_spawn(agent_id=spec, task=envelope)

@@ -233,7 +233,7 @@ async def _register_in_config() -> None:
             model="mimo-v2.5-pro",
             tier="c1",
             allowed_tiers=["c1", "c2"],
-            max_history_turns=4,
+            max_history_turns=8,
             enabled=True,
             system_prompt=SOUL_BODY,
             subagents=subagents,
