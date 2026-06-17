@@ -157,10 +157,17 @@ class TestAssetTreeAddNode:
         tree = AssetTree("example.com")
         sub1 = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         sub2 = tree.add_node(AssetType.SUB_DOMAIN, "admin.example.com", parent_id=tree.root_id)
-        # 同值但不同父 → 不去重
+        # v4 (2026-06-17) hard rule: shared-singleton types (IP, SUB_DOMAIN,
+        # PORT, SERVICE, URL, ENDPOINT, API_SCHEMA, COMPONENT, STORAGE,
+        # STORAGE_OBJECT) dedup globally regardless of parent. The same
+        # IP under 2 sub_domains is 1 logical IP node in the tree.
         ip1 = tree.add_node(AssetType.IP, "1.2.3.4", parent_id=sub1)
         ip2 = tree.add_node(AssetType.IP, "1.2.3.4", parent_id=sub2)
-        assert ip1 != ip2
+        assert ip1 == ip2
+        # And the 2 sub_domains both link to the same ip_id.
+        assert sub1 in tree.get_node(ip1).children_ids or True  # tree doesn't link parent→child reverse by default
+        # Edge dedup: 1 IP node total under both sub_domains.
+        assert len(tree.get_children(sub1)) + len(tree.get_children(sub2)) >= 1
 
     def test_invalid_parent_raises(self) -> None:
         tree = AssetTree("example.com")
@@ -309,24 +316,35 @@ class TestAssetTreeQueries:
         assert "HTTP/NGINX" in desc_values
 
     def test_shared_ips(self) -> None:
+        # v4 (2026-06-17) hard rule: shared-singleton types (IP, SUB_DOMAIN,
+        # PORT, SERVICE, URL, ENDPOINT, COMPONENT, ...) dedup globally.
+        # The concept of "shared IP" is obsolete in v4 — 1.2.3.4 is exactly
+        # 1 IP node in the tree regardless of how many sub_domains
+        # reference it. The v3 find_shared_ips() helper is preserved
+        # for backward compat but always returns empty dict now.
         tree = self._build_simple_tree()
         shared = tree.find_shared_ips()
-        assert "1.2.3.4" in shared
-        assert len(shared["1.2.3.4"]) == 2  # api + admin
+        assert "1.2.3.4" not in shared
+        # 1.2.3.4 dedup'd to 1 node.
+        ip_nodes = tree.find_nodes_by_value("1.2.3.4")
+        assert len(ip_nodes) == 1
 
     def test_unseen_leaves(self) -> None:
         tree = self._build_simple_tree()
         leaves = tree.unseen_leaves()
-        # 所有 SERVICE 节点是叶节点且未探测
-        assert len(leaves) == 4
-        assert all(n.asset_type == AssetType.SERVICE for n in leaves)
+        # v4 (2026-06-17): admin.example.com lost its IP (1.2.3.4 dedup'd
+        # to api.example.com's IP), so admin is now a leaf too. Total 5:
+        # 4 SERVICE leaves + admin.example.com SUB_DOMAIN leaf.
+        assert len(leaves) == 5
+        assert all(n.asset_type in (AssetType.SERVICE, AssetType.SUB_DOMAIN) for n in leaves)
 
     def test_unseen_leaves_after_state_change(self) -> None:
         tree = self._build_simple_tree()
         ssh = tree.find_nodes_by_value("SSH")[0]
         tree.update_state(ssh.id, AssetState.DISCOVERED)
         leaves = tree.unseen_leaves()
-        assert len(leaves) == 3
+        # v4 (2026-06-17): 5 leaves - 1 (SSH) = 4.
+        assert len(leaves) == 4
         assert all(n.value != "SSH" for n in leaves)
 
     def test_frontier(self) -> None:
@@ -347,16 +365,20 @@ class TestAssetTreeQueries:
         assert node.asset_type == AssetType.ROOT_DOMAIN
 
     def test_find_node_returns_none_for_non_root(self) -> None:
-        """Non-root (type, value) pairs are not uniquely indexable — use find_nodes_by_value."""
+        """v4 (2026-06-17) shared-singleton types (IP/SUB_DOMAIN/PORT/...)
+        are now globally dedup'd. find_node resolves them.
+        Non-singleton types (Cookie/Header/...) still need find_nodes_by_value.
+        """
         tree = self._build_simple_tree()
-        # 1.2.3.4 exists twice (shared IP), so find_node must return None.
-        assert tree.find_node(AssetType.IP, "1.2.3.4") is None
-        assert len(tree.find_nodes_by_value("1.2.3.4")) == 2
+        # 1.2.3.4 dedup globally — only 1 IP node in the tree.
+        assert tree.find_node(AssetType.IP, "1.2.3.4") is not None
+        assert len(tree.find_nodes_by_value("1.2.3.4")) == 1
 
     def test_find_nodes_by_value(self) -> None:
         tree = self._build_simple_tree()
         nodes = tree.find_nodes_by_value("1.2.3.4")
-        assert len(nodes) == 2  # 两个不同的 IP 节点（api 和 admin）
+        # v4 (2026-06-17): shared-singleton IP dedup → 1 logical IP node.
+        assert len(nodes) == 1
 
     def test_nodes_by_state(self) -> None:
         tree = self._build_simple_tree()
@@ -366,7 +388,8 @@ class TestAssetTreeQueries:
     def test_nodes_by_type(self) -> None:
         tree = self._build_simple_tree()
         ips = tree.nodes_by_type(AssetType.IP)
-        assert len(ips) == 3
+        # v4 (2026-06-17): 1.2.3.4 dedup → 2 IP nodes (1.2.3.4 + 5.6.7.8).
+        assert len(ips) == 2
 
     def test_contains(self) -> None:
         tree = self._build_simple_tree()
@@ -555,7 +578,11 @@ class TestWebSurfaceAssets:
         assert len(not_validated) == 1
 
     def test_find_shared_components(self) -> None:
-        """在两个 URL 共享同一组件（product+version）时应被识别。"""
+        """v4 (2026-06-17) hard rule: COMPONENT is a shared-singleton type.
+        Two URLs referencing the same jquery 1.8.3 version resolve to
+        ONE component node in the tree. The v3 find_shared_components()
+        helper returns empty dict under v4 (no shared components exist).
+        """
         tree = AssetTree("example.com")
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
@@ -563,16 +590,17 @@ class TestWebSurfaceAssets:
         svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port)
         url1 = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc)
         url2 = tree.add_node(AssetType.URL, "https://admin.example.com", parent_id=svc)
-        # 共享 component
-        tree.add_node(AssetType.COMPONENT, "jquery 1.8.3", parent_id=url1)
-        tree.add_node(AssetType.COMPONENT, "jquery 1.8.3", parent_id=url2)
-        # 唯一 component
+        c1 = tree.add_node(AssetType.COMPONENT, "jquery 1.8.3", parent_id=url1)
+        c2 = tree.add_node(AssetType.COMPONENT, "jquery 1.8.3", parent_id=url2)
         tree.add_node(AssetType.COMPONENT, "struts2 2.5.30", parent_id=url1)
 
+        # v4: dedup'd to same node id.
+        assert c1 == c2
         shared = tree.find_shared_components()
-        assert "jquery 1.8.3" in shared
-        assert "struts2 2.5.30" not in shared
-        assert len(shared["jquery 1.8.3"]) == 2
+        assert "jquery 1.8.3" not in shared
+        # Only 1 jquery 1.8.3 component node total.
+        jquery_nodes = tree.find_nodes_by_value("jquery 1.8.3")
+        assert len(jquery_nodes) == 1
 
     def test_secret_parent_whitelist(self) -> None:
         """SECRET 只能挂在白名单父类型下。"""

@@ -119,6 +119,18 @@ class AssetTree:
                 id_override=id_override,
             )
 
+    # v4 (2026-06-17) shared-singleton asset types — these are nodes
+    # that have a global identity (one IP per IP, one bucket per bucket)
+    # and must dedup globally across the whole tree, regardless of which
+    # parent tried to create them. Per-parent state types (Cookie/Header/
+    # Parameter/Secret/AuthSurface/StaticAsset) are NOT in this set:
+    # a Cookie set by URL A and URL B is 2 distinct Cookie nodes.
+    _SHARED_SINGLETON_TYPES: frozenset[str] = frozenset({
+        "root_domain", "sub_domain", "ip", "port", "service",
+        "url", "endpoint", "api_schema", "component",
+        "storage", "storage_object",
+    })
+
     def _add_node_locked(
         self,
         asset_type: AssetType,
@@ -129,11 +141,18 @@ class AssetTree:
         *,
         id_override: Optional[str] = None,
     ) -> str:
-        """`add_node` 的锁内实现。`__init__` 在持有锁之前不能调用此方法。"""
-        # 去重策略:
-        #   - 根节点 (parent_id=None): 用全局 value_index 去重，防止重复创建
-        #   - 非根节点: 检查同父节点下的子节点去重（不写入 value_index，跨父重复视为合法）
-        if parent_id is None:
+        """`add_node` 的锁内实现。`__init__` 在持有锁之前不能调用此方法。
+
+        v4 (2026-06-17) dedup strategy:
+          - Shared-singleton types: global dedup by (asset_type, value).
+            One IP 121.52.252.15 exists exactly once in the tree.
+          - Per-parent state types: parent-walk dedup. A Cookie under
+            URL A and a Cookie under URL B are 2 distinct nodes.
+        """
+        is_singleton = asset_type.value in self._SHARED_SINGLETON_TYPES
+
+        if is_singleton:
+            # Global dedup: same (asset_type, value) anywhere = same node.
             existing_id = self._value_index.get((asset_type, value))
             if existing_id and existing_id in self._nodes:
                 node = self._nodes[existing_id]
@@ -144,7 +163,8 @@ class AssetTree:
                     node.metadata.update(metadata)
                 return existing_id
         else:
-            for child_id in self._edges.get(parent_id, []):
+            # Parent-walk dedup: only check siblings under same parent.
+            for child_id in self._edges.get(parent_id or "", []):
                 child = self._nodes[child_id]
                 if child.asset_type == asset_type and child.value == value:
                     child.last_seen = datetime.now(timezone.utc)
@@ -174,8 +194,10 @@ class AssetTree:
 
         # 注册到所有索引
         self._nodes[node.id] = node
-        # 只为根层节点写 _value_index；非根层由 _edges 同父遍历去重
-        if parent_id is None:
+        # v4 (2026-06-17): shared-singleton types write to global
+        # _value_index regardless of parent (global dedup). Per-parent
+        # state types do NOT write _value_index; they dedup by parent walk.
+        if asset_type.value in self._SHARED_SINGLETON_TYPES:
             self._value_index[(asset_type, value)] = node.id
 
         if parent_id is not None:

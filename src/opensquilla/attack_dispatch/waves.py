@@ -268,7 +268,16 @@ WAVES: dict[str, WaveSpec] = {
                         # (read state.evidence["W0.6"] if present, but never
                         # block W1 if W0.6 missing or failed)
         fanout="static_fanout",
-        fanout_agents=("recon", "intel-collection", "attack-surface-enumeration"),
+        # v4 (2026-06-17): W1 fanout is now 3 v4 specialists that
+        # own the IP-tier / Port-tier / Service-tier recon:
+        #   - port-scanner:         121.52.252.15 -> [21,22,80,443,8001,...]
+        #   - service-fingerprint:  1.2.3.4:443 -> [nginx 1.21, kong 3.0, ...]
+        #   - endpoint-crawler:     https://host:port -> [/api, /admin, ...]
+        # 3 legacy_recon (recon / intel-collection / attack-surface-
+        # enumeration) move to FALLBACK_AGENTS for v3 3-tier fallback
+        # when v4 specialists are unavailable. See SOUL_BODY.md
+        # "自适应执行 (v3, 2026-06-17)".
+        fanout_agents=("port-scanner", "service-fingerprint", "endpoint-crawler"),
         drill_in_allowed=True,
         owner_agent="hack-deep-find",
     ),

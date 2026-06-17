@@ -2465,19 +2465,18 @@ class TestSerialMode:
             artifact_root=tmp_path,
         )
         results = ex.run(target="example.com")
-        # W1 is a static_fanout(3); its 3 specialist handoff_ids must
-        # appear in the recorder in the fan-out order, AND must be
-        # appended in the order they were called (not interleaved with
-        # drill-in calls). The sub_index is 1, 2, 3 (envelope builder
-        # convention).
-        assert "W1.recon.1" in calls
-        assert "W1.intel-collection.2" in calls
-        assert "W1.attack-surface-enumeration.3" in calls
-        # Find the indices of W1's three calls and assert they are
-        # consecutive in call order (no drill-in specialists interleaved).
+        # v4 (2026-06-17): W1 is static_fanout(3) of 3 v4 specialists
+        # (port-scanner / service-fingerprint / endpoint-crawler).
+        # sub_index 1, 2, 3 (envelope builder convention).
+        assert "W1.port-scanner.1" in calls
+        assert "W1.service-fingerprint.2" in calls
+        assert "W1.endpoint-crawler.3" in calls
+        # Consecutive in call order (no drill-in specialists interleaved).
         w1_indices = [
             i for i, h in enumerate(calls) if h in {
-                "W1.recon.1", "W1.intel-collection.2", "W1.attack-surface-enumeration.3"
+                "W1.port-scanner.1",
+                "W1.service-fingerprint.2",
+                "W1.endpoint-crawler.3",
             }
         ]
         assert w1_indices == sorted(w1_indices)
@@ -2494,13 +2493,14 @@ class TestSerialMode:
         )
         ex.run(target="example.com")
         w1_dir = tmp_path / "W1"
-        # W1 has 3 static_fanout specialists; sub_index is 1, 2, 3.
+        # v4 (2026-06-17): W1 has 3 static_fanout v4 specialists;
+        # sub_index 1, 2, 3.
         specialist_files = sorted(p.name for p in w1_dir.glob("*.json"))
         assert specialist_files == [
-            "W1.attack-surface-enumeration.3.json",
             "W1.combined.json",
-            "W1.intel-collection.2.json",
-            "W1.recon.1.json",
+            "W1.endpoint-crawler.3.json",
+            "W1.port-scanner.1.json",
+            "W1.service-fingerprint.2.json",
         ]
         # The combined SERIAL artifact is at <root>/W1/W1.combined.json.
         assert (w1_dir / "W1.combined.json").is_file()
@@ -2547,11 +2547,12 @@ class TestSerialMode:
         import json as _json
         payload = _json.loads(combined_path.read_text(encoding="utf-8"))
         assert payload["mode"] == "serial"
+        # v4 (2026-06-17): W1 fanout is 3 v4 specialists.
         per_spec = payload["per_specialist_artifacts"]
         assert set(per_spec) == {
-            "W1.recon.1",
-            "W1.intel-collection.2",
-            "W1.attack-surface-enumeration.3",
+            "W1.port-scanner.1",
+            "W1.service-fingerprint.2",
+            "W1.endpoint-crawler.3",
         }
         for handoff_id, path_str in per_spec.items():
             p = Path(path_str)
@@ -2569,12 +2570,14 @@ class TestSerialMode:
         )
         state = DispatchState()
         ex.run(target="example.com", state=state)
-        # At minimum, the W1 trio is in both sets.
-        assert "W1.recon.1" in state.released_handoff_ids
-        assert "W1.intel-collection.2" in state.released_handoff_ids
-        assert "W1.attack-surface-enumeration.3" in state.released_handoff_ids
+        # v4 (2026-06-17): the W1 trio is now 3 v4 specialists.
+        assert "W1.port-scanner.1" in state.released_handoff_ids
+        assert "W1.service-fingerprint.2" in state.released_handoff_ids
+        assert "W1.endpoint-crawler.3" in state.released_handoff_ids
         for handoff_id in (
-            "W1.recon.1", "W1.intel-collection.2", "W1.attack-surface-enumeration.3"
+            "W1.port-scanner.1",
+            "W1.service-fingerprint.2",
+            "W1.endpoint-crawler.3",
         ):
             assert handoff_id in state.specialist_artifacts
             assert Path(state.specialist_artifacts[handoff_id]).is_file()
@@ -2620,17 +2623,17 @@ class TestSerialMode:
             # NOTE: mode is the default (PARALLEL).
         )
         ex.run(target="example.com")
-        # W1's per-specialist files must NOT exist in PARALLEL mode.
+        # v4 (2026-06-17): W1 primary handoff is port-scanner.1.
         w1_dir = tmp_path / "W1"
-        # The combined file uses the original primary_handoff_id form.
-        assert (w1_dir / "W1.recon.1.json").is_file()
+        # Combined file uses primary_handoff_id form.
+        assert (w1_dir / "W1.port-scanner.1.json").is_file()
         # And there is no W1.combined.json (that's a SERIAL-mode rename).
         assert not (w1_dir / "W1.combined.json").exists()
-        # And the W1 directory contains ONLY the combined file (no per-specialist).
-        assert sorted(p.name for p in w1_dir.glob("*.json")) == ["W1.recon.1.json"]
+        # W1 directory contains ONLY the combined file (no per-specialist).
+        assert sorted(p.name for p in w1_dir.glob("*.json")) == ["W1.port-scanner.1.json"]
         # The combined file does NOT have a per_specialist_artifacts field.
         import json as _json
-        payload = _json.loads((w1_dir / "W1.recon.1.json").read_text(encoding="utf-8"))
+        payload = _json.loads((w1_dir / "W1.port-scanner.1.json").read_text(encoding="utf-8"))
         assert "per_specialist_artifacts" not in payload
         assert payload["mode"] == "parallel"
 
