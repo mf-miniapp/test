@@ -333,18 +333,32 @@ recon_diff_snapshots(snapshot_a_path=<older>, snapshot_b_path=<newer>)
 3. 之后**所有** F0 / F1 / F3.5 都按 `state.binary_availability` 直接走
    binary path (避免每次 detect)。
 
-**Operator instructions**: 部署到新机器时, 先确认 6 个 binary 在 PATH:
+**Operator instructions**: 部署到新机器时, 先确认 12 个 binary 在 PATH
+(`_binaries.detect_all()` 的 hard guarantee):
 
 ```bash
-which naabu httpx subfinder katana nuclei nmap
-# 若缺, brew install: brew install nmap
-# GO 工具: go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-#         go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-#         go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-#         go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-#         go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+which naabu httpx subfinder katana nuclei nmap masscan ffuf dnsx asnmap tlsx cdncheck
+# brew (system tools):
+#   brew install nmap masscan ffuf tlsx
+# Go 工具 (proxy: export https_proxy=http://127.0.0.1:7897 GOPROXY=https://goproxy.cn,direct):
+#   go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+#   go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+#   go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#   go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+#   go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+#   go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+#   go install -v github.com/projectdiscovery/asnmap/cmd/asnmap@latest
+#   go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+#   go install -v github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
 # nuclei 模板: nuclei -update-templates
+# 验证: .venv/bin/python -c "from opensquilla.tools.builtin.recon import _binaries; print(_binaries.detect_all(refresh=True))"
 ```
+
+**v4.1 note**: `_binaries._safe_version` 不再 gate exit code。
+masscan (`--version` rc=1, 输出在 stderr)、tlsx/asnmap
+(`-version` 触发 cgo m1cpu SIGSEGV)、ffuf/naabu/httpx/cdncheck
+(ASCII art 在 stderr) 都会被识别为 available, 前提是
+binary exec 成功并产生任何 stdout/stderr 输出。
 
 **为什么 stdlib fallback 仍然保留**: 部署环境 (CI / sandbox / 离线 air-gap)
 不一定有 binary 可装。fallback 保证编排者在最差环境下也能跑 (只是慢 + 浅),

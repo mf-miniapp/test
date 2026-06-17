@@ -53,14 +53,26 @@ def _safe_version(binary: str, version_flag: str = "--version") -> str | None:
     Never raises — always returns None on failure. Use this to test
     that a binary actually runs (some hosts have stale PATH entries
     pointing to non-functional binaries).
+
+    v4.1 (2026-06-17) relaxation: we do NOT gate on exit code. Several
+    recon binaries print version info to stderr with non-zero exit
+    codes (``masscan --version`` -> rc=1) or print ASCII art with
+    rc=0 (``tlsx``, ``naabu``, ``httpx``, ``ffuf``). A binary is
+    "alive" iff it exec'd and produced *any* output (stdout or
+    stderr). Only treat as dead when the binary is missing, hangs
+    (timeout), or returns immediately with both streams empty.
     """
     try:
         result = subprocess.run(
             [binary, version_flag],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode != 0:
-            return None
+        # v4.1: do NOT gate on returncode. masscan --version -> rc=1
+        # with version banner on stderr; tlsx -version segfaults but
+        # still prints Go panic to stderr; ffuf/naabu/httpx print
+        # ASCII art on stderr with rc=0. Binary is "alive" iff it
+        # exec'd and produced any output on either stream. Only
+        # treat as dead when both streams are empty (or timeout / ENOENT).
         out = (result.stdout or result.stderr or "").strip()
         return out.splitlines()[0] if out else None
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):

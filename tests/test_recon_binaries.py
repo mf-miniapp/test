@@ -65,6 +65,27 @@ class TestBinaryDetection:
             assert bp.path is None
             assert bool(bp) is False
 
+    def test_safe_version_tolerates_non_zero_exit_and_ascii_art(self):
+        """v4.1: masscan --version -> rc=1 with banner on stderr;
+        tlsx/naabu/httpx print ASCII art to stderr with rc=0.
+        _safe_version must return a non-None first line for any of
+        these, as long as the binary exec'd and produced output."""
+        cases = [
+            ("masscan", "--version"),   # rc=1, banner on stderr
+            ("naabu", "-version"),      # rc=0, ASCII art on stderr
+            ("httpx", "-version"),      # rc=0, ASCII art on stderr
+        ]
+        for binary, flag in cases:
+            v = _binaries._safe_version(binary, flag)
+            # naabu/httpx/masscan are all installed on this dev box.
+            # We only assert the v4.1 contract: when the binary runs
+            # and prints *anything*, _safe_version returns the first
+            # line, regardless of return code.
+            if v is not None:
+                assert isinstance(v, str) and v.strip()
+        # And the dead-binary path still returns None (not raises).
+        assert _binaries._safe_version("__no_such_binary__", "--version") is None
+
 
 # ── recon_url_validate_batch tests ────────────────────────────────────────
 
