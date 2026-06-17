@@ -621,8 +621,29 @@ go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
 ```
 1. wave = WAVES["W0.5"]
 2. fanout_agents = wave.fanout_agents  # v4: [domain-expander, osint-collector]
-3. 拼装 2 份 envelope (各自 schema 不同: domain-expansion-v1 / osint-v1)
-4. 单次 assistant message: sessions_spawn × 2  (并行, 1 barrier)
+3. 拼装 2 份 envelope, **agent_id 必须字面是 `domain-expander` 和 `osint-collector`** (来自 WAVES["W0.5"].fanout_agents):
+   ```
+   HANDOFF FIND-W0.5.domain-expander.{i} | deps=empty | tree_id={tree_id}
+   root_domain={root_domain} | scope=domain_expansion
+   eta=240
+   对 root_domain {root_domain} 做横向扩展, 产 subdomains + ip_map + extra_seeds。
+   工具: recon_subdomain_enum + recon_passive_dns + ...
+   输出 evidence schema: domain-expansion-v1
+   最后一行: `schema: domain-expansion-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+   ```
+   ```
+   HANDOFF FIND-W0.5.osint-collector.{i} | deps=empty | tree_id={tree_id}
+   root_domain={root_domain} | scope=osint_collect
+   eta=180
+   对 root_domain {root_domain} 做 OSINT 收集, 产 historical_ips + related_domains + exposed_services。
+   工具: recon_osint_query (Shodan / Censys / FOFA / VirusTotal / Hunter)
+   输出 evidence schema: osint-v1
+   最后一行: `schema: osint-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+   ```
+4. 单次 assistant message:
+   sessions_spawn(agent_id="domain-expander", task=<上面 envelope 1>)
+   sessions_spawn(agent_id="osint-collector", task=<上面 envelope 2>)
+   (并行, 1 barrier)
 5. sessions_yield()  ← wave barrier
 6. ingest_evidence("W0.5", evidence[0..1])  # 落盘到 memory/W0.5/
 7. **v4.5 incremental diff** (only when state.first_run == False):
@@ -700,18 +721,39 @@ HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
 3. **前置装载**: 从 state 调 `asset_tree_find_unseen("ip")` 拿到
    所有 ip:unseen 节点, 记为 ip_list
 4. **port-scanner 阶段** (per ip, batch):
-   a. 对每个 ip 派 1 份 envelope: HANDOFF W1.port-scanner.{i} | ...
-   b. envelope 包含 ip.value + ip.id, 目标: 扫 top-100 端口, 产 PORT 节点
-   c. sessions_spawn × |ip_list| → yield → ingest
+   a. 对每个 ip 派 1 份 envelope, **agent_id 必须字面是 `port-scanner`** (来自 WAVES["W1"].fanout_agents[0]), 不得替换为 `recon` 或其它 v3 名
+   b. envelope 字符串模板 (LLM 直接按此拼, **不要改名**):
+      ```
+      HANDOFF FIND-W1.port-scanner.{i} | deps=empty | tree_id={tree_id}
+      root_domain={root_domain} | scope=port_scan_one_ip
+      ip={ip_value} | ip_node_id={ip_node_id} | eta=60
+
+      对 ip {ip_value} 跑 top-100 端口扫描 (masscan / nmap),
+      工具: recon_port_scan_tcp (单端口) 或 recon_port_scan_batch (批量)
+      输出 evidence schema: port-v1
+      最后一行加: `schema: port-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+      ```
+   c. sessions_spawn(agent_id="port-scanner", task=<上面 envelope>) × |ip_list|
+      → yield → ingest
    d. ingest: port-scanner.ports → PORT 节点 (挂在 ip 下)
 5. **service-fingerprint 阶段** (per port, 全覆盖, 不允许跳过):
    a. 重新调 `asset_tree_find_unseen("port")` 拿本轮新增的 port:unseen
       节点, 记为 port_list
    b. **硬约束**: port_list 必须非空;若空说明 port-scanner 没跑
       (错误), 不得跳过此步直接进 F1.5
-   c. 对每个 port 派 1 份 envelope: HANDOFF W1.service-fingerprint.{i}
-      | ... 目标: 抓 banner / HTTP probe, 产 SERVICE 节点
-   d. sessions_spawn × |port_list| → yield → ingest
+   c. 对每个 port 派 1 份 envelope, **agent_id 必须字面是 `service-fingerprint`** (来自 WAVES["W1"].fanout_agents[1]):
+      ```
+      HANDOFF FIND-W1.service-fingerprint.{i} | deps=empty | tree_id={tree_id}
+      root_domain={root_domain} | scope=service_one_port
+      ip={ip_value} | port={port_value} | port_node_id={port_node_id} | eta=60
+
+      对 ip:port {ip_value}:{port_value} 跑服务指纹,
+      工具: recon_grab_banner (首选) / recon_http_probe (web 端口)
+      输出 evidence schema: service-v1
+      最后一行加: `schema: service-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+      ```
+   d. sessions_spawn(agent_id="service-fingerprint", task=<上面 envelope>) × |port_list|
+      → yield → ingest
    e. ingest: service-fingerprint.services → SERVICE 节点 (挂在 port 下)
 6. **v4.5 incremental diff** (only when state.first_run == False):
    a. current_evidence = 合并 port-scanner + service-fingerprint 出的
@@ -769,27 +811,63 @@ HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
    - subdomain_unseen: 所有 state=UNSEEN 的 SUB_DOMAIN 节点
    - url_unseen: 所有 state=UNSEEN 的 URL 节点
 3. **per-service fan-out** (主路径, 这是 web app 探测的真正入口):
-   a. 对每个 service 派 2 个 specialist 并行:
-      - `webapp-discoverer`: 判定 service 协议族 (HTTP/HTTPS/DB/Mail);
-        若 HTTP 族, **必须**在 evidence 里给出 url candidates
-        (ip + port + scheme 列表), 编排器在 step 5 自动建 url:UNSEEN
-        节点 (挂在该 service 下) 给 W3.5 处理
-      - `component-detector`: 抓 service 指纹, 产 COMPONENT 节点
-        (挂在 service 下)
-   b. sessions_spawn × 2 × |service_unseen| → yield → ingest
-   c. ingest: webapp-discoverer.url_candidates → URL 节点 (挂在
-      service 下, parent_id=service.id, **不是** sub_domain);
-      component-detector.components → COMPONENT 节点
+   a. 对每个 service 派 2 个 specialist 并行, **agent_id 必须字面是
+      `webapp-discoverer` 和 `component-detector`** (来自
+      WAVES["W1.5"].fanout_agents), 不得替换为 `recon` 或其它 v3 名
+   b. envelope 字符串模板 (per service, 2 份独立 spawn):
+      ```
+      HANDOFF FIND-W1.5.webapp-discoverer.{i} | deps=empty | tree_id={tree_id}
+      root_domain={root_domain} | scope=webapp_one_service
+      ip={ip} | port={port} | service={service_value} | service_node_id={service_node_id} | eta=120
+
+      对 service {service_value} (ip:port) 跑 web app 边界识别,
+      工具: recon_vhost_bruteforce / recon_robots_sitemap /
+            recon_tech_detect / recon_app_fingerprint
+      输出 evidence schema: webapp-v1, 必须含 url_candidates[]
+      最后一行: `schema: webapp-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+      ```
+      ```
+      HANDOFF FIND-W1.5.component-detector.{i} | deps=empty | tree_id={tree_id}
+      root_domain={root_domain} | scope=component_one_service
+      ip={ip} | port={port} | service={service_value} | service_node_id={service_node_id} | eta=90
+
+      对 service {service_value} 抓组件指纹 (product + version + cpe),
+      工具: cpe_resolve (静态字典) + recon_app_fingerprint
+      输出 evidence schema: component-v1
+      最后一行: `schema: component-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+      ```
+   c. sessions_spawn(agent_id="webapp-discoverer", task=...) +
+      sessions_spawn(agent_id="component-detector", task=...) → yield → ingest
+   d. ingest: webapp-discoverer.url_candidates → URL 节点
+      (parent_id=service.id, 不是 sub_domain);
+      component-detector.components → COMPONENT 节点 (parent_id=service.id)
 4. **per-subdomain fan-out** (storage 探测):
-   a. 对每个 sub_domain 派 1 个 specialist:
-      - `storage-discoverer`: 探测关联 bucket (OSS / GCS / Azure /
-        S3 命名变体), 产 STORAGE + STORAGE_OBJECT 节点 (挂在
-        sub_domain 下)
-   b. sessions_spawn × |subdomain_unseen| → yield → ingest
+   a. 对每个 sub_domain 派 1 个 specialist, **agent_id 字面
+      `storage-discoverer`**:
+      ```
+      HANDOFF FIND-W1.5.storage-discoverer.{i} | deps=empty | tree_id={tree_id}
+      root_domain={root_domain} | scope=storage_one_subdomain
+      subdomain={subdomain_value} | subdomain_node_id={subdomain_node_id} | eta=60
+
+      对 sub_domain {subdomain_value} 探测关联 cloud bucket,
+      工具: recon_storage_probe (OSS / GCS / Azure / S3 变体)
+      输出 evidence schema: cloud-storage-v1
+      最后一行: `schema: cloud-storage-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+      ```
+   b. sessions_spawn(agent_id="storage-discoverer", task=...) → yield → ingest
 5. **per-url fan-out** (secret 探测, 给后续 W3.5 提前挖):
-   a. 对每个 url (主要来自 W1.5 step 3c 新建) 派 1 个 specialist:
-      - `secret-scanner`: 抓 HTML/JS 里的暴露密钥、内部域名、注释
-   b. sessions_spawn × |url_unseen| → yield → ingest
+   a. 对每个 url 派 1 个 specialist, **agent_id 字面 `secret-scanner`**:
+      ```
+      HANDOFF FIND-W1.5.secret-scanner.{i} | deps=empty | tree_id={tree_id}
+      root_domain={root_domain} | scope=secret_one_url
+      url={url_value} | url_node_id={url_node_id} | eta=90
+
+      对 url {url_value} 抓暴露密钥 / 内部域名 / 注释,
+      工具: recon_secret_extract + recon_sensitive_fingerprint
+      输出 evidence schema: secret-v1
+      最后一行: `schema: secret-v1 | phase: evidence-collection | wave: 0/1 | deps: empty`
+      ```
+   b. sessions_spawn(agent_id="secret-scanner", task=...) → yield → ingest
    c. ingest: secret-scanner.secrets → SECRET 节点 (跨层白名单挂载)
 5.5 **批量 state 推进** (v4.5.1 新增, 修"service/url 永远 UNSEEN" bug):
    - 本 wave 新增的 service 节点 → update_state(id, "discovered")
@@ -898,6 +976,11 @@ W2.5 是 find 拥有的 wave, 但实际 spawn 由 hack-deep 代行。详见
 
 ### Step F3.5 (W3.5) — web crawl (动态, 3 v4 specialist 并行 per bucket)
 
+> **v4.5.2 envelope 模板 (2026-06-18)**: 解决 LLM 误把 v3 `recon` 当作
+> v4 specialist 的问题。每个 W3.5 specialist 的 agent_id 必须字面是
+> `webapp-discoverer` / `content-classifier` / `api-surface-mapper`。
+> url:unseen 列表里每个 url 派 1 份下面模板:
+
 ```
 1. wave = WAVES["W3.5"]  # fanout=dynamic_fanout, specialist=recon (Tier 2 fallback)
 2. web_services = filter(F1.services, scheme in (http, https))
@@ -909,7 +992,22 @@ W2.5 是 find 拥有的 wave, 但实际 spawn 由 hack-deep 代行。详见
      v4_specialists = ["webapp-discoverer", "content-classifier", "api-surface-mapper"]
      # ↑ 3 个 v4 specialist 并行 (1 barrier per bucket)
 7.   for spec in v4_specialists:
-         sessions_spawn(agent_id=spec, task=<typed envelope for this bucket>)
+         # **v4.5.2 硬约束**: spec 字面必须是 3 个 v4 specialist 之一, 不得替换为 `recon`
+         assert spec in ("webapp-discoverer", "content-classifier", "api-surface-mapper"), (
+             f"W3.5 spec must be a v4 specialist, got {spec!r}. "
+             "Use WAVES['W3.5'].fanout_agents list verbatim."
+         )
+         envelope = f"""
+HANDOFF FIND-W3.5.{spec}.{seq} | deps=W1.5 | tree_id={tree_id}
+root_domain={root_domain} | scope={spec}_one_url
+url={url_value} | url_node_id={url_node_id} | eta=180
+
+对 url {url_value} 跑 {spec} 专项探测,
+工具: {_TOOL_BY_SPEC[spec]}
+输出 evidence schema: {_SCHEMA_BY_SPEC[spec]}
+最后一行: `schema: {_SCHEMA_BY_SPEC[spec]} | phase: evidence-collection | wave: 0/1 | deps: empty`
+""".strip()
+         sessions_spawn(agent_id=spec, task=envelope)
 8.   sessions_yield()  # 1 barrier per bucket
 9.   ingest_evidence("W3.5", evidence_for_this_bucket)
 10.  asset_tree_add_nodes(...):
@@ -928,6 +1026,20 @@ W2.5 是 find 拥有的 wave, 但实际 spawn 由 hack-deep 代行。详见
   AUTH_SURFACE / COOKIE / HEADER), 替代 v3 3 个 specialist 跑 3 次 HTTP
 - `api-surface-mapper` 把 v3 跨 wave barrier 的 schema_id 链接
   收到 agent 内部, 减少 ingest 步骤
+
+**W3.5 v4 specialist 工具/输出 schema 映射 (v4.5.2 必须按此填 envelope)**:
+```python
+_TOOL_BY_SPEC = {
+    "webapp-discoverer":   "recon_directory_bruteforce + recon_extract_endpoints_from_js",
+    "content-classifier":  "recon_http_probe + recon_sensitive_fingerprint + recon_security_header_audit",
+    "api-surface-mapper":  "recon_openapi_parse + recon_graphql_introspect + recon_js_crawl_recursive",
+}
+_SCHEMA_BY_SPEC = {
+    "webapp-discoverer":   "webapp-v1",
+    "content-classifier":  "content-classification-v1",
+    "api-surface-mapper":  "api-surface-v1",
+}
+```
 
 ### Step F-final-pre (v4.5: 资产树收口, 改为只做完整性核查) — tree-finalizer
 

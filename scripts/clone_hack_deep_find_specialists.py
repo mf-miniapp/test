@@ -362,6 +362,8 @@ async def _register_specialist(spec: dict[str, object]) -> None:
             workspace=str(dst_dir),
             provider="mimo",
             model="mimo-v2.5-pro",
+            tier="c1",
+            allowed_tiers=["c1", "c2"],
             max_history_turns=4,
             enabled=True,
             system_prompt=soul_body,
