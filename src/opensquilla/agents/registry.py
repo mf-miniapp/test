@@ -58,6 +58,8 @@ class AgentRegistry:
         name: str | None = None,
         description: str | None = None,
         model: str | None = None,
+        provider: str | None = None,
+        max_history_turns: int | None = None,
         workspace: str | None = None,
         agent_dir: str | None = None,
         tools: dict[str, Any] | list[str] | str | None = None,
@@ -69,11 +71,18 @@ class AgentRegistry:
         if self._find_index(normalized) >= 0:
             raise ValueError(f'Agent "{normalized}" already exists')
         subagents_cfg = self._coerce_subagents(subagents)
+        # v4.5.1 fix (2026-06-18): allow caller to pin provider /
+        # max_history_turns. Without this, the agent inherits the
+        # global [llm] baseline; if that provider is unreachable
+        # sessions_spawn fails with "internal error" for any
+        # specialist that did not already have an explicit override.
         entry = AgentEntryConfig(
             id=normalized,
             name=(name or normalized).strip() or normalized,
             description=description or None,
             model=model or None,
+            provider=provider or None,
+            max_history_turns=max_history_turns if max_history_turns is not None else 0,
             workspace=workspace or None,
             agent_dir=agent_dir or None,
             tools=tools,
@@ -94,6 +103,8 @@ class AgentRegistry:
             "name",
             "description",
             "model",
+            "provider",
+            "max_history_turns",
             "workspace",
             "agent_dir",
             "tools",
