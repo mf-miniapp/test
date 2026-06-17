@@ -348,6 +348,30 @@ async def asset_tree_create(
                 "Recorded on each new node as `source_wave`."
             ),
         },
+        "verification": {
+            "type": "object",
+            "description": (
+                "v4 (2026-06-17) REQUIRED for asset_type=port / service / "
+                "url / endpoint. Verification envelope from "
+                "recon_url_validate (for url/endpoint) or recon_port_verify "
+                "(for port/service). The envelope must have verified=true. "
+                "Without it the add_node call is rejected — this is the "
+                "false-positive gate that 51ifind.com run 2026-06-17 lacked "
+                "(14/84 ports and 13 URL nodes that turned out to be "
+                "unreachable / error pages were all marked discovered). "
+                "For asset_type not in (port, service, url, endpoint), "
+                "verification is ignored."
+            ),
+        },
+        "allow_unverified": {
+            "type": "boolean",
+            "description": (
+                "Skip verification check. PRODUCTION PATHS MUST NOT PASS TRUE. "
+                "Only valid for deserialization (from_dict, JSON restore) and "
+                "test fixtures."
+            ),
+            "default": False,
+        },
     },
     required=["tree_id", "parent_id", "asset_type", "values"],
 )
@@ -358,6 +382,8 @@ async def asset_tree_add_nodes(
     values: list[str],
     metadata: dict[str, Any] | None = None,
     source_wave: str | None = None,
+    verification: dict[str, Any] | None = None,
+    allow_unverified: bool = False,
 ) -> str:
     """Add child nodes to a parent.
 
@@ -413,6 +439,8 @@ async def asset_tree_add_nodes(
                 parent_id=parent_id,
                 source_wave=source_wave,
                 metadata=metadata,
+                verification=verification,
+                allow_unverified=allow_unverified,
             )
             added.append(
                 {"node_id": new_id, "value": value, "asset_type": atype.value}

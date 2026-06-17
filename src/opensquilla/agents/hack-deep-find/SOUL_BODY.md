@@ -1005,6 +1005,66 @@ path  模式: "{scheme}://{host}:{port}{base_path}"     e.g. "http://1.2.3.4:808
 - 严禁 "port 太多, 只挂前 5 个" 这种自我截断
   (51ifind.com 跑出 14 port 实际 84 — 70 个被丢就是这个原因)
 
+**入树前 verification 硬约束** (v4 关键硬化, 解决 84→14 / 13 假阳性 URL bug):
+
+> **51ifind.com run 2026-06-17 假阳性根因**: 编排者把 specialist 报告的
+> **所有** 节点直接 add_node 入树, 没有可达性 / 真实响应验证。
+> - 84 个 naabu 扫到的 port → tree 14 个, **70 个丢失** (LLM 自我截断)
+> - 13 个 URL 节点里至少包括 http://121.201.70.245/admin (admin page 实际超时 /
+>   返回 500 error page), 全部标 "discovered"
+> - v3 时代编排者拿 specialist 报告 → 全部入树, **不验证**
+>
+> v4 强制: **PORT / SERVICE / URL / ENDPOINT 节点**入树前**必须**先 verify。
+
+**verify 工具契约** (v4 引入, 2 个新工具):
+
+- `recon_port_verify(ip, port, timeout_s=3.0)` — TCP 握手探测, 返回
+  ```json
+  {"verified": true, "reason": "ok",
+   "probe": {"state": "open", "error": null},
+   "verified_at": "2026-06-17T..."}
+  ```
+  reason 取值: `ok` / `timeout` / `connection_refused` / `dns_error` / `os_error` / `unexpected_error`
+
+- `recon_url_validate(url, method="GET", timeout_s=8.0)` — HTTP 探测 + body
+  错误页面识别, 返回
+  ```json
+  {"verified": true, "reason": "ok",
+   "probe": {"status_code": 200, "server": "nginx", "title": "..."},
+   "verified_at": "2026-06-17T..."}
+  ```
+  reason 取值: `ok` / `no_response` / `status_{code}` /
+  `error_body:{kind}` (kind 是 404_page / 500_page / nginx_error_page /
+  kong_error_page / upstream_error_page / browser_error_page /
+  placeholder_page / maintenance_page / ...)
+
+**入树流程硬约束** (编排器 ingest 时**严格**遵循):
+
+1. specialist 报告 evidence (含 ports / urls / services 列表)
+2. 对每个 PORT 节点 → 先 `recon_port_verify(ip, port)`:
+   - verified=True → 拿 result envelope 传给 `asset_tree_add_nodes(verification=...)`
+   - verified=False → **不入树**, 记录 `{ip, port, reason}` 到 stderr-style 日志
+3. 对每个 URL 节点 → 先 `recon_url_validate(url)`:
+   - verified=True (status=200, body 非 error page) → 入树
+   - verified=False (status 非 200 / status=200 但 body 是 error page) → **不入树**
+4. 对每个 SERVICE 节点 → 先验证对应 port 可达
+   (复用步骤 2 的 verify result; 同 port 验证过的 service 直接用)
+5. 对每个 ENDPOINT 节点 → 先验证对应 url 200 + body ok
+   (复用步骤 3 的 verify result; 同 url 验证过的 endpoint 直接用)
+
+**严禁**:
+- 把 specialist evidence 里的 URL/port 全部 add_node (51ifind.com bug 根因)
+- 用 `allow_unverified=True` 绕过 verification (仅反序列化/测试 fixture 允许)
+- 把 `recon_url_validate` 报的 `error_body:*` 当作"200 OK"入树
+  (kong 默认 error 包装 200 + error body 必须拒绝)
+- 把 502/503/504/timeout 节点标 "discovered" (必须 rejected)
+
+**verify 失败节点的归宿**:
+- 不入树, **不**进入 AssetTree
+- 记录到 `state.rejected_nodes[W{i}]` (新 state 字段, v4 新加), 给
+  终止报告 + 给 hack-deep F-final handoff 用
+- 终止报告里加 1 个 "Rejected by verification" 章节
+
 **sub_domain 覆盖率硬约束** (v4 关键硬化, 解决 13 vs 54):
 - 每次 `domain-expander` 跑完, 全部 subdomains 入树
 - 每次 `osint-collector` 跑完, 全部 related_domains 入树作为

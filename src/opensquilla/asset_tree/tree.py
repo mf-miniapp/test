@@ -84,6 +84,21 @@ class AssetTree:
 
     # ── 节点 CRUD ──────────────────────────────────────
 
+    # v4 (2026-06-17) verification-required types — these nodes claim a
+    # real-time property of a network endpoint ("port X is open",
+    # "URL Y returns 200 with a real page") that must be verified at
+    # add_node time. The verification object is the result envelope
+    # from recon_url_validate (for URL) or recon_port_verify (for
+    # PORT / SERVICE / ENDPOINT). Without it the node is rejected.
+    #
+    # This closes the false-positive bug from 51ifind.com run
+    # 2026-06-17 where 84 naabu ports were reported but only 14 made
+    # it into the tree, and 13 reported URLs that turned out to be
+    # error pages / timeouts were still marked as discovered.
+    _VERIFICATION_REQUIRED_TYPES: frozenset[str] = frozenset({
+        "port", "service", "url", "endpoint",
+    })
+
     def add_node(
         self,
         asset_type: AssetType,
@@ -93,10 +108,20 @@ class AssetTree:
         metadata: Optional[dict[str, Any]] = None,
         *,
         id_override: Optional[str] = None,
+        verification: Optional[dict[str, Any]] = None,
+        allow_unverified: bool = False,
     ) -> str:
         """添加节点，返回 node_id。
 
-        去重策略: 同类型 + 同值 + 同父 → 返回已有节点 id 并更新 ``last_seen``。
+        去重策略: 共享单例类型 (singleton) 全局按 (asset_type, value) 去重;
+        非单例类型 (cookie/header/parameter/secret 等) 同父去重。
+
+        v4 (2026-06-17) verification contract: PORT / SERVICE / URL /
+        ENDPOINT 节点**必须**携带 ``verification`` 参数 (recon_port_verify
+        或 recon_url_validate 的 result envelope), 且 ``verification.verified``
+        必须为 True。缺失或 verified=False 会被拒绝 (raise ValueError),
+        除非显式传 ``allow_unverified=True`` (用于反序列化历史 tree /
+        测试 fixture, **生产路径不允许**)。
 
         Args:
             asset_type: 节点类型。
@@ -105,6 +130,9 @@ class AssetTree:
             source_wave: 发现此节点的波次标识。
             metadata: 附加元数据。
             id_override: 仅用于反序列化，覆盖自动生成的 id。
+            verification: 探测结果 envelope, 含 verified/reason/probe/verified_at。
+                Required for PORT/SERVICE/URL/ENDPOINT.
+            allow_unverified: 跳过 verification 检查 (反序列化/测试用).
 
         Returns:
             节点 ID（新建或已有）。
@@ -117,6 +145,8 @@ class AssetTree:
                 source_wave=source_wave,
                 metadata=metadata,
                 id_override=id_override,
+                verification=verification,
+                allow_unverified=allow_unverified,
             )
 
     # v4 (2026-06-17) shared-singleton asset types — these are nodes
@@ -140,6 +170,8 @@ class AssetTree:
         metadata: Optional[dict[str, Any]] = None,
         *,
         id_override: Optional[str] = None,
+        verification: Optional[dict[str, Any]] = None,
+        allow_unverified: bool = False,
     ) -> str:
         """`add_node` 的锁内实现。`__init__` 在持有锁之前不能调用此方法。
 
@@ -148,6 +180,15 @@ class AssetTree:
             One IP 121.52.252.15 exists exactly once in the tree.
           - Per-parent state types: parent-walk dedup. A Cookie under
             URL A and a Cookie under URL B are 2 distinct nodes.
+
+        v4 (2026-06-17) verification contract:
+          - PORT / SERVICE / URL / ENDPOINT require ``verification.verified==True``.
+          - Missing or unverified → ValueError (unless allow_unverified=True).
+          - On dedup (existing node), verification is still applied: if
+            the existing node has no prior verification, the new
+            verification upgrades it; if the existing node was previously
+            verified, the new verification overwrites verification fields
+            (for re-checks).
         """
         is_singleton = asset_type.value in self._SHARED_SINGLETON_TYPES
 
@@ -161,6 +202,9 @@ class AssetTree:
                     node.source_wave = source_wave
                 if metadata:
                     node.metadata.update(metadata)
+                # v4 verification: re-record on dedup hit (re-check)
+                if verification and verification.get("verified"):
+                    node.metadata["verification"] = verification
                 return existing_id
         else:
             # Parent-walk dedup: only check siblings under same parent.
@@ -172,7 +216,45 @@ class AssetTree:
                         child.source_wave = source_wave
                     if metadata:
                         child.metadata.update(metadata)
+                    # v4 verification: re-record on dedup hit
+                    if verification and verification.get("verified"):
+                        child.metadata["verification"] = verification
                     return child_id
+
+        # v4 (2026-06-17) verification check: PORT / SERVICE / URL / ENDPOINT
+        # must carry a verification envelope with verified=True. Without
+        # this gate, specialist-reported nodes (e.g. naabu ports,
+        # endpoint-crawler URLs) get into the tree as "discovered"
+        # regardless of whether they're actually reachable. The 51ifind.com
+        # run on 2026-06-17 had 14/84 ports and 13 URL nodes that
+        # turned out to be unreachable / error pages — all marked
+        # discovered, polluting the tree.
+        if (
+            asset_type.value in self._VERIFICATION_REQUIRED_TYPES
+            and not allow_unverified
+        ):
+            if verification is None:
+                raise ValueError(
+                    f"asset_type={asset_type.value} requires verification "
+                    f"envelope (recon_url_validate for url/endpoint, "
+                    f"recon_port_verify for port/service). "
+                    f"Got no verification for value={value!r}. "
+                    f"Pass allow_unverified=True only for "
+                    f"deserialization / test fixtures."
+                )
+            if not isinstance(verification, dict):
+                raise ValueError(
+                    f"verification must be a dict, got {type(verification).__name__}"
+                )
+            if not verification.get("verified"):
+                reason = verification.get("reason") or "unknown"
+                raise ValueError(
+                    f"asset_type={asset_type.value} rejected: "
+                    f"verification.verified is not True "
+                    f"(reason={reason!r}, value={value!r}). "
+                    f"Reachable verification is required for "
+                    f"port/service/url/endpoint ingestion."
+                )
 
         # 校验父子关系
         if parent_id is not None:
@@ -191,6 +273,15 @@ class AssetTree:
             last_seen=datetime.now(timezone.utc),
             metadata=metadata or {},
         )
+
+        # v4 (2026-06-17): attach verification to metadata so the
+        # node record carries the probe envelope for downstream
+        # consumers (e.g. attack-priority-v1 evidence weights a URL
+        # with verified=True differently from one without).
+        if verification and verification.get("verified"):
+            if node.metadata is None:
+                node.metadata = {}
+            node.metadata["verification"] = verification
 
         # 注册到所有索引
         self._nodes[node.id] = node

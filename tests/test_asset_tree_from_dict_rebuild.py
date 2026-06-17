@@ -20,9 +20,9 @@ def _build() -> AssetTree:
     admin = tree.add_node(AssetType.SUB_DOMAIN, "admin.example.com", parent_id=tree.root_id)
     ip_api = tree.add_node(AssetType.IP, "1.2.3.4", parent_id=api)
     ip_admin = tree.add_node(AssetType.IP, "5.6.7.8", parent_id=admin)
-    tree.add_node(AssetType.PORT, "443", parent_id=ip_api)
-    tree.add_node(AssetType.PORT, "80", parent_id=ip_api)
-    tree.add_node(AssetType.PORT, "22", parent_id=ip_admin)
+    tree.add_node(AssetType.PORT, "443", parent_id=ip_api, allow_unverified=True)
+    tree.add_node(AssetType.PORT, "80", parent_id=ip_api, allow_unverified=True)
+    tree.add_node(AssetType.PORT, "22", parent_id=ip_admin, allow_unverified=True)
     return tree
 
 

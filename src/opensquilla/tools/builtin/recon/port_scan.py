@@ -114,6 +114,92 @@ async def recon_port_scan_range(
     )
 
 
+
+
+
+@tool(
+    name="recon_port_verify",
+    description=(
+        "Verify a single TCP port is reachable. Thin wrapper around "
+        "recon_port_scan_tcp that returns a ``verified`` boolean envelope "
+        "suitable for the AssetTree add_node ``verification`` contract: "
+        "PORT / SERVICE / URL nodes require ``verification.verified == true`` "
+        "at add time. Returns ``verified=true`` ONLY if the TCP handshake "
+        "completes within timeout. Returns ``verified=false`` with "
+        "``reason`` on timeout / connection refused / DNS failure."
+    ),
+    params={
+        "ip": {"type": "string", "description": "Target IPv4 or IPv6 address."},
+        "port": {"type": "integer", "description": "TCP port number (1-65535)."},
+        "timeout_s": {
+            "type": "number",
+            "description": "Connect timeout in seconds. Default: 3.0 (more generous than recon_port_scan_tcp's 2.0; we want to be sure a port is closed before rejecting it from the tree).",
+            "default": 3.0,
+        },
+    },
+    required=["ip", "port"],
+    execution_timeout_seconds=15.0,
+)
+async def recon_port_verify(
+    ip: str,
+    port: int,
+    timeout_s: float = 3.0,
+) -> str:
+    """Verify one TCP port is open.
+
+    Returns a dict with:
+      - verified: bool   (true only if TCP handshake completes)
+      - reason: str      ("ok" if verified, else "timeout" / "connection_refused" / "dns_error" / "os_error")
+      - probe:  {state: "open"|"closed", error: str|null}
+      - verified_at: iso_ts
+    """
+    from datetime import datetime, timezone
+
+    result: dict[str, Any] = {
+        "ip": ip,
+        "port": port,
+        "verified": False,
+        "reason": None,
+        "probe": {"state": "closed", "error": None},
+        "verified_at": None,
+    }
+
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port),
+            timeout=timeout_s,
+        )
+        result["probe"]["state"] = "open"
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
+        result["reason"] = "ok"
+        result["verified"] = True
+    except asyncio.TimeoutError:
+        result["probe"]["error"] = "timeout"
+        result["reason"] = "timeout"
+    except ConnectionRefusedError as exc:
+        result["probe"]["error"] = f"ConnectionRefusedError: {exc}"
+        result["reason"] = "connection_refused"
+    except OSError as exc:
+        # Includes DNS resolution failures, network unreachable, etc.
+        result["probe"]["error"] = f"{type(exc).__name__}: {exc}"
+        err_name = type(exc).__name__
+        if "gaierror" in err_name.lower() or "getaddrinfo" in str(exc).lower():
+            result["reason"] = "dns_error"
+        else:
+            result["reason"] = "os_error"
+    except Exception as exc:  # noqa: BLE001 — catch-all for unexpected
+        result["probe"]["error"] = f"{type(exc).__name__}: {exc}"
+        result["reason"] = "unexpected_error"
+
+    result["verified_at"] = datetime.now(timezone.utc).isoformat()
+    return json.dumps(result, ensure_ascii=False)
+
+
+
 @tool(
     name="recon_grab_banner",
     description=(

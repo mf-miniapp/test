@@ -128,6 +128,204 @@ async def recon_http_probe(
     return json.dumps(result, ensure_ascii=False)
 
 
+
+
+# ── URL validate (HTTP probe + body error-page detection) ────────────────
+
+# Strings / patterns that indicate an error page even when the server
+# returns HTTP 200. Common with reverse proxies (Kong, nginx, envoy)
+# that wrap a real 4xx/5xx in a 200 response with a generic error body.
+_ERROR_BODY_INDICATORS: tuple[tuple[str, str], ...] = (
+    # (substring_to_match_in_body_lowercased, reason_label)
+    ("not found", "404 page"),
+    ("404 not found", "404 page"),
+    ("page not found", "404 page"),
+    ("internal server error", "500 page"),
+    ("service unavailable", "503 page"),
+    ("bad gateway", "502 page"),
+    ("gateway timeout", "504 page"),
+    ("forbidden", "403 page"),
+    ("access denied", "403 page"),
+    ("unauthorized", "401 page"),
+    ("nginx error", "nginx error page"),
+    ("nginx/1.", "nginx default error page"),  # default nginx error pages
+    ("apache/2.", "apache default error page"),
+    ("kong error", "kong error page"),
+    ("upstream connect error", "upstream error page"),
+    ("the page you are looking for can't be found", "404 page"),
+    ("site can't be reached", "browser error page"),
+    ("this site can't be reached", "browser error page"),
+    ("err_", "browser error page"),  # chrome ERR_CONNECTION_REFUSED etc
+    ("site not found", "404 page"),
+    ("domain is not configured", "404 page"),
+    ("default web page", "default web page"),
+    ("it works", "apache default page"),  # only if content_type is html
+    ("test page", "test placeholder page"),
+    ("coming soon", "placeholder page"),
+    ("placeholder", "placeholder page"),
+    ("maintenance", "maintenance page"),
+    ("under construction", "placeholder page"),
+)
+
+
+def _is_error_body(body: str, content_type: str | None) -> str | None:
+    """Return error reason if body looks like an error page, else None.
+
+    A body is considered an error page if:
+      1. content_type is text/html (or unset) AND
+      2. body (lowercased, first 64KB) contains any known error indicator.
+    """
+    if not body:
+        return None
+    # Skip non-HTML responses — JSON API errors are valid (the API surface
+    # is a legit asset, the error message is part of the contract).
+    if content_type and "html" not in content_type.lower():
+        return None
+    sample = body[: 64 * 1024].lower()
+    for indicator, reason in _ERROR_BODY_INDICATORS:
+        if indicator in sample:
+            return reason
+    return None
+
+
+@tool(
+    name="recon_url_validate",
+    description=(
+        "Validate a URL for AssetTree ingestion. Performs an HTTP HEAD probe "
+        "with fallback to GET, then a body-level error-page check. Returns "
+        "``verified=true`` ONLY if status_code is 200 AND body is not a "
+        "known error page (404/500/502/503/504/Kong/nginx default etc). "
+        "Use this BEFORE adding a URL node to the AssetTree — the AssetTree "
+        "add_node call requires a ``verification`` object whose ``verified`` "
+        "field must be true; passing the probe result of recon_url_validate "
+        "satisfies that contract."
+    ),
+    params={
+        "url": {"type": "string", "description": "Full URL (e.g. 'http://1.2.3.4:8080/admin')."},
+        "method": {
+            "type": "string",
+            "enum": ["HEAD", "GET"],
+            "description": "HTTP method. Default: GET (we need the body to check for error pages).",
+            "default": "GET",
+        },
+        "timeout_s": {
+            "type": "number",
+            "description": "Total request timeout. Default: 8.0 (slightly more than recon_http_probe to allow for slow servers).",
+            "default": 8.0,
+        },
+        "verify_ssl": {
+            "type": "boolean",
+            "description": "Verify TLS cert. Default: false (recon mode).",
+            "default": False,
+        },
+        "max_body_bytes": {
+            "type": "integer",
+            "description": "How many bytes of response body to read for error-page check. Default: 65536 (64KB).",
+            "default": 65536,
+        },
+    },
+    required=["url"],
+    execution_timeout_seconds=20.0,
+)
+async def recon_url_validate(
+    url: str,
+    method: str = "GET",
+    timeout_s: float = 8.0,
+    verify_ssl: bool = False,
+    max_body_bytes: int = 65536,
+) -> str:
+    """Probe URL + check body is not an error page.
+
+    Returns a dict with:
+      - verified: bool   (true only if status=200 AND body not an error page)
+      - reason: str|null (why verified is false; "ok" if verified is true)
+      - probe:  {status_code, server, content_type, title, final_url, error}
+      - verified_at: iso_ts (when the probe was run)
+    """
+    import ssl
+    from datetime import datetime, timezone
+
+    result: dict[str, Any] = {
+        "url": url,
+        "verified": False,
+        "reason": None,
+        "probe": {
+            "status_code": None,
+            "server": None,
+            "content_type": None,
+            "title": None,
+            "final_url": None,
+            "error": None,
+        },
+        "verified_at": None,
+    }
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):  # type: ignore[override]
+            return None
+
+    ctx = ssl.create_default_context()
+    if not verify_ssl:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    opener = urllib.request.build_opener(
+        _NoRedirect(),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+
+    req = urllib.request.Request(url, method=method)
+    req.add_header("User-Agent", "hack-deep-find/2.0 (validate)")
+
+    body = ""
+    try:
+        loop = asyncio.get_running_loop()
+        response = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: opener.open(req, timeout=timeout_s),
+            ),
+            timeout=timeout_s + 1,
+        )
+        result["probe"]["status_code"] = response.status
+        result["probe"]["final_url"] = response.geturl()
+        result["probe"]["server"] = response.headers.get("Server")
+        result["probe"]["content_type"] = response.headers.get("Content-Type")
+        # Read body for error-page check
+        try:
+            body = response.read(max_body_bytes).decode("utf-8", errors="ignore")
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                result["probe"]["title"] = title_match.group(1).strip()[:256]
+        except Exception as exc:
+            result["probe"]["error"] = f"body_read: {type(exc).__name__}: {exc}"
+    except urllib.error.HTTPError as exc:
+        result["probe"]["status_code"] = exc.code
+        result["probe"]["server"] = exc.headers.get("Server") if exc.headers else None
+        result["probe"]["content_type"] = exc.headers.get("Content-Type") if exc.headers else None
+        result["probe"]["error"] = f"HTTPError: {exc.code} {exc.reason}"
+    except (urllib.error.URLError, asyncio.TimeoutError, OSError) as exc:
+        result["probe"]["error"] = f"{type(exc).__name__}: {exc}"
+
+    # Final verdict
+    status = result["probe"]["status_code"]
+    if status is None:
+        result["reason"] = "no_response"
+    elif status != 200:
+        result["reason"] = f"status_{status}"
+    else:
+        # status == 200 — check body
+        body_error = _is_error_body(body, result["probe"]["content_type"])
+        if body_error:
+            result["reason"] = f"error_body:{body_error}"
+        else:
+            result["reason"] = "ok"
+            result["verified"] = True
+
+    result["verified_at"] = datetime.now(timezone.utc).isoformat()
+    return json.dumps(result, ensure_ascii=False)
+
+
 # ── Internal helpers (NOT exposed as tools) ─────────────────────────────
 
 

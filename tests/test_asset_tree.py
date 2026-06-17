@@ -172,7 +172,7 @@ class TestAssetTreeAddNode:
     def test_invalid_parent_raises(self) -> None:
         tree = AssetTree("example.com")
         with pytest.raises(ValueError, match="Invalid parent"):
-            tree.add_node(AssetType.SERVICE, "nginx", parent_id=tree.root_id)
+            tree.add_node(AssetType.SERVICE, "nginx", parent_id=tree.root_id, allow_unverified=True)
 
     def test_nonexistent_parent_raises(self) -> None:
         tree = AssetTree("example.com")
@@ -257,15 +257,15 @@ class TestAssetTreeQueries:
         ip2 = tree.add_node(AssetType.IP, "5.6.7.8", parent_id=api)
         ip3 = tree.add_node(AssetType.IP, "1.2.3.4", parent_id=admin)  # 共享
 
-        port80 = tree.add_node(AssetType.PORT, "80", parent_id=ip1)
-        port443a = tree.add_node(AssetType.PORT, "443", parent_id=ip1)
-        port22 = tree.add_node(AssetType.PORT, "22", parent_id=ip2)
-        port443b = tree.add_node(AssetType.PORT, "443", parent_id=ip3)
+        port80 = tree.add_node(AssetType.PORT, "80", parent_id=ip1, allow_unverified=True)
+        port443a = tree.add_node(AssetType.PORT, "443", parent_id=ip1, allow_unverified=True)
+        port22 = tree.add_node(AssetType.PORT, "22", parent_id=ip2, allow_unverified=True)
+        port443b = tree.add_node(AssetType.PORT, "443", parent_id=ip3, allow_unverified=True)
 
-        svc_http = tree.add_node(AssetType.SERVICE, "HTTP/NGINX", parent_id=port80)
-        svc_https_a = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port443a)
-        svc_ssh = tree.add_node(AssetType.SERVICE, "SSH", parent_id=port22)
-        svc_https_b = tree.add_node(AssetType.SERVICE, "HTTPS/Apache", parent_id=port443b)
+        svc_http = tree.add_node(AssetType.SERVICE, "HTTP/NGINX", parent_id=port80, allow_unverified=True)
+        svc_https_a = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port443a, allow_unverified=True)
+        svc_ssh = tree.add_node(AssetType.SERVICE, "SSH", parent_id=port22, allow_unverified=True)
+        svc_https_b = tree.add_node(AssetType.SERVICE, "HTTPS/Apache", parent_id=port443b, allow_unverified=True)
 
         return tree
 
@@ -415,7 +415,7 @@ class TestAssetTreeStats:
         assert tree.max_depth() == 1
         ip = tree.add_node(AssetType.IP, "1.2.3.4", parent_id=sub)
         assert tree.max_depth() == 2
-        tree.add_node(AssetType.PORT, "80", parent_id=ip)
+        tree.add_node(AssetType.PORT, "80", parent_id=ip, allow_unverified=True)
         assert tree.max_depth() == 3
 
     def test_len(self) -> None:
@@ -467,7 +467,7 @@ class TestAssetTreeRender:
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         ip = tree.add_node(AssetType.IP, "1.2.3.4", parent_id=sub)
         tree.update_state(ip, AssetState.DISCOVERED)
-        tree.add_node(AssetType.PORT, "443", parent_id=ip)
+        tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
 
         rendered = tree.render_tree()
         assert "[ROOT] example.com" in rendered
@@ -504,15 +504,15 @@ class TestWebSurfaceAssets:
         tree = AssetTree("example.com")
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
-        port = tree.add_node(AssetType.PORT, "443", parent_id=ip)
-        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port)
-        url = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc)
-        ep = tree.add_node(AssetType.ENDPOINT, "GET /v1/users/:id", parent_id=url)
+        port = tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
+        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True)
+        url = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc, allow_unverified=True)
+        ep = tree.add_node(AssetType.ENDPOINT, "GET /v1/users/:id", parent_id=url, allow_unverified=True)
         param = tree.add_node(AssetType.PARAMETER, "id", parent_id=ep)
         vec = tree.add_node(AssetType.INJECTION_VECTOR, "id:sqli", parent_id=param,
                             metadata={"category": "sqli", "verified": True})
         auth = tree.add_node(AssetType.AUTH_SURFACE, "/api/auth/login", parent_id=url,
-                             metadata={"kind": "login", "mfa": False})
+                             metadata={"kind": "login", "mfa": False}, allow_unverified=True)
         static = tree.add_node(AssetType.STATIC_ASSET, "/swagger.json", parent_id=url,
                                metadata={"leak_kind": "spec"})
         api_schema = tree.add_node(AssetType.API_SCHEMA, "openapi://api.example.com",
@@ -545,10 +545,10 @@ class TestWebSurfaceAssets:
         tree = AssetTree("example.com")
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
-        port = tree.add_node(AssetType.PORT, "443", parent_id=ip)
-        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port)
+        port = tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
+        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True)
         with pytest.raises(ValueError, match="Invalid parent"):
-            tree.add_node(AssetType.ENDPOINT, "/v1/users", parent_id=svc)
+            tree.add_node(AssetType.ENDPOINT, "/v1/users", parent_id=svc, allow_unverified=True)
 
     def test_find_injection_vectors_filters(self) -> None:
         tree, vec_id, _ = self._build_tree()
@@ -586,10 +586,10 @@ class TestWebSurfaceAssets:
         tree = AssetTree("example.com")
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
-        port = tree.add_node(AssetType.PORT, "443", parent_id=ip)
-        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port)
-        url1 = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc)
-        url2 = tree.add_node(AssetType.URL, "https://admin.example.com", parent_id=svc)
+        port = tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
+        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True)
+        url1 = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc, allow_unverified=True)
+        url2 = tree.add_node(AssetType.URL, "https://admin.example.com", parent_id=svc, allow_unverified=True)
         c1 = tree.add_node(AssetType.COMPONENT, "jquery 1.8.3", parent_id=url1)
         c2 = tree.add_node(AssetType.COMPONENT, "jquery 1.8.3", parent_id=url2)
         tree.add_node(AssetType.COMPONENT, "struts2 2.5.30", parent_id=url1)
@@ -611,9 +611,9 @@ class TestWebSurfaceAssets:
         # 链建好后，挂在 STATIC_ASSET 上允许
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
         ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
-        port = tree.add_node(AssetType.PORT, "443", parent_id=ip)
-        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port)
-        url = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc)
+        port = tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
+        svc = tree.add_node(AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True)
+        url = tree.add_node(AssetType.URL, "https://api.example.com", parent_id=svc, allow_unverified=True)
         static = tree.add_node(AssetType.STATIC_ASSET, "/app.js", parent_id=url)
         secret_id = tree.add_node(AssetType.SECRET, "AKIA-xxx", parent_id=static,
                                     metadata={"kind": "aws_key"})
