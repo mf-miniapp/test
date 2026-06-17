@@ -338,21 +338,23 @@ recon_diff_snapshots(snapshot_a_path=<older>, snapshot_b_path=<newer>)
 
 ```bash
 which naabu httpx subfinder katana nuclei nmap masscan ffuf dnsx asnmap tlsx cdncheck
-# brew (system tools):
-#   brew install nmap masscan ffuf tlsx
-# Go 工具 (proxy: export https_proxy=http://127.0.0.1:7897 GOPROXY=https://goproxy.cn,direct):
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/httpx/cmd/httpx@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/katana/cmd/katana@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/asnmap/cmd/asnmap@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
-#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
-#   # asnmap/tlsx 必须 CGO_ENABLED=0, 否则 cgo m1cpu init SIGSEGV
+# 1) brew (系统 / 不需要 Go toolchain):
+#   brew install nmap masscan ffuf
+# 2) projectdiscovery 9 个 (naabu/httpx/subfinder/katana/nuclei/dnsx/asnmap/tlsx/cdncheck):
+#   必须 CGO_ENABLED=0 编译, 否则 go-m1cpu init SIGSEGV.
+#   export CGO_ENABLED=0
+#   export https_proxy=http://127.0.0.1:7897 GOPROXY=https://goproxy.cn,direct
+#   go install -v -a github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+#   go install -v -a github.com/projectdiscovery/httpx/cmd/httpx@latest
+#   go install -v -a github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#   go install -v -a github.com/projectdiscovery/katana/cmd/katana@latest
+#   go install -v -a github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+#   go install -v -a github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+#   go install -v -a github.com/projectdiscovery/asnmap/cmd/asnmap@latest
+#   go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+#   go install -v -a github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
+# 3) 把 /Users/zlpc/go/bin 加到 $PATH 首位, 或者直接把 binary 拷到 /Users/zlpc/.local/bin/
 # nuclei 模板: nuclei -update-templates
-# PATH: 把 /Users/zlpc/go/bin 放到 $PATH 首位 (覆盖 brew tlsx 死链)
 # 验证: .venv/bin/python -c "from opensquilla.tools.builtin.recon import _binaries; print(_binaries.detect_all(refresh=True))"
 ```
 
