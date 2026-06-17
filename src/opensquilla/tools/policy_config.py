@@ -141,6 +141,10 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
             "asset_tree_list_siblings",
             "asset_tree_stats",
             "asset_tree_complete",
+            # v4.5 (2026-06-18) incremental re-discovery tool:
+            "asset_tree_diff_existing",
+            # v4.5.1 (2026-06-18) resume-scan plan tool:
+            "asset_tree_plan_pending",
         }
     ),
     "channel:chat": frozenset(

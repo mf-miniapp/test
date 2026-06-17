@@ -5,7 +5,7 @@ Tools:
   - recon_secret_scan_js_bundle  Fetch + scan a JS bundle URL
   - recon_secret_scan_git_history  Best-effort git history scan (local clone)
   - recon_secret_scan_env_dump   Parse .env / config file format
-  - recon_secret_classify        Classify a candidate secret + blast_radius
+  - recon_secret_classify        Classify a candidate secret by kind only (v4.5: blast_radius removed — attack-side view belongs to hack-deep W2)
   - recon_secret_validate_aws_key  Probe AWS STS GetCallerIdentity (read-only)
 
 Pure-stdlib; no external scanners.
@@ -268,29 +268,24 @@ async def recon_secret_scan_env_dump(text: str, source_hint: str = "env") -> str
 
 
 # ── 5. recon_secret_classify ─────────────────────────
-
-
-_BLAST_RADIUS: dict[str, str] = {
-    "aws_access_key_id": "critical",
-    "aws_secret_access_key": "critical",
-    "private_key": "critical",
-    "jwt_token": "high",
-    "github_pat": "high",
-    "slack_token": "high",
-    "google_api_key": "high",
-    "stripe_live_key": "critical",
-    "password_kv": "medium",
-    "db_connection_string": "high",
-    "internal_host": "medium",
-    "email": "low",
-}
+# v4.5 (2026-06-18): blast_radius field removed.
+# Rationale: blast_radius is an attack-side metric ("how bad is it if
+# exploited?"), and hack-deep-find's contract is "identify secrets, do
+# not evaluate exploitability". v4.4/v4 used to emit this field; v4.5
+# keeps only `kind` + structural metadata (`evidence_length`,
+# `context_preview`). Action recommendations ("rotate_immediately",
+# "investigate") also removed for the same reason. Downstream consumers
+# (hack-deep W2) compute blast_radius from the kind + context if needed.
 
 
 @tool(
     name="recon_secret_classify",
     description=(
-        "Classify a candidate secret: returns kind, blast_radius, and "
-        "recommended immediate action."
+        "v4.5: Classify a candidate secret by kind only. Returns `kind` "
+        "(aws_access_key_id / private_key / jwt / ...) and structural "
+        "metadata (evidence_length, context_preview). Does NOT return "
+        "blast_radius — that is an attack-side metric and lives in "
+        "hack-deep W2."
     ),
     params={
         "evidence": {"type": "string", "description": "The candidate secret value (or first 80 chars)."},
@@ -305,13 +300,9 @@ async def recon_secret_classify(evidence: str, context: str = "") -> str:
         if pat.search(e):
             kind = name
             break
-    blast = _BLAST_RADIUS.get(kind, "low")
-    action = "rotate_immediately" if blast == "critical" else "investigate" if blast in ("high", "medium") else "monitor"
     return json.dumps(
         {
             "kind": kind,
-            "blast_radius": blast,
-            "action": action,
             "evidence_length": len(e),
             "context_preview": (context or "")[:80],
         },

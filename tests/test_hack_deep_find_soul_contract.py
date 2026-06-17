@@ -39,7 +39,7 @@ api_surface_mapper = _specialists_pkg.api_surface_mapper
 content_classifier = _specialists_pkg.content_classifier
 osint_collector = _specialists_pkg.osint_collector
 secret_scanner = _specialists_pkg.secret_scanner
-surface_aggregator = _specialists_pkg.surface_aggregator
+tree_finalizer = _specialists_pkg.tree_finalizer  # v4.5 RENAME from surface_aggregator
 
 
 class TestHackDeepFindSoul:
@@ -200,8 +200,9 @@ class TestSpecialistPackages:
     def test_secret_scanner(self):
         self._check("secret-scanner", secret_scanner.SOUL_BODY)
 
-    def test_surface_aggregator(self):
-        self._check("surface-aggregator", surface_aggregator.SOUL_BODY)
+    def test_tree_finalizer(self):
+        # v4.5 RENAME: surface-aggregator -> tree-finalizer
+        self._check("tree-finalizer", tree_finalizer.SOUL_BODY)
 
     def test_leaf_verifier(self):
         self._check("leaf-verifier", leaf_verifier.SOUL_BODY)
@@ -220,7 +221,7 @@ class TestSpecialistPackages:
             "content-classifier": content_classifier.SOUL_BODY,
             "osint-collector": osint_collector.SOUL_BODY,
             "secret-scanner": secret_scanner.SOUL_BODY,
-            "surface-aggregator": surface_aggregator.SOUL_BODY,
+            "tree-finalizer": tree_finalizer.SOUL_BODY,
             "leaf-verifier": leaf_verifier.SOUL_BODY,
         }
         for sid, soul in souls.items():

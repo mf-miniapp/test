@@ -205,6 +205,13 @@ class AssetTree:
                 # v4 verification: re-record on dedup hit (re-check)
                 if verification and verification.get("verified"):
                     node.metadata["verification"] = verification
+                # v4.5 (2026-06-18) resurrection: if a previously
+                # ABANDONED node is rediscovered, flip it back to
+                # DISCOVERED. first_seen is preserved (historical
+                # record); only last_seen + state change. Soft-delete
+                # semantics: we never delete, only mark.
+                if node.state == AssetState.ABANDONED:
+                    node.state = AssetState.DISCOVERED
                 return existing_id
         else:
             # Parent-walk dedup: only check siblings under same parent.
@@ -219,6 +226,10 @@ class AssetTree:
                     # v4 verification: re-record on dedup hit
                     if verification and verification.get("verified"):
                         child.metadata["verification"] = verification
+                    # v4.5 (2026-06-18) resurrection: same as singleton
+                    # path — flip ABANDONED -> DISCOVERED on rediscovery.
+                    if child.state == AssetState.ABANDONED:
+                        child.state = AssetState.DISCOVERED
                     return child_id
 
         # v4 (2026-06-17) verification check: PORT / SERVICE / URL / ENDPOINT
@@ -274,10 +285,13 @@ class AssetTree:
             metadata=metadata or {},
         )
 
-        # v4 (2026-06-17): attach verification to metadata so the
+        # v4.5 (2026-06-18): attach verification to metadata so the
         # node record carries the probe envelope for downstream
-        # consumers (e.g. attack-priority-v1 evidence weights a URL
-        # with verified=True differently from one without).
+        # consumers. v4 used attack-priority-v1 evidence (since
+        # removed — see tree-finalizer rename); v4.5 consumers are
+        # tree-finalizer's liveness recheck (filters by verified=True
+        # before HEAD probe) and hack-deep W2 priority ranking
+        # (verified=True URLs are higher confidence).
         if verification and verification.get("verified"):
             if node.metadata is None:
                 node.metadata = {}

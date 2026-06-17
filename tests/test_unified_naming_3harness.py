@@ -15,10 +15,11 @@ Asserts:
    names: domain-expander, port-scanner, service-fingerprint,
    endpoint-crawler, storage-discoverer, webapp-discoverer,
    component-detector, api-surface-mapper, content-classifier,
-   osint-collector, secret-scanner, surface-aggregator, leaf-verifier.
+   osint-collector, secret-scanner, tree-finalizer, leaf-verifier.
    (v3 16-specialist list was consolidated in 2026-06-17 by 3-way merge
-   + 2 NEW; the 8 retired v3 names remain on disk for historical
-   reference but are NOT exposed via the specialists package.)
+   + 2 NEW; v4.5 (2026-06-18) RENAME surface-aggregator -> tree-finalizer
+   + REMOVE vuln-prioritizer. The 8 retired v3 names + vuln-prioritizer + 
+   surface-aggregator directories are removed from disk.)
 5. The specialists package's __init__ exposes BOTH the hyphenated
    attribute name (e.g. ``endpoint-crawler``) and the snake_case
    alias (``endpoint_crawler``) for backward compat.
@@ -92,7 +93,7 @@ SPECIALISTS = (
     "content-classifier",
     "osint-collector",
     "secret-scanner",
-    "surface-aggregator",
+    "tree-finalizer",
     "leaf-verifier",
 )
 
@@ -141,7 +142,7 @@ def test_specialists_package_exposes_hyphen_and_alias() -> None:
         ("content_classifier", "content-classifier"),
         ("osint_collector", "osint-collector"),
         ("secret_scanner", "secret-scanner"),
-        ("surface_aggregator", "surface-aggregator"),
+        ("tree_finalizer", "tree-finalizer"),
         ("leaf_verifier", "leaf-verifier"),
     ):
         assert hasattr(pkg, snake), f"missing {snake} alias"

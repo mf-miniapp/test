@@ -268,7 +268,7 @@ class TestCloneScriptHackDeepAllowAgent:
             "osint-collector",
             "secret-scanner",
             # Tier 4 - synthesis
-            "surface-aggregator",
+            "tree-finalizer",     # v4.5 RENAME from surface-aggregator
             # Tier 5 - terminal
             "leaf-verifier",
         )
@@ -647,8 +647,8 @@ class TestV3AdaptiveExecution:
             "domain-expander", "port-scanner", "service-fingerprint",
             "endpoint-crawler", "storage-discoverer", "webapp-discoverer",
             "component-detector", "api-surface-mapper", "content-classifier",
-            "osint-collector", "secret-scanner", "surface-aggregator",
-            "leaf-verifier",
+            "osint-collector", "secret-scanner", "tree-finalizer",
+            "leaf-verifier",  # v4.5 RENAME
         )
         for name in v4_active:
             assert name in mod.SPECIALIST_AGENTS, f"v4 specialist {name} missing"

@@ -210,6 +210,58 @@ class TestAssetTreeStateTransition:
         with pytest.raises(ValueError, match="Node not found"):
             tree.update_state("nope", AssetState.EXPLOITED)
 
+    # ── v4.5 resurrection tests (2026-06-18) ─────────────────
+    # When a previously ABANDONED node is rediscovered via
+    # add_node (singleton or parent-walk dedup hit), it should
+    # automatically flip back to DISCOVERED, with first_seen
+    # preserved and last_seen refreshed.
+
+    def test_singleton_resurrect_abandoned_on_rediscovery(self) -> None:
+        """v4.5: ABANDONED singleton rediscovered → DISCOVERED."""
+        tree = AssetTree("example.com")
+        ip_id = tree.add_node(AssetType.IP, "1.2.3.4")
+        # Manually mark abandoned
+        tree.update_state(ip_id, AssetState.ABANDONED)
+        original_first_seen = tree.get_node(ip_id).first_seen
+        # Rediscover (singleton dedup hit)
+        rediscovered_id = tree.add_node(AssetType.IP, "1.2.3.4")
+        assert rediscovered_id == ip_id
+        node = tree.get_node(ip_id)
+        assert node.state == AssetState.DISCOVERED, (
+            f"expected DISCOVERED after rediscovery, got {node.state}"
+        )
+        # first_seen preserved (historical record)
+        assert node.first_seen == original_first_seen
+        # last_seen should be >= original (refreshed on rediscovery)
+
+    def test_parent_walk_resurrect_abandoned_on_rediscovery(self) -> None:
+        """v4.5: ABANDONED per-parent-state type rediscovered → DISCOVERED."""
+        tree = AssetTree("example.com")
+        # Create a URL and a COOKIE under it (per-parent state type)
+        url_id = tree.add_node(AssetType.URL, "https://api.example.com", allow_unverified=True)
+        cookie_id = tree.add_node(
+            AssetType.COOKIE, "session=abc", parent_id=url_id
+        )
+        # Manually mark cookie as abandoned
+        tree.update_state(cookie_id, AssetState.ABANDONED)
+        # Rediscover the same cookie
+        rediscovered_id = tree.add_node(
+            AssetType.COOKIE, "session=abc", parent_id=url_id
+        )
+        assert rediscovered_id == cookie_id
+        node = tree.get_node(cookie_id)
+        assert node.state == AssetState.DISCOVERED
+
+    def test_singleton_dedup_no_resurrect_when_already_discovered(self) -> None:
+        """v4.5: DISCOVERED node rediscovered stays DISCOVERED (no-op)."""
+        tree = AssetTree("example.com")
+        ip_id = tree.add_node(AssetType.IP, "1.2.3.4")
+        tree.update_state(ip_id, AssetState.DISCOVERED)
+        # Rediscover
+        rediscovered_id = tree.add_node(AssetType.IP, "1.2.3.4")
+        assert rediscovered_id == ip_id
+        assert tree.get_node(ip_id).state == AssetState.DISCOVERED
+
     def test_update_metadata(self) -> None:
         tree = AssetTree("example.com")
         nid = tree.add_node(AssetType.IP, "1.2.3.4", metadata={"asn": "AS1"})

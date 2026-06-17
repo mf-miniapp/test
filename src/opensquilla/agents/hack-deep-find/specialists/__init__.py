@@ -5,72 +5,72 @@ Each specialist is a separate subpackage with its own SOUL_BODY.md and
 (``scripts/clone_hack_deep_find_specialists.py``) imports ``SOUL_BODY``
 from each to register the agent in ``~/.opensquilla/config.toml``.
 
-v4 (2026-06-17) refactor: 16 specialists -> 13 by consolidating
-3 v3 splits and adding 1 new aggregator. The 14 specialists are
-organized by 5 tiers:
+v4.5 (2026-06-18) refactor: 13 v4 specialists -> 13 active (1 rename
++ 1 removal + 1 field cleanup). Positioning fix: hack-deep-find is
+"discover every asset and verify it is real", not "rank attack
+surfaces". v4.5 specifically:
+
+  - DROP: vuln-prioritizer          (越界: 主动 nuclei 扫描是攻击侧工作)
+  - RENAME: surface-aggregator ->
+            tree-finalizer            (去 attack-priority-v1 攻击打分,
+                                       改为 asset-tree-v1 覆盖度+存活复核)
+  - CLEAN: secret-scanner            (去 blast_radius 字段, 仅做识别)
+
+The 13 active specialists are organized by 5 tiers:
 
   Tier 1 (network surface, 5):
-    - domain-expander       (replaces subdomain-discoverer + ip-resolver
-                             + seed-expander; v4 merge of F0 horizontal)
+    - domain-expander       (v4 merge: subdomain-discoverer + ip-resolver
+                             + seed-expander)
     - port-scanner          (v3 retained)
     - service-fingerprint   (v3 retained)
     - endpoint-crawler      (v3 retained)
-    - storage-discoverer    (renamed from cloud-storage for v4 clarity)
+    - storage-discoverer    (v4 rename: cloud-storage)
 
   Tier 2 (web surface, 4):
     - webapp-discoverer     (v3 retained)
-    - component-detector    (renamed from service-detailed)
-    - api-surface-mapper    (replaces api-surface + parameter-extract;
-                             v4 merge for schema_id link in one agent)
-    - content-classifier    (replaces static-asset + auth-mapper +
-                             cookie-header; v4 merge for one HTTP-pass
-                             of all 4 cross-cutting signals)
+    - component-detector    (v4 rename: service-detailed)
+    - api-surface-mapper    (v4 merge: api-surface + parameter-extract)
+    - content-classifier    (v4 merge: static-asset + auth-mapper +
+                             cookie-header)
 
   Tier 3 (horizontal / cross-layer, 2):
-    - osint-collector       (NEW in v4: external-source breadth from
-                             legacy intel-collection, with the
-                             hack-deep-find specialist contract)
-    - secret-scanner        (v3 retained)
+    - osint-collector       (v4 NEW: external-source breadth)
+    - secret-scanner        (v3 retained; v4.5 去掉 blast_radius)
 
-  Tier 4 (synthesis, 2):
-    - surface-aggregator    (NEW in v4: produces attack-priority-v1
-                             evidence from the AssetTree, replacing
-                             legacy attack-surface-enumeration's
-                             free-text output)
-    - vuln-prioritizer       (NEW in v4.4: nuclei-driven CVE
-                             priority scan; assets get an active
-                             vulnerability scan before handoff to
-                             hack-deep)
+  Tier 4 (synthesis, 1):
+    - tree-finalizer        (v4.5 RENAME: surface-aggregator ->
+                             asset-tree-v1, 去攻击打分)
 
   Tier 5 (terminal, 1):
     - leaf-verifier         (v3 retained)
 
-  Total: 14 specialists (v4: 13 by 3-way merge +2 new; v4.4 +vuln-prioritizer).
+  Total: 13 specialists (v4.5: -vuln-prioritizer, -surface-aggregator,
+  +tree-finalizer, -blast_radius 字段).
 
-Backward compat: the 8 retired v3 specialist names
-(subdomain-discoverer, ip-resolver, seed-expander, api-surface,
-parameter-extract, static-asset, auth-mapper, cookie-header) remain
-in the directory as DEPRECATED packages. They are NOT registered in
-``_SUBMODULES`` and NOT cloned by ``clone_hack_deep_find_specialists``.
-The clone script's ``SPECIALIST_AGENTS`` list also drops them.
-The v3 SOUL files stay on disk for historical reference but the
-runtime does not invoke them.
+Backward compat:
+  - 8 v3 retired names (subdomain-discoverer, ip-resolver, seed-expander,
+    api-surface, parameter-extract, static-asset, auth-mapper,
+    cookie-header) directories were physically removed in v4.4.
+  - 1 v4 retired name (vuln-prioritizer) directory removed in v4.5.
+  - 1 v4 renamed name (surface-aggregator -> tree-finalizer);
+    surface-aggregator directory removed in v4.5.
 
-v3 -> v4 wave count delta:
-  - F0 (root_domain):  v3 2 specialists (subdomain-discoverer + seed-expander) -> v4 2 specialists
-    (domain-expander + osint-collector). Same count, no IPC overhead.
-  - F1 (sub_domain):   v3 2 specialists (ip-resolver + cloud-storage) -> v4 2 specialists
-    (port-scanner is downstream of F1's IP, not F1; storage-discoverer
-    is unchanged from cloud-storage). Same.
+v3 -> v4 -> v4.5 wave count delta:
+  - F0 (root_domain):  v3 2 -> v4 2 -> v4.5 2 (no change)
+  - F1 (sub_domain):   v3 2 -> v4 2 -> v4.5 2 (no change)
   - F2.5 cross-owner: unchanged
-  - F6 (url):          v3 4 specialists (api-surface + static-asset +
-    auth-mapper + cookie-header) -> v4 2 specialists
-    (api-surface-mapper + content-classifier). -2 wave.
-  - F7 (endpoint):     v3 1 specialist (parameter-extract) -> v4 0
-    (folded into api-surface-mapper). -1 wave.
-  - F-final:           v3 1 step -> v4 2 steps
-    (surface-aggregator + handoff). +1 wave.
-  Net: -2 waves, +1 wave = -1 wave. Total F0-F-final waves: 7+1 = 8.
+  - F6 (url):          v3 4 -> v4 2 -> v4.5 2 (no change)
+  - F7 (endpoint):     v3 1 -> v4 0 -> v4.5 0 (no change)
+  - F-final:           v3 1 -> v4 2 -> v4.5 2 (no change;
+                         surface-aggregator -> tree-finalizer is
+                         only a schema rename, same wave count)
+  Net: 8 waves unchanged.
+
+v4.5 定位 contract (replace v4 "给 hack-deep 找出可打的面" 错位定位):
+  hack-deep-find = 全部资产 + 真实验证
+    -> 输出 raw AssetTree + asset-tree-v1 (覆盖度报告 + 存活复核)
+    -> 不做: exploitability_score / CVE 关联 / specialist 推荐
+    -> 不做: nuclei 主动漏洞扫描 (那是 hack-deep W2 的工作)
 """
 
 from __future__ import annotations
@@ -83,30 +83,25 @@ _SUBMODULES = (
     # we use import_module to import them and expose them as
     # attributes for the clone script's convenience).
     #
-    # v4 (2026-06-17): 13 specialists across 5 tiers. The 8 retired
-    # v3 names (subdomain-discoverer, ip-resolver, seed-expander,
-    # api-surface, parameter-extract, static-asset, auth-mapper,
-    # cookie-header) are NOT in this tuple; their SOUL_BODY.md
-    # files remain on disk for reference but the clone script
-    # does not register them in config.toml.
-    #
+    # v4.5 (2026-06-18): 13 specialists across 5 tiers.
+    # The 10 retired names (8 v3 + 1 v4 vuln-prioritizer +
+    # 1 v4 surface-aggregator renamed) are NOT in this tuple.
     # Tier 1 - network surface (5)
-    "domain-expander",        # v4 merge: subdomain-discoverer + ip-resolver + seed-expander
+    "domain-expander",        # v4 merge
     "port-scanner",           # v3 retained
     "service-fingerprint",    # v3 retained
     "endpoint-crawler",       # v3 retained
-    "storage-discoverer",     # v4 rename: cloud-storage -> storage-discoverer
+    "storage-discoverer",     # v4 rename
     # Tier 2 - web surface (4)
     "webapp-discoverer",      # v3 retained
-    "component-detector",     # v4 rename: service-detailed -> component-detector
-    "api-surface-mapper",     # v4 merge: api-surface + parameter-extract
-    "content-classifier",     # v4 merge: static-asset + auth-mapper + cookie-header
+    "component-detector",     # v4 rename
+    "api-surface-mapper",     # v4 merge
+    "content-classifier",     # v4 merge
     # Tier 3 - horizontal / cross-layer (2)
-    "osint-collector",        # v4 NEW: external-source breadth (Shodan/Censys/...)
-    "secret-scanner",         # v3 retained
+    "osint-collector",        # v4 NEW
+    "secret-scanner",         # v3 retained (v4.5: -blast_radius)
     # Tier 4 - synthesis (1)
-    "surface-aggregator",     # v4 NEW: AssetTree -> attack-priority-v1
-    "vuln-prioritizer",       # v4.4 NEW: nuclei-driven CVE priority scan
+    "tree-finalizer",         # v4.5 RENAME from surface-aggregator
     # Tier 5 - terminal (1)
     "leaf-verifier",          # v3 retained
 )
@@ -117,8 +112,6 @@ _SUBMODULES = (
 # import endpoint_crawler). The clone script is migrated to use
 # the hyphenated names in 2026-06-15.
 _ALIAS = {
-    # v4 active specialists (13). ONLY these names have a matching
-    # entry in _SUBMODULES; importing via these names works.
     "domain-expander": "domain_expander",
     "port-scanner": "port_scanner",
     "service-fingerprint": "service_fingerprint",
@@ -130,14 +123,14 @@ _ALIAS = {
     "content-classifier": "content_classifier",
     "osint-collector": "osint_collector",
     "secret-scanner": "secret_scanner",
-    "surface-aggregator": "surface_aggregator",
-    "vuln-prioritizer": "vuln_prioritizer",
+    "tree-finalizer": "tree_finalizer",
     "leaf-verifier": "leaf_verifier",
 }
 
-# v3 retired specialist names. v4.4: the directories have been
-# physically removed from disk. This constant is kept for historical
-# documentation and for any audit log that references the v3 names.
+# Retired specialist names. v4.4: the 8 v3 directories were physically
+# removed from disk. v4.5: vuln-prioritizer + surface-aggregator also
+# removed. This constant is kept for historical documentation and for
+# any audit log that references the v3/v4 names.
 _RETIRED_V3_SPECIALISTS: tuple[str, ...] = (
     "subdomain-discoverer",  # v4 merged into domain-expander
     "ip-resolver",           # v4 merged into domain-expander
@@ -149,6 +142,11 @@ _RETIRED_V3_SPECIALISTS: tuple[str, ...] = (
     "cookie-header",         # v4 merged into content-classifier
     "cloud-storage",         # v4 renamed to storage-discoverer
     "service-detailed",      # v4 renamed to component-detector
+)
+
+_RETIRED_V4_SPECIALISTS: tuple[str, ...] = (
+    "vuln-prioritizer",      # v4.5 removed (越界: 主动 nuclei 扫描)
+    "surface-aggregator",    # v4.5 renamed to tree-finalizer
 )
 
 # Eagerly import each so SOUL_BODY is hot-loaded when the clone script

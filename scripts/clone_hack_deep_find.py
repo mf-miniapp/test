@@ -78,7 +78,7 @@ SPECIALIST_AGENTS: tuple[str, ...] = (
     "osint-collector",        # v4 NEW
     "secret-scanner",
     # Tier 4 - synthesis (1)
-    "surface-aggregator",     # v4 NEW
+    "tree-finalizer",         # v4.5 RENAME from surface-aggregator (去 attack-priority-v1 攻击打分)
     # Tier 5 - terminal (1)
     "leaf-verifier",
     # Phase 3 handoff target (not a v4 specialist but must be
@@ -207,12 +207,18 @@ async def _register_in_config() -> None:
         "v4 consolidates 16 v3 specialists into 13 by merging 3 same-source "
         "splits (subdomain+ip+seed -> domain-expander; api+parameter -> "
         "api-surface-mapper; static+auth+cookie-header -> content-classifier) "
-        "and adding 2 new specialists (osint-collector for external-source "
-        "breadth, surface-aggregator for typed attack-priority-v1 synthesis). "
-        "Manages a persistent AssetTree via asset_tree_* tools. Never "
-        "invokes exploit / payload tools. Phase 3 wires the "
-        "find-complete-v1 handoff (now also carrying attack_priority_evidence "
-        "from surface-aggregator) to hack-deep at end-of-run."
+        "and 1 new specialist (osint-collector for external-source breadth). "
+        "v4.5 positioning fix (2026-06-18): hack-deep-find's job is discover "
+        "every asset and verify it is real, not rank attack surfaces. v4.5 vs v4: "
+        "(1) vuln-prioritizer REMOVED (nuclei scan is attack-side work); "
+        "(2) surface-aggregator RENAMED to tree-finalizer, schema attack-priority-v1 "
+        "-> asset-tree-v1 (coverage report + URL liveness recheck, no "
+        "exploitability_score); (3) secret-scanner: blast_radius field "
+        "deprecated. v4.5 has 13 specialists. Manages a persistent AssetTree via "
+        "asset_tree_* tools. Never invokes exploit / payload tools. Never calls "
+        "recon_nuclei_scan. Phase 3 wires the find-complete-v1 handoff to "
+        "hack-deep at end-of-run; hack-deep W2 does its own priority ranking "
+        "and nuclei call."
     )
 
     ids = {a.id for a in cfg.agents}

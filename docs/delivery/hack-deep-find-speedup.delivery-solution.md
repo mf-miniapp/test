@@ -20,7 +20,7 @@
 | B1 | **per-subdomain / per-bucket 串行 LLM round** | `SOUL_BODY.md:397-428` (F1.5) / `:486-518` (F3.5) | 30+ round (F1.5) + 5+ round (F3.5)，每 round 1 spawn |
 | B2 | **per-parent spawn 串行锁** | `sessions.py:226-243`, `:568-571` | 同一 parent 内 `async with spawn_lock` 把"单消息 4 个 spawn" 串行化 4 次 |
 | B3 | **Specialist 内部串行 tool-call** | `specialists/domain-expander/SOUL_BODY.md:43-87` (50-100 DNS 串行) | 100+ round/specialist |
-| B4 | **surface-aggregator 把整棵 AssetTree 读进 LLM** | `specialists/surface-aggregator/SOUL_BODY.md:32-49` | O(N) 节点 × N round, 单 round 20-60s |
+| B4 | (v4.5 撤回: surface-aggregator 越界做 attack-priority 排序, v4.5 改名为 tree-finalizer, 输出覆盖度报告 + HEAD 存活复核, 整段优化建议改写为 S5') | — | — |
 | B5 | **System prompt 过大** | `SOUL_BODY.md` 56KB / specialist 100-200 行 | 每 round 40-80K input tokens |
 | B6 | **同 URL 3 specialist 各做 1 次 HTTP** | F3.5: webapp / content / api 各 1 探 | 3× 网络往返 / URL |
 | B7 | **F2.5 跨 owner dispatch envelope 链** | `SOUL_BODY.md:447-485` | find→deep→vuln-triage→deep→find 5 跳 |
@@ -152,33 +152,56 @@ async def http_batch_probe(
 
 **效果**: F3.5 单 host 网络请求数 3→1, wall-clock 减 60%; specialist round 数同 S1 减少。
 
-#### S5. surface-aggregator 改 "读 metadata 索引 + 选择性 LLM 调"（-1 round, -90% token）
+#### S5'. (v4.5 替换 S5) tree-finalizer — 全 Python 化, 不进 LLM, -1 round 砍掉
 
-**现状**：`specialists/surface-aggregator/SOUL_BODY.md:32-49` 读整棵 AssetTree 进 LLM, 1000+ 节点 → 200K token。
-**改**：拆成 "Python 索引 + LLM 调".
+**v4.5 定位纠偏**: hack-deep-find 不再做 attack-priority 排序 (那是 hack-deep W2 的工作)。
+tree-finalizer 只输出 2 类信息:
+  1. **节点统计 + coverage_gaps** — 纯 Python 可计算 (遍历 tree, 检查 evidence 完整性)
+  2. **URL 存活复核** — 调 `recon_http_probe(HEAD)` 即可, 不需要 LLM 参与
+
+**新方案 (整段从 S5 改写)**:
 
 ```python
-# 新工具 src/opensquilla/tools/builtin/asset_tree/priority_index.py
-@tool(name="asset_tree_priority_candidates", ...)
-async def asset_tree_priority_candidates(
+# 新工具 src/opensquilla/tools/builtin/asset_tree/coverage_report.py
+@tool(name="asset_tree_coverage_report", ...)
+async def asset_tree_coverage_report(tree_path: str) -> str:
+    # 纯 Python 遍历 tree, 不调 LLM:
+    # 1. 节点总数 + nodes_by_type 统计
+    # 2. verified URL 比例
+    # 3. coverage_gaps: 每条 SERVICE/URL 路径上 4 类 evidence
+    #    (component / auth / disclosure / secret) 缺哪些
+    # 4. evidence 路径缺失检查
+    # 返回 {summary, coverage_gaps, missing_evidence} JSON。
+    ...
+```
+
+**URL 存活复核并行化**:
+
+```python
+# 新工具 src/opensquilla/tools/builtin/asset_tree/liveness_recheck.py
+@tool(name="asset_tree_liveness_recheck", ...)
+async def asset_tree_liveness_recheck(
     tree_path: str,
-    max_candidates: int = 50,
+    concurrency: int = 20,
+    timeout_s: float = 5.0,
 ) -> str:
-    """纯 Python 计算, 不调 LLM:
-    1. 遍历 tree, 收集 (CVE 关联 / default-creds / secret-hit / info-leak)
-       命中的节点, 每节点算 exploitability_score (0-100, 启发式)
-    2. 排序, 取 top-N
-    3. 返回 [{node_id, score, reasons[]}, ...]"""
+    # 并发 HEAD 探测 verified=true 的 URL, 限流 20/s, 返回 {url_liveness: [...]}
+    ...
 ```
 
-**specialist SOUL 改**:
+**tree-finalizer SOUL 改**:
 ```text
-2. 调 asset_tree_priority_candidates(tree_path, max=50) → top 50 候选
-3. 只把 top 50 的 summary 读进 LLM, 让 LLM 写 attack-priority-v1 evidence
-   (避免全树进 context)
+1. 调 asset_tree_coverage_report(tree_path) -> coverage 报告
+2. 调 asset_tree_liveness_recheck(tree_path) -> URL 存活状态
+3. 拼 asset-tree-v1 evidence, 无 LLM round
 ```
 
-**效果**: surface-aggregator round 1 的 input token 200K → 5K (-97%), 1 round wall-clock 30s → 3s。
+**效果 (vs v4 surface-aggregator)**:
+  - 砍掉 1 个 LLM round (specialist 直接被 tool 取代, F-final-pre 不再 spawn)
+  - input token: 200K -> 0 (LLM 不参与)
+  - wall-clock: 30s -> ~2s (Python 遍历 + 并发 HEAD)
+  - 编排器侧: F-final = 1 step 即可 (而不是 v4 的 2 steps)
+  - 职责回归正位: find 只产资产, 排序由 hack-deep 自己来
 
 ---
 

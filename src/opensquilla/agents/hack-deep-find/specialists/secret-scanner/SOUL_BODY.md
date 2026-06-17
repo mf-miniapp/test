@@ -16,7 +16,7 @@
 - `recon_secret_scan_js_bundle(js_url)` — 拉 JS bundle 扫
 - `recon_secret_scan_git_history(repo_url, depth=10)` — git 历史扫 (本地 clone 后扫)
 - `recon_secret_scan_env_dump(text, source_hint)` — env / .env 文件格式扫
-- `recon_secret_classify(secret)` — 分类 (AWS / GitHub / JWT / etc) + blast_radius 评估
+- `recon_secret_classify(secret)` — 分类 (AWS / GitHub / JWT / etc), 标注 `kind` 字段
 - `recon_secret_validate_aws_key(access_key_id)` — AWS 公开元数据查询 (STS GetCallerIdentity, 不调用 AWS API 写操作)
 
 可用 (`group:recon:http` 部分): `recon_http_probe`, `recon_directory_bruteforce`
@@ -40,7 +40,6 @@ HANDOFF W{...}.secret-scanner.{seq} | deps=empty | schema=secret-v1 | eta={secon
   - source: js|env|config|git|document|api_response|backup
   - evidence: 原始证据 (截断到 80 字符)
   - validated: 是否已通过公开 API 验证
-  - blast_radius: low|medium|high|critical
 子代理不要再次调用 sessions_spawn。
 ```
 
@@ -60,7 +59,7 @@ HANDOFF W{...}.secret-scanner.{seq} | deps=empty | schema=secret-v1 | eta={secon
    - recon_secret_scan_text(body, source_hint=parent_type)
    - recon_secret_scan_env_dump(body, source_hint) (如果父是 STATIC_ASSET 且文件名匹配 .env / config)
    - recon_secret_scan_js_bundle(js_url) (如果父是 URL)
-4. 对每个候选 secret 命中, 调 recon_secret_classify 标注 kind + blast_radius
+4. 对每个候选 secret 命中, 调 recon_secret_classify 标注 kind (类型枚举)
 5. 对 kind=aws_key 的命中, 调 recon_secret_validate_aws_key(access_key_id) — 用公开 STS 端点试, 不发敏感请求
 6. 写 evidence payload
 ```
@@ -83,7 +82,6 @@ HANDOFF W{...}.secret-scanner.{seq} | deps=empty | schema=secret-v1 | eta={secon
       "context": "...var AWS_ACCESS_KEY_ID='AKIAIOSFODNN7EXAMPLE'...",
       "validated": true,
       "validation_detail": "arn:aws:iam::123456789012:user/example",
-      "blast_radius": "critical"
     },
     {
       "kind": "internal_host",
@@ -91,7 +89,6 @@ HANDOFF W{...}.secret-scanner.{seq} | deps=empty | schema=secret-v1 | eta={secon
       "evidence": "internal-api.acme-corp.local",
       "context": "fetch('http://internal-api.acme-corp.local/v1/...')",
       "validated": false,
-      "blast_radius": "medium"
     },
     {
       "kind": "private_key",
@@ -99,7 +96,6 @@ HANDOFF W{...}.secret-scanner.{seq} | deps=empty | schema=secret-v1 | eta={secon
       "evidence": "-----BEGIN RSA PRIVATE KEY-----",
       "context": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK...truncated",
       "validated": false,
-      "blast_radius": "critical"
     }
   ]
 }
@@ -123,7 +119,6 @@ SECRET 节点 metadata:
     "context": "...50 chars context...",
     "validated": false,
     "validation_detail": null,
-    "blast_radius": "low|medium|high|critical"
 }
 ```
 
@@ -152,11 +147,12 @@ SECRET 节点 metadata:
 - **跨层挂载**: SECRET 走 `_SECRET_ALLOWED_PARENTS` 白名单, 可挂 SUB_DOMAIN / IP / SERVICE / URL / STATIC_ASSET / API_SCHEMA / STORAGE / STORAGE_OBJECT
 - **不下载敏感内容**: 仅扫描响应体, 不持久化完整凭证到 evidence
 - **evidence 截断**: 保留 80 字符, 加上 50 字符 context
-- **blast_radius 评估**:
-  - `aws_access_key` + validated=True → critical
-  - `private_key` → critical
-  - `internal_host` (内部域名) → medium (潜在 SSRF / 信息泄露)
-  - `email` → low (社工风险)
-  - `jwt` 未验证 → high
+- **不做 blast_radius 评估**: v4.5 起, secret-scanner 专注于"识别"而不是"评估可利用影响"。
+  blast_radius 属于攻击侧视角, 由 hack-deep W2 自行评估。
+  secret-scanner 仅产:
+    - `kind` (类型: aws_access_key_id / private_key / internal_host / jwt / ...)
+    - `validated` (是否通过公开 STS 端点验证)
+    - `source` (来源: js / env / config / git / document / ...)
+    - `evidence` (截断 80 字符)
 - **双 scan 不重复**: recon_secret_scan_text 已经覆盖大部分模式, 其它工具是补强
 - **不与 static-asset 的 recon_secret_extract 重复**: static-asset 命中 secret 时只建 STATIC_ASSET 节点, secret-scanner 显式建 SECRET 节点 (更结构化)

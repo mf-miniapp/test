@@ -940,3 +940,367 @@ async def asset_tree_merge(
 
     summary["target_stats"] = target.stats()
     return json.dumps(summary, ensure_ascii=False, default=str)
+
+
+# ── v4.5 增量更新工具 (2026-06-18) ────────────────────
+# Soft-delete / resurrect semantics for incremental asset discovery.
+# When hack-deep-find runs F0 / F1 / F3.5 again on a previously-scanned
+# target, the LLM-coordinator needs:
+#   (a) The set of nodes present in the tree that were NOT redetected
+#       in the current wave -> mark ABANDONED.
+#   (b) The set of nodes already ABANDONED that WERE redetected ->
+#       flipped back to DISCOVERED automatically (handled in tree.py
+#       add_node dedup hit path).
+#   (c) A summary of new vs preserved vs abandoned so the LLM can
+#       write a clean evidence block at the end of the wave.
+
+
+@tool(
+    name="asset_tree_diff_existing",
+    description=(
+        "v4.5: For incremental re-discovery on a target that has "
+        "already been scanned. Returns 3 lists:\n"
+        "  - 'preserved': existing DISCOVERED/UNSEEN nodes whose "
+        "(asset_type, value) appears in the current evidence. The "
+        "caller does NOT need to call add_node for these — they are "
+        "still in the tree and will be dedup-hit on add_node (which "
+        "also auto-resurrects any ABANDONED ones).\n"
+        "  - 'abandoned_candidates': existing DISCOVERED/UNSEEN nodes "
+        "whose (asset_type, value) does NOT appear in the current "
+        "evidence. The caller should call asset_tree_update_state for "
+        "each of these to mark them ABANDONED. Soft-delete: the node "
+        "is kept in the tree (not removed); if the same asset comes "
+        "back in a future wave, add_node will resurrect it.\n"
+        "  - 'rediscovered_abandoned': nodes that were ABANDONED but "
+        "are now in the current evidence. The caller does NOT need to "
+        "do anything for these — the upcoming add_node call will "
+        "auto-resurrect them. This list is informational.\n"
+        "Returns the lists as JSON arrays of {node_id, asset_type, "
+        "value, state, last_seen, parent_id}. The LLM-coordinator "
+        "uses this to drive the 'incremental re-discovery' workflow "
+        "without re-reading the entire AssetTree."
+    ),
+    params={
+        "tree_id": {"type": "string", "description": "Tree id."},
+        "current_evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "description": (
+                    "An asset from the current wave's specialist "
+                    "evidence. Required: 'asset_type' and 'value'. "
+                    "Optional: 'parent_value' (matches the existing "
+                    "tree node's parent_id by traversing parent "
+                    "value->id for per-parent-state types like "
+                    "COOKIE / HEADER / PARAMETER / STATIC_ASSET)."
+                ),
+            },
+            "description": (
+                "List of {asset_type, value, [parent_value]} from "
+                "the current wave's specialist evidence. Typically the "
+                "union of all specialist findings for the wave."
+            ),
+        },
+    },
+    required=["tree_id", "current_evidence"],
+)
+async def asset_tree_diff_existing(
+    tree_id: str,
+    current_evidence: list[dict[str, Any]],
+) -> str:
+    """Compute preserved / abandoned_candidates / rediscovered_abandoned.
+
+    This is a read-only tool. It does NOT mutate the tree. The caller
+    is expected to:
+      1. Call add_node for everything in `current_evidence` (which
+         dedup-hits preserved items, resurrects rediscovered_abandoned
+         items, and creates new items).
+      2. Call update_state(id, ABANDONED) for every node in
+         `abandoned_candidates`.
+    """
+    tree = _load_tree(tree_id)
+
+    # Build a set of (asset_type, value) tuples from the current
+    # evidence for fast lookup.
+    current_set: set[tuple[str, str]] = set()
+    for entry in current_evidence or []:
+        at = (entry.get("asset_type") or "").strip()
+        v = (entry.get("value") or "").strip()
+        if at and v:
+            current_set.add((at, v))
+
+    preserved: list[dict[str, Any]] = []
+    abandoned_candidates: list[dict[str, Any]] = []
+    rediscovered_abandoned: list[dict[str, Any]] = []
+
+    for node in tree._nodes.values():
+        # ROOT_DOMAIN is the run target itself; it represents the
+        # scope of the run, not a discovered asset. Never mark it
+        # ABANDONED (that would orphan the rest of the tree).
+        if node.asset_type == AssetType.ROOT_DOMAIN:
+            continue
+        key = (node.asset_type.value, node.value)
+        is_currently_active = node.state in (
+            AssetState.DISCOVERED,
+            AssetState.UNSEEN,
+        )
+        in_current_wave = key in current_set
+        if is_currently_active and in_current_wave:
+            preserved.append({
+                "node_id": node.id,
+                "asset_type": node.asset_type.value,
+                "value": node.value,
+                "state": node.state.value,
+                "last_seen": node.last_seen.isoformat() if node.last_seen else None,
+                "parent_id": node.parent_id,
+            })
+        elif is_currently_active and not in_current_wave:
+            abandoned_candidates.append({
+                "node_id": node.id,
+                "asset_type": node.asset_type.value,
+                "value": node.value,
+                "state": node.state.value,
+                "last_seen": node.last_seen.isoformat() if node.last_seen else None,
+                "parent_id": node.parent_id,
+                "abandoned_at": _utcnow_iso(),
+            })
+        elif node.state == AssetState.ABANDONED and in_current_wave:
+            rediscovered_abandoned.append({
+                "node_id": node.id,
+                "asset_type": node.asset_type.value,
+                "value": node.value,
+                "state": node.state.value,
+                "last_seen": node.last_seen.isoformat() if node.last_seen else None,
+                "parent_id": node.parent_id,
+            })
+
+    return json.dumps(
+        {
+            "tree_id": tree_id,
+            "current_wave_size": len(current_set),
+            "preserved": preserved,
+            "abandoned_candidates": abandoned_candidates,
+            "rediscovered_abandoned": rediscovered_abandoned,
+            "summary": {
+                "preserved_count": len(preserved),
+                "abandoned_candidates_count": len(abandoned_candidates),
+                "rediscovered_abandoned_count": len(rediscovered_abandoned),
+            },
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@tool(
+    name="asset_tree_plan_pending",
+    description=(
+        "v4.5.1: For incremental re-discovery on a target that has "
+        "already been scanned but is incomplete. Returns a structured "
+        "plan the LLM-coordinator can use to drive a 'resume scan' "
+        "loop:\n"
+        "  - 'completion_pct': 1 - (unseen / total) - when this "
+        "reaches 1.0 the tree is fully built.\n"
+        "  - 'incomplete_by_type_state': {asset_type: {state: count}} "
+        "for nodes still in UNSEEN state. The LLM uses this to "
+        "decide which specialists to dispatch.\n"
+        "  - 'pending_waves': a list of waves to run, each with the "
+        "target asset_type, count, and recommended specialists. "
+        "Wave mapping (per SOUL_BODY.md F0-F-final):\n"
+        "    W1   <- ip:unseen  (port-scanner), port:unseen "
+        "(service-fingerprint, optionally webapp-discoverer)\n"
+        "    W1.5 <- sub_domain:unseen, service:unseen, "
+        "storage:unseen (webapp-discoverer, component-detector, "
+        "storage-discoverer, secret-scanner)\n"
+        "    W3.5 <- url:unseen, endpoint:unseen, component:unseen "
+        "(webapp-discoverer, content-classifier, api-surface-mapper)\n"
+        "  - 'abandoned_to_retry': list of ABANDONED non-root_domain "
+        "nodes the LLM may want to revisit (e.g. an IP that was "
+        "temporarily unreachable but is back). Read-only; resurrection "
+        "happens automatically when add_node dedup-hits.\n"
+        "  - 'discovered_breakdown' / 'triaged_or_exploited_breakdown': "
+        "supporting counts for sanity check.\n"
+        "  - 'sample_unseen': a small (<=10) sample of unseen nodes per "
+        "asset_type for the LLM to know the values before dispatching "
+        "(so it doesn't have to make a second read of the tree).\n"
+        "Read-only tool - does NOT mutate the tree."
+    ),
+    params={
+        "tree_id": {
+            "type": "string",
+            "description": "Tree id (e.g. '10jqka.com.cn').",
+        },
+        "max_sample_per_type": {
+            "type": "integer",
+            "description": (
+                "Max unseen node values to sample per asset_type in "
+                "'sample_unseen'. Default 10, capped at 50."
+            ),
+        },
+    },
+    required=["tree_id"],
+)
+async def asset_tree_plan_pending(
+    tree_id: str,
+    max_sample_per_type: int = 10,
+) -> str:
+    """Build a resume-scan plan for an incomplete asset tree.
+
+    Walks the tree, groups incomplete (UNSEEN) nodes by asset_type,
+    maps them to the wave that owns that asset_type, and surfaces
+    ABANDONED nodes as a retry candidate list. Read-only.
+    """
+    tree = _load_tree(tree_id)
+
+    cap = max(0, min(int(max_sample_per_type or 0), 50))
+
+    # Wave assignment by asset_type. UNSEEN-only - DISCOVERED/TRIAGED/
+    # EXPLOITED nodes are considered done.
+    # v4.5.1 fix: SUB_DOMAIN:unseen -> W0.5 (not W1.5). v3-residual
+    # mapping put it under W1.5 which dragged webapp-discoverer
+    # onto the wrong fanout object (sub_domain has no port context,
+    # webapp-discoverer needs a service with banner).
+    WAVE_BY_TYPE: dict[str, str] = {
+        AssetType.SUB_DOMAIN.value: "W0.5",   # ← W0.5: domain-expander / osint-collector
+        AssetType.IP.value: "W1",
+        AssetType.PORT.value: "W1",
+        AssetType.SERVICE.value: "W1.5",      # ← W1.5: webapp-discoverer / component-detector (per-service)
+        AssetType.STORAGE.value: "W1.5",     # ← W1.5: storage-discoverer (per-subdomain via parent)
+        AssetType.URL.value: "W3.5",         # ← W3.5: webapp-discoverer / content-classifier / api-surface-mapper (per-url)
+        AssetType.ENDPOINT.value: "W3.5",
+        AssetType.COMPONENT.value: "W3.5",   # ← component-detector 也可在此二探 (per-url JS bundle)
+    }
+    SPECIALISTS_BY_WAVE: dict[str, list[str]] = {
+        "W0.5": ["domain-expander", "osint-collector"],
+        "W1": ["port-scanner", "service-fingerprint"],
+        "W1.5": [
+            "webapp-discoverer",     # per-service
+            "component-detector",    # per-service (also per-url for JS bundle)
+            "storage-discoverer",    # per-subdomain (via parent walk)
+            "secret-scanner",        # per-url
+        ],
+        "W3.5": [
+            "webapp-discoverer",     # per-url — dir busting / path discovery
+            "content-classifier",    # per-url — page type / auth surface
+            "api-surface-mapper",    # per-url — endpoint / parameter / API schema
+        ],
+    }
+
+    # Counters
+    total = 0
+    unseen_count = 0
+    incomplete_by_type_state: dict[str, dict[str, int]] = {}
+    discovered_breakdown: dict[str, int] = {}
+    triaged_or_exploited_breakdown: dict[str, int] = {}
+    sample_unseen: dict[str, list[dict[str, Any]]] = {}
+    abandoned_to_retry: list[dict[str, Any]] = []
+
+    for node in tree._nodes.values():
+        if node.asset_type == AssetType.ROOT_DOMAIN:
+            continue
+        total += 1
+        at = node.asset_type.value
+        st = node.state.value
+        if node.state == AssetState.UNSEEN:
+            unseen_count += 1
+            slot = incomplete_by_type_state.setdefault(at, {})
+            slot[st] = slot.get(st, 0) + 1
+            cap_t = sample_unseen.setdefault(at, [])
+            if cap == 0 or len(cap_t) < cap:
+                cap_t.append({
+                    "node_id": node.id,
+                    "value": node.value,
+                    "parent_id": node.parent_id,
+                    "first_seen": (
+                        node.first_seen.isoformat()
+                        if node.first_seen
+                        else None
+                    ),
+                })
+        elif node.state == AssetState.DISCOVERED:
+            discovered_breakdown[at] = discovered_breakdown.get(at, 0) + 1
+        elif node.state in (
+            AssetState.TRIAGED,
+            AssetState.EXPLOITED,
+        ):
+            triaged_or_exploited_breakdown[at] = (
+                triaged_or_exploited_breakdown.get(at, 0) + 1
+            )
+        elif node.state == AssetState.ABANDONED:
+            abandoned_to_retry.append({
+                "node_id": node.id,
+                "asset_type": at,
+                "value": node.value,
+                "parent_id": node.parent_id,
+                "last_seen": (
+                    node.last_seen.isoformat() if node.last_seen else None
+                ),
+            })
+
+    # Build pending_waves from incomplete_by_type_state.
+    wave_counts: dict[str, int] = {}
+    wave_types: dict[str, list[str]] = {}
+    for at, by_state in incomplete_by_type_state.items():
+        wave = WAVE_BY_TYPE.get(at)
+        if not wave:
+            # UNSEEN nodes of unmapped types are surfaced as
+            # 'unmapped_unseen' so the LLM can decide.
+            continue
+        c = sum(by_state.values())
+        wave_counts[wave] = wave_counts.get(wave, 0) + c
+        wave_types.setdefault(wave, []).append(at)
+
+    # Wave order: W0.5 (subdomain) -> W1 (ip/port) -> W1.5 (service/storage)
+    # -> W3.5 (url/endpoint/component). Strict upstream-to-downstream
+    # because URL/endpoint need SERVICE as parent and SERVICE needs
+    # PORT as parent.
+    pending_waves: list[dict[str, Any]] = []
+    for wave in ("W0.5", "W1", "W1.5", "W3.5"):
+        if wave_counts.get(wave, 0) > 0:
+            pending_waves.append({
+                "wave": wave,
+                "specialists": SPECIALISTS_BY_WAVE[wave],
+                "asset_types": sorted(wave_types[wave]),
+                "unseen_count": wave_counts[wave],
+            })
+
+    # Unmapped UNSEEN types (PARAMETER, INJECTION_VECTOR, etc.)
+    # are deeper-tier - the LLM should finish W1/W1.5/W3.5 first.
+    unmapped_unseen: dict[str, int] = {
+        at: sum(by_state.values())
+        for at, by_state in incomplete_by_type_state.items()
+        if at not in WAVE_BY_TYPE
+    }
+
+    completion_pct = (
+        1.0 - (unseen_count / total) if total else 1.0
+    )
+    is_complete = unseen_count == 0
+
+    return json.dumps(
+        {
+            "tree_id": tree_id,
+            "total_nodes": total,
+            "unseen_count": unseen_count,
+            "completion_pct": round(completion_pct, 4),
+            "is_complete": is_complete,
+            "incomplete_by_type_state": incomplete_by_type_state,
+            "pending_waves": pending_waves,
+            "unmapped_unseen": unmapped_unseen,
+            "abandoned_to_retry": abandoned_to_retry,
+            "abandoned_to_retry_count": len(abandoned_to_retry),
+            "discovered_breakdown": discovered_breakdown,
+            "triaged_or_exploited_breakdown": (
+                triaged_or_exploited_breakdown
+            ),
+            "sample_unseen": sample_unseen,
+            "generated_at": _utcnow_iso(),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _utcnow_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()

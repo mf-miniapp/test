@@ -291,7 +291,7 @@ Output of cross-layer (URL/ENDPOINT/STATIC_ASSET/API_SCHEMA/STORAGE/STORAGE_OBJE
 | `SecretEntry.context` | `str` | yes | Surrounding 50-char context |
 | `SecretEntry.validated` | `bool` | yes | Whether validated via public API |
 | `SecretEntry.validation_detail` | `str \| null` | no |  |
-| `SecretEntry.blast_radius` | `str` | yes | `low` / `medium` / `high` / `critical` |
+| ~~`SecretEntry.blast_radius`~~ | — | — | **(v4.5 REMOVED)** 影响半径是攻击侧视角, hack-deep-find 不评估; `recon_secret_classify` 工具自 v4.5 起不再产出该字段. v4.4 之前的历史 evidence 文件可能含此字段, hack-deep 接收方应忽略. |
 
 ### `seed-v1` — seed-expander
 Output of ROOT_DOMAIN → seed list (horizontal expansion). Does NOT write to AssetTree.
@@ -368,7 +368,7 @@ Output of cross-layer (URL/ENDPOINT/STATIC_ASSET/API_SCHEMA/STORAGE/STORAGE_OBJE
 | `SecretEntry.context` | `str` | yes | Surrounding 50-char context |
 | `SecretEntry.validated` | `bool` | yes | Whether validated via public API |
 | `SecretEntry.validation_detail` | `str \| null` | no |  |
-| `SecretEntry.blast_radius` | `str` | yes | `low` / `medium` / `high` / `critical` |
+| ~~`SecretEntry.blast_radius`~~ | — | — | **(v4.5 REMOVED)** 影响半径是攻击侧视角, hack-deep-find 不评估; `recon_secret_classify` 工具自 v4.5 起不再产出该字段. v4.4 之前的历史 evidence 文件可能含此字段, hack-deep 接收方应忽略. |
 
 ### `seed-v1` — seed-expander
 Output of ROOT_DOMAIN → seed list (horizontal expansion). Does NOT write to AssetTree.
