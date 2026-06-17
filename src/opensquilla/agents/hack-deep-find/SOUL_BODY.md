@@ -341,16 +341,18 @@ which naabu httpx subfinder katana nuclei nmap masscan ffuf dnsx asnmap tlsx cdn
 # brew (system tools):
 #   brew install nmap masscan ffuf tlsx
 # Go 工具 (proxy: export https_proxy=http://127.0.0.1:7897 GOPROXY=https://goproxy.cn,direct):
-#   go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-#   go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-#   go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-#   go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-#   go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-#   go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-#   go install -v github.com/projectdiscovery/asnmap/cmd/asnmap@latest
-#   go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@latest
-#   go install -v github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/httpx/cmd/httpx@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/katana/cmd/katana@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/asnmap/cmd/asnmap@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+#   CGO_ENABLED=0 go install -v -a github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
+#   # asnmap/tlsx 必须 CGO_ENABLED=0, 否则 cgo m1cpu init SIGSEGV
 # nuclei 模板: nuclei -update-templates
+# PATH: 把 /Users/zlpc/go/bin 放到 $PATH 首位 (覆盖 brew tlsx 死链)
 # 验证: .venv/bin/python -c "from opensquilla.tools.builtin.recon import _binaries; print(_binaries.detect_all(refresh=True))"
 ```
 
@@ -359,6 +361,22 @@ masscan (`--version` rc=1, 输出在 stderr)、tlsx/asnmap
 (`-version` 触发 cgo m1cpu SIGSEGV)、ffuf/naabu/httpx/cdncheck
 (ASCII art 在 stderr) 都会被识别为 available, 前提是
 binary exec 成功并产生任何 stdout/stderr 输出。
+
+**v4.2 note (2026-06-17)**: `asnmap` 和 `tlsx` 在 go-m1cpu
+cgo init 段错误, **必须** `CGO_ENABLED=0 go install` 编译才能
+跑; 默认 `go install` 出来的 binary 一执行就 SIGSEGV, `-h` 也
+崩。安装命令必须加 `CGO_ENABLED=0`:
+
+```bash
+export CGO_ENABLED=0
+go install -v -a github.com/projectdiscovery/asnmap/cmd/asnmap@latest
+go install -v -a github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+```
+
+`tlsx` 若从 brew 装, 因 brew 默认走系统 go + cgo on, 同样会
+崩; 此时把 brew 版本 link 掉 (`brew unlink tlsx`), 用
+`/Users/zlpc/go/bin/tlsx` (已 CGO=0 重编译) 替代, 并把
+`/Users/zlpc/go/bin` 放到 `$PATH` **首位**。
 
 **为什么 stdlib fallback 仍然保留**: 部署环境 (CI / sandbox / 离线 air-gap)
 不一定有 binary 可装。fallback 保证编排者在最差环境下也能跑 (只是慢 + 浅),
