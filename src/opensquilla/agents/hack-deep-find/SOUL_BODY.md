@@ -281,6 +281,77 @@ recon_diff_snapshots(snapshot_a_path=<older>, snapshot_b_path=<newer>)
 
 ---
 
+## v4 成熟工具栈 (Recon Binaries) — 51ifind.com 提速根因
+
+> **v4 (2026-06-17) 核心改动**: 编排者 / specialist 优先调用成熟的
+> 行业标准 binary (naabu / httpx / subfinder / katana / nuclei / nmap),
+> 不再用 stdlib 单步探测串行调用。51ifind.com run 实测:
+> stdlib 串行探测 84 个 port 要 ~84 秒, LLM 不耐烦自我截断到 14 个;
+> naabu 一次扫 65k 端口只花 10 秒。**速度直接决定覆盖率**。
+
+**Binary 优先级表 (按 step)**:
+
+| Wave | v4 推荐工具 (binary) | Stdlib fallback | v3 (已废弃) |
+|---|---|---|---|
+| F0 根域探测 | `recon_subdomain_enum` (subfinder, 30+ source) | crt.sh + 60 词 brute | 单 crt.sh |
+| F1 端口扫描 | `recon_port_batch` (naabu, SYN scan) | `recon_port_verify` 逐个 TCP | 同样 stdlib 但慢 |
+| F1 服务指纹 | `nmap -sV` (新工具: `recon_nmap_service`) | `recon_grab_banner` | 同样 |
+| F3.5 URL 探活 | `recon_url_validate_batch` (httpx 批量) | `recon_url_validate` 逐个 | 同样 |
+| F3.5 URL deep crawl | `recon_katana_crawl` (katana + JS extract) | stdlib BFS | 单个 fetch |
+| F1.5 / F3.5 CVE 视图 | `recon_nuclei_scan` (8000+ 模板) | 8 项 tiny CVE map | 手工 fingerprint |
+
+**Binary 不可用时的降级** (硬规则):
+
+1. 编排者启动时, **第一次** 调 `recon_subdomain_enum` / `recon_port_batch` /
+   `recon_katana_crawl` / `recon_nuclei_scan` / `recon_url_validate_batch` 任意
+   一个, 内部会调 `_binaries.detect(<binary>)`, 把结果 (`source: "binary"`
+   或 `"stdlib"`, `binary_path`, `binary_version`) 写到 result envelope。
+2. `source == "stdlib"` 表示该 binary 不在 PATH, 编排者下次**直接调 fallback
+   版本**, 不要再尝试 binary (避免每次都跑 detect 浪费时间)。
+3. **降级 ≠ 跳过**: stdlib fallback 一定能跑 (哪怕慢), 所以编排者必须用
+   该结果, 不能因为慢就截断。
+4. **降级状态报告**: F-final handoff envelope 加 `binary_availability` 字段,
+   列出本次 run 每个 binary 是否可用, 给 hack-deep 报告用。
+
+**v4 严禁** (v3 trade-off 不可逆):
+
+- v3 era `recon/__init__.py` 写的 "tools prefer Python stdlib over
+  shelling out to curl / nmap" 已被 v4 推翻。`hack-deep-find/SOUL_BODY.md`
+  是新的 hard reference。
+- 严禁在 100+ URL 列表上调 `recon_url_validate` 逐个探测 — 改用
+  `recon_url_validate_batch` (httpx 一次 subprocess 跑完全部, 30 并发)。
+- 严禁在 50+ IP 列表上调 `recon_port_scan_tcp` 逐个探测 — 改用
+  `recon_port_batch` (naabu 一次跑完全部, 1k pps rate)。
+- 严禁 specialist 自己 (subagent 内部) 手写 fingerprint 逻辑 — 改用
+  `recon_nuclei_scan` (8000+ 现成模板) 或 `nmap -sV`。
+
+**v4 编排者启动时的 binary 探测流程**:
+
+1. 第一次跑 `recon_subdomain_enum(domain="...")` — 该调用是 binary detect
+   的"warmup"; 看返回 `source` 字段, 记录到本 session 的 `state.binary_availability`。
+2. 同理跑 `recon_port_batch(ips=[...])` 一次做 warmup, 记录 `naabu` 状态。
+3. 之后**所有** F0 / F1 / F3.5 都按 `state.binary_availability` 直接走
+   binary path (避免每次 detect)。
+
+**Operator instructions**: 部署到新机器时, 先确认 6 个 binary 在 PATH:
+
+```bash
+which naabu httpx subfinder katana nuclei nmap
+# 若缺, brew install: brew install nmap
+# GO 工具: go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+#         go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+#         go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#         go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+#         go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+# nuclei 模板: nuclei -update-templates
+```
+
+**为什么 stdlib fallback 仍然保留**: 部署环境 (CI / sandbox / 离线 air-gap)
+不一定有 binary 可装。fallback 保证编排者在最差环境下也能跑 (只是慢 + 浅),
+不会因为缺 binary 直接挂。
+
+---
+
 ## 编排流程 (LLM 自跑) — v4 显式 Wave-DAG
 
 **v4 (2026-06-17) 强化**: 取代 v1 的 "Step N.5: 分层调度 LOOP"

@@ -326,6 +326,245 @@ async def recon_url_validate(
     return json.dumps(result, ensure_ascii=False)
 
 
+
+
+# ── Batch URL validation via httpx (preferred over single-URL stdlib) ─────
+
+
+def _is_error_body(body: str, content_type: str | None) -> str | None:
+    """Body-level error-page detector. Reused by both single and batch paths.
+
+    A body is considered an error page if:
+      1. content_type is text/html (or unset) AND
+      2. body (lowercased, first 64KB) contains any known error indicator.
+    """
+    if not body:
+        return None
+    if content_type and "html" not in content_type.lower():
+        return None
+    sample = body[: 64 * 1024].lower()
+    for indicator, reason in _ERROR_BODY_INDICATORS:
+        if indicator in sample:
+            return reason
+    return None
+
+
+@tool(
+    name="recon_url_validate_batch",
+    description=(
+        "Validate a LIST of URLs in one batch. v4-preferred over calling "
+        "recon_url_validate per URL. Internally uses the ``httpx`` binary "
+        "(https://github.com/projectdiscovery/httpx) to probe all URLs in "
+        "parallel with a single subprocess; falls back to per-URL stdlib "
+        "probes if httpx is not on PATH. Each URL gets a verification "
+        "envelope: {verified, reason, probe, verified_at}. URLs that are "
+        "non-200 or return an error body (404 page / 500 page / nginx "
+        "default / kong error / upstream error / etc.) are marked "
+        "verified=False and should NOT be added to the AssetTree."
+    ),
+    params={
+        "urls": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of full URLs to validate (e.g. ['https://1.2.3.4:443', 'http://1.2.3.4:8080/admin']).",
+        },
+        "timeout_s": {
+            "type": "integer",
+            "description": "Per-URL timeout in seconds. Default: 8.0.",
+            "default": 8,
+        },
+        "max_concurrency": {
+            "type": "integer",
+            "description": "httpx -c flag: concurrent probes. Default: 30.",
+            "default": 30,
+        },
+    },
+    required=["urls"],
+    execution_timeout_seconds=300.0,
+)
+async def recon_url_validate_batch(
+    urls: list[str],
+    timeout_s: int = 8,
+    max_concurrency: int = 30,
+) -> str:
+    """Validate many URLs at once. Preferred for ingest-time verification.
+
+    Returns a JSON object:
+      {
+        "source": "binary" | "stdlib",
+        "binary_path": str | None,
+        "binary_version": str | None,
+        "verified_count": int,
+        "rejected_count": int,
+        "results": [
+          {url, verified, reason, probe: {status_code, server, title, ...},
+           verified_at}, ...
+        ]
+      }
+    """
+    import json
+    import tempfile
+    from datetime import datetime, timezone
+    from opensquilla.tools.builtin.recon._binaries import detect, _run_binary
+
+    if not urls:
+        return json.dumps({
+            "source": "stdlib",
+            "binary_path": None,
+            "binary_version": None,
+            "verified_count": 0,
+            "rejected_count": 0,
+            "results": [],
+        }, ensure_ascii=False)
+
+    bp = detect("httpx")
+    if not bp.available:
+        # Stdlib fallback: probe each URL one-by-one.
+        from opensquilla.tools.builtin.recon.http_probe import recon_url_validate
+        results = []
+        for u in urls:
+            r = json.loads(await recon_url_validate(u, method="GET", timeout_s=float(timeout_s)))
+            results.append(r)
+        return json.dumps({
+            "source": "stdlib",
+            "binary_path": None,
+            "binary_version": None,
+            "verified_count": sum(1 for r in results if r.get("verified")),
+            "rejected_count": sum(1 for r in results if not r.get("verified")),
+            "results": results,
+        }, ensure_ascii=False)
+
+    # httpx path: write URLs to a temp file, run httpx -json -l, parse JSONL.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="httpx-urls-"
+    ) as f:
+        for u in urls:
+            f.write(u + "\n")
+        urls_path = f.name
+
+    jsonl_path = urls_path + ".jsonl"
+    argv = [
+        bp.path, "-l", urls_path,
+        "-json", "-o", jsonl_path,
+        "-timeout", str(timeout_s),
+        "-c", str(max_concurrency),
+        "-silent",
+        "-no-stdin",
+        "-fr",  # follow redirects; final URL recorded in json
+    ]
+    try:
+        rc, stdout, stderr = await _run_binary(argv, timeout_s=300.0)
+    except (asyncio.TimeoutError, OSError) as exc:
+        # Binary failed: fall back to stdlib per-URL.
+        from opensquilla.tools.builtin.recon.http_probe import recon_url_validate
+        results = []
+        for u in urls:
+            try:
+                r = json.loads(await recon_url_validate(u, method="GET", timeout_s=float(timeout_s)))
+            except Exception as inner:  # noqa: BLE001
+                r = {"url": u, "verified": False, "reason": f"stdlib_error: {inner}",
+                     "probe": {}, "verified_at": None}
+            results.append(r)
+        return json.dumps({
+            "source": "stdlib",
+            "binary_path": bp.path,
+            "binary_version": bp.version,
+            "binary_error": f"{type(exc).__name__}: {exc}",
+            "verified_count": sum(1 for r in results if r.get("verified")),
+            "rejected_count": sum(1 for r in results if not r.get("verified")),
+            "results": results,
+        }, ensure_ascii=False)
+    finally:
+        try:
+            import os
+            os.unlink(urls_path)
+        except OSError:
+            pass
+
+    # Parse httpx JSONL output
+    results: list[dict[str, Any]] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    indexed: dict[str, dict[str, Any]] = {}
+    try:
+        from pathlib import Path as _P
+        jsonl_file = _P(jsonl_path)
+        if jsonl_file.exists():
+            for line in jsonl_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    indexed[obj.get("url", "").rstrip("/")] = obj
+                except json.JSONDecodeError:
+                    continue
+        try:
+            jsonl_file.unlink()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+    for u in urls:
+        u_norm = u.rstrip("/")
+        # httpx may record the final URL after redirects; match on both.
+        hit = indexed.get(u_norm) or indexed.get(u)
+        if hit is None:
+            results.append({
+                "url": u,
+                "verified": False,
+                "reason": "no_response",
+                "probe": {},
+                "verified_at": now_iso,
+            })
+            continue
+        status = hit.get("status_code") or hit.get("status")
+        content_type = hit.get("content_type", "")
+        title = hit.get("title")
+        body = hit.get("body", "") or ""
+        server = hit.get("webserver") or hit.get("server")
+        err = None
+        if status is None or status == 0:
+            err = "no_response"
+            reason = "no_response"
+            verified = False
+        elif status != 200:
+            reason = f"status_{status}"
+            verified = False
+        else:
+            body_error = _is_error_body(body, content_type)
+            if body_error:
+                reason = f"error_body:{body_error}"
+                verified = False
+            else:
+                reason = "ok"
+                verified = True
+        results.append({
+            "url": u,
+            "verified": verified,
+            "reason": reason,
+            "probe": {
+                "status_code": status,
+                "server": server,
+                "title": title,
+                "content_type": content_type,
+                "final_url": hit.get("final_url") or u,
+                "error": err,
+            },
+            "verified_at": now_iso,
+        })
+
+    return json.dumps({
+        "source": "binary",
+        "binary_path": bp.path,
+        "binary_version": bp.version,
+        "verified_count": sum(1 for r in results if r["verified"]),
+        "rejected_count": sum(1 for r in results if not r["verified"]),
+        "results": results,
+    }, ensure_ascii=False)
+
+
+
+
 # ── Internal helpers (NOT exposed as tools) ─────────────────────────────
 
 
