@@ -21,6 +21,7 @@ import urllib.request
 from typing import Any
 
 from opensquilla.tools.registry import tool
+from opensquilla.tools.builtin.recon import _binaries
 
 
 # ── helpers ──────────────────────────────────────────
@@ -131,12 +132,40 @@ async def recon_whois_lookup(domain: str, timeout_s: float = 8.0) -> str:
 # ── 2. recon_asn_lookup ──────────────────────────────
 
 
+def _parse_asnmap_jsonl(text: str) -> list[dict[str, Any]]:
+    """Parse asnmap -json output. One record per IP found in the ASN/org.
+
+    asnmap -json emits records like:
+      {"timestamp":"...","input":"google","as_number":"AS15169",
+       "as_name":"GOOGLE","as_country":"US","as_range":["8.8.8.0/24",...],
+       "ip_count":256}
+    """
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        out.append({
+            "asn": rec.get("as_number"),
+            "as_name": rec.get("as_name"),
+            "as_country": rec.get("as_country"),
+            "ip_ranges": rec.get("as_range", []) or [],
+            "ip_count": rec.get("ip_count"),
+        })
+    return out
+
+
 @tool(
     name="recon_asn_lookup",
     description=(
-        "Resolve a domain to its IP, then look up the IP's ASN via the "
-        "public Team Cymru DNS-based ASN lookup (asn.cymru.com). Returns "
-        "ASN, AS name, BGP prefix, country, registry."
+        "Resolve a domain to its IP, then look up the IP's ASN. v4.4-preferred: "
+        "uses asnmap binary (https://github.com/projectdiscovery/asnmap) "
+        "for IP -> ASN + IP range. Falls back to ip-api.com HTTP API when "
+        "asnmap is not on PATH. Returns ASN, AS name, country, IP range."
     ),
     params={
         "ip_or_domain": {"type": "string"},
@@ -146,7 +175,35 @@ async def recon_whois_lookup(domain: str, timeout_s: float = 8.0) -> str:
     execution_timeout_seconds=20.0,
 )
 async def recon_asn_lookup(ip_or_domain: str, timeout_s: float = 8.0) -> str:
-    """Resolve domain to IP if needed, then DNS-query Team Cymru for ASN info."""
+    """ASN lookup via asnmap (preferred) or ip-api.com (fallback)."""
+    bp = _binaries.detect("asnmap")
+    if bp.available:
+        try:
+            # asnmap flag naming: -i for IP, -d for domain, -org for org
+            is_ip = bool(re.match(r"^[\d.:a-fA-F]+$", ip_or_domain))
+            if is_ip:
+                argv = ["asnmap", "-json", "-i", ip_or_domain, "-silent"]
+            else:
+                argv = ["asnmap", "-json", "-d", ip_or_domain, "-silent"]
+            rc, stdout, stderr = await _binaries._run_binary(
+                argv, timeout_s=timeout_s + 5,
+            )
+            records = _parse_asnmap_jsonl(stdout)
+            if records:
+                r0 = records[0]
+                return json.dumps({
+                    "input": ip_or_domain,
+                    "ok": True,
+                    "asn": r0.get("asn"),
+                    "as_name": r0.get("as_name"),
+                    "as_country": r0.get("as_country"),
+                    "ip_ranges": r0.get("ip_ranges", []),
+                    "ip_count": r0.get("ip_count"),
+                    "source": "asnmap", "binary_version": bp.version,
+                }, ensure_ascii=False)
+        except (asyncio.TimeoutError, OSError) as exc:
+            pass  # fall through to ip-api
+
     import socket
 
     target_ip = ip_or_domain
@@ -157,10 +214,7 @@ async def recon_asn_lookup(ip_or_domain: str, timeout_s: float = 8.0) -> str:
         except Exception as e:  # noqa: BLE001
             return json.dumps({"input": ip_or_domain, "ok": False, "error": f"resolve: {e}"}, ensure_ascii=False)
 
-    # Use Team Cymru DNS-based ASN lookup: reverse IP octets + ".origin.asn.cymru.com"
-    # Simplified: use dns.resolver if available; else fall back to HTTP-friendly ip-api.com
     loop = asyncio.get_running_loop()
-    # Prefer ip-api.com (no key, http)
     api_url = f"http://ip-api.com/json/{target_ip}?fields=status,country,org,as,hosting,query"
     res = await loop.run_in_executor(None, _http_get, api_url, timeout_s)
     if res["status_code"] != 200 or not res["body"]:

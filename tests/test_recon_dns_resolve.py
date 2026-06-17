@@ -13,6 +13,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from opensquilla.tools.builtin.recon import dns as recon_dns
+from opensquilla.tools.builtin.recon import _binaries
+
+# v4.4: dnsx is preferred when available. Unit tests want the stdlib
+# path, so we patch recon_dns._binaries.detect to return available=False
+# for dnsx while letting everything else (naabu/httpx/...) fall through.
+_orig_detect = _binaries.detect
+
+def _fake_detect(name, refresh=False):
+    if name == "dnsx":
+        from opensquilla.tools.builtin.recon._binaries import BinaryPath
+        return BinaryPath(name="dnsx", path=None, version=None, available=False)
+    return _orig_detect(name, refresh=refresh)
+
+patch.object(_binaries, "detect", side_effect=_fake_detect).start()
 
 
 def _make_loop_with_getaddrinfo(behaviour):

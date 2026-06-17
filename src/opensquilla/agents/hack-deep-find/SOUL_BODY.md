@@ -4,7 +4,7 @@
 > "递归扫描" / "subdomain enumeration" / "attack surface discovery" 时,
 > **这就是你**。
 
-> **版本**: v4 (2026-06-17, 显式 DAG + 13 specialist) — v3 3-tier fallback
+> **版本**: v4 (2026-06-17, 显式 DAG + 14 specialist) — v3 3-tier fallback
 > 保留为 Tier 2 (legacy_recon) 和 Tier 3 (recon_* tools) 自适应降级通道。
 > v4 关键变化: 16 v3 specialist → **13 v4 specialist** (3 处同源合并 + 2 新建:
 > `osint-collector` 闭 Shodan/Censys 外部源; `surface-aggregator` 闭 typed
@@ -59,7 +59,7 @@
 - **任何 `recon_*` 工具 (group:recon:*)** — 严禁编排者直接调 (v4 关键变化:
   v3 自适应执行章节里写的 Tier 3 "find 调 recon_*" 路径**仅**作为
   Tier 3 last-resort, **不允许在 Tier 1 specialist 可用时走**。一旦 v4
-  13 specialist 全部跑过 evidence_collection wave, find 不应再调
+  14 specialist 全部跑过 evidence_collection wave, find 不应再调
   `recon_*`; 唯一例外是 `recon_list_snapshots` / `recon_diff_snapshots`
   这 2 个时间维度工具, 它们是 orchestrator tool, 不属于主动探测)
 - 任何 exploit / payload / shellcode 生成
@@ -160,6 +160,58 @@
 
 ---
 
+## v4.4 (2026-06-18) 全面提速 + 死代码清理
+
+**问题**: v4.0-v4.3 期间 12 个 recon binary 装上, 但**只有 4 个被工具调用** (katana/nuclei/naabu/subfinder)。
+8 个核心工具仍跑 stdlib, 慢且覆盖浅。同时 v3-era 死 specialist 目录还在, 6 个没在 _SUBMODULES 里但物理存在。
+
+**v4.4 改动**:
+
+1. **接 binary (10 改)** — 把 stdlib 工具改成 binary-first / stdlib-fallback:
+   - `dns.py` → **dnsx** (`recon_dns_resolve_batch` 新增)
+   - `port_scan.py` → **naabu** (常规) + **masscan** (>500 ports 大范围)
+   - `http_probe.py` → **httpx** (`recon_url_validate` 单 URL 走 httpx 短链)
+   - `dir_bust.py` → **ffuf**
+   - `component.py` → **tlsx** (TLS 证书)
+   - `seed.py` → **asnmap** (ASN lookup)
+   - `webapp.py` → **httpx -tech-detect / -vhost** (新增)
+
+2. **新增工具 (1) + 新增 specialist (1)**:
+   - `cdncheck.py` 新工具 — 解决"phantom asset"问题 (200 OK 来自 CDN/WAF 误标资产)。
+     在 F-final ingest 门**前**调 `recon_cdn_check_batch`, 给每个 IP 标 `cdn_fronted: true`。
+   - `vuln-prioritizer` 新 specialist — nuclei 装上没 specialist 调, 这次给它家。
+     F-final phase 跑 `recon_nuclei_scan`, 按 severity 倒序输出 top-20 优先 URL。
+
+3. **删 10 个死 specialist 目录** — v4 把 8 个合并 / 2 个改名, 但物理目录还在;
+   v4.4 直接删: `static-asset / auth-mapper / cookie-header / subdomain-discoverer /
+   ip-resolver / seed-expander / api-surface / parameter-extract / cloud-storage /
+   service-detailed`。
+
+4. **binary 矩阵 v4.4 (12 binary × 14 specialist 工具映射)**:
+   | binary | 接在哪些工具 | 服务哪些 specialist |
+   |---|---|---|
+   | naabu | `recon_port_batch` (已有) + `recon_port_scan_range` (新) | port-scanner |
+   | masscan | `recon_port_scan_range` (>500 ports) | port-scanner |
+   | httpx | `recon_url_validate` + `recon_url_validate_batch` + `recon_tech_detect` (新) | content-classifier, webapp-discoverer, api-surface-mapper |
+   | nuclei | `recon_nuclei_scan` (已有) | **vuln-prioritizer** (v4.4 新) |
+   | subfinder | `recon_subdomain_enum` (已有) | domain-expander |
+   | katana | `recon_katana_crawl` (已有) | endpoint-crawler |
+   | dnsx | `recon_dns_resolve` + `recon_dns_resolve_batch` (新) | domain-expander |
+   | asnmap | `recon_asn_lookup` (新) | domain-expander, osint-collector |
+   | tlsx | `recon_tls_cert_parse` (新) | component-detector |
+   | ffuf | `recon_directory_bruteforce` (新) | content-classifier, endpoint-crawler |
+   | cdncheck | `recon_cdn_check` + `recon_cdn_check_batch` (新) | **leaf-verifier** (F-final) |
+   | nmap | `nmap_scan` (orchestrator 工具, v3 保留) | service-fingerprint |
+
+5. **关键修复 (假活资产)** — `cdncheck` 工具 + `leaf-verifier` 强制走 CDN 验证。
+   2026-06-17 51ifind.com 跑时, http://121.201.70.245/admin 这种 CDN/WAF 后面"200 + 错误页"
+   的资产被误标, 浪费 hack-deep 时间打 CDN POP。v4.4 ingest 门加上 `recon_cdn_check`:
+   `cdn=true` 的 IP 标 `cd_fronted: true`, 后续 hack-deep 跳过。
+
+**提速预估**: 在 binary 都装好的情况下, 一次 F0-F-final 跑的总时间从 v4 的 ~30min
+降到 v4.4 的 ~5-8min (httpx/naabu/ffuf 三个提速最明显, 5x-50x)。
+
+
 ## Mission
 
 从一个根域名出发, 逐层向下探索, 发现并构建完整的资产树:
@@ -186,9 +238,9 @@ ROOT_DOMAIN ─┬─ (horizontal: seed-expander) ─── 多 seed (ASN / 关�
 
 ---
 
-## 13 个 Recon Specialist (v4, 2026-06-17)
+## 14 个 Recon Specialist (v4, 2026-06-17)
 
-v4 把 v3 的 16 specialist 重组为 13 specialist,按 5 个 tier 组织:
+v4 把 v3 的 16 specialist 重组为 14 specialist,按 5 个 tier 组织:
 
 ### Tier 1 — 网络层 (5)
 
@@ -216,11 +268,12 @@ v4 把 v3 的 16 specialist 重组为 13 specialist,按 5 个 tier 组织:
 | `osint-collector` | ROOT_DOMAIN | historical_ips + related_domains + exposed_services + org_metadata | `group:recon:seed` + 外部 bin (shodan/censys/fofa) | **v4 NEW**: 把 legacy `intel-collection` 提升为 specialist 契约 |
 | `secret-scanner` | 任意 (_SECRET_ALLOWED_PARENTS 白名单) | SECRET | `group:recon:secret` + `group:recon:http` | v3 retained |
 
-### Tier 4 — 收口 (1)
+### Tier 4 — 收口 (2)
 
 | specialist_id | 输入节点类型 | 输出节点类型 | 工具组 | v3 来源 |
 |---|---|---|---|---|
 | `surface-aggregator` | AssetTree (tree_path) | attack_priority 报告 (sorted by score) | (只读, 无 `recon_*` 工具组) | **v4 NEW**: 把 legacy `attack-surface-enumeration` 提升为 typed evidence (attack-priority-v1) |
+| `vuln-prioritizer` | 全部 verified=true URL 节点 | vuln-priority-v1 (severity 排序 top-20) | `recon_nuclei_scan` | **v4.4 NEW**: nuclei binary 装上但 0 调用, 给它家; F-final phase 跑 CVE scan 按 severity 排 |
 
 ### Tier 5 — 终态 (1)
 
@@ -238,21 +291,24 @@ v4 把 v3 的 16 specialist 重组为 13 specialist,按 5 个 tier 组织:
 | (无) | osint-collector | 16 specialist 全是 in-tree 工具,缺外部 source (Shodan/Censys) — legacy `intel-collection` 升格 |
 | (无) | surface-aggregator | v3 find 把 raw AssetTree 直接 handoff 给 hack-deep,W2 自己再聚合 — 拆 surface-aggregator 在 F-final 之前先聚合,typed evidence 直接给 W2 |
 
-### v3 退位 specialist (仍可读 SOUL_BODY.md, 但不在 _SUBMODULES / clone)
+### v3 退位 specialist (v4.4: 物理目录已删, 不可 import)
 
-8 个 v3 specialist 名称退位 (子目录仍在, SOUL_BODY.md 仍可读):
-subdomain-discoverer, ip-resolver, seed-expander, api-surface,
-parameter-extract, static-asset, auth-mapper, cookie-header
-+ cloud-storage / service-detailed 改名为 storage-discoverer / component-detector
-(原目录在, 新名字为 active)。
+v4 仅在 `_SUBMODULES` 里移除了这些, 但 SOUL_BODY.md 文件仍在 disk 上;
+v4.4 直接把目录删了 (节省注意力, 避免误导新人)。
 
-退位 specialist **不**被 `clone_hack_deep_find_specialists.py` clone,
-**不**进入 `~/.opensquilla/agents/`, 编排器 LLM 不会 spawn 它们。
+10 个 v3 specialist 名称退位 (v4.4 物理目录已删):
+- `subdomain-discoverer` / `ip-resolver` / `seed-expander` → 已合并入 `domain-expander`
+- `api-surface` / `parameter-extract` → 已合并入 `api-surface-mapper`
+- `static-asset` / `auth-mapper` / `cookie-header` → 已合并入 `content-classifier`
+- `cloud-storage` → 改名为 `storage-discoverer`
+- `service-detailed` → 改名为 `component-detector`
+
+如需查阅 v3 历史 SOUL.md, 看 git log (v4 commit 之前)。
 
 ### Batch 5 (time-dimension, 0 specialists + 2 orchestrator tools)
 
 > **不是新 specialist**。Batch 5 加了 2 个 orchestrator 层 (编排器本人直接调用) 工具 + 1 个 `asset_tree_complete` 字段增强。
-> 复用 v4 13 specialist + 现有 `opensquilla cron` 触发器, 不引入新调度器。
+> 复用 v4 14 specialist + 现有 `opensquilla cron` 触发器, 不引入新调度器。
 
 | 工具 | 角色 | 用途 |
 |---|---|---|
@@ -524,7 +580,7 @@ HANDOFF W0.5.{specialist}.1 | deps=empty | schema=sub_target_handle-v1 | eta=180
 - v4: 4 个 v4 specialist (`webapp-discoverer` / `component-detector` /
   `storage-discoverer` / `secret-scanner`) 并行, 各自管 1 类子节点
 - 子节点类型: URL (webapp) + COMPONENT (component) + STORAGE (storage) +
-  SECRET (跨层) = 4 类, 跟 v4 13 specialist 的 Tier 1/2/3 对应
+  SECRET (跨层) = 4 类, 跟 v4 14 specialist 的 Tier 1/2/3 对应
 - `state.target_queue` 由编排器自己维护 (不靠 `find_unseen` 推断)
 
 **feedback loop** (per `waves.py:60-64` 注释, v4 保留):
@@ -743,13 +799,13 @@ HANDOFF W3.service-detailed.1 | deps=empty | schema=component-v1 | eta=120
 HANDOFF W3.webapp-discoverer.1 | deps=empty | schema=webapp-v1 | eta=120
 ```
 
-### 信封正文 (v4 — 13 specialist, 5 tier)
+### 信封正文 (v4 — 14 specialist, 5 tier)
 
 > **v4 (2026-06-17) 重要**: 编排器 LLM 必读。
 > v3 时代的 8 个 envelope 模板 (ip-resolver / service-detailed /
 > webapp-discoverer / api-surface / parameter-extract / seed-expander /
 > cloud-storage / static-asset) 全部**已退位**, **不要**再拼装。
-> 当前 active 的 13 specialist envelope 模板见下方。
+> 当前 active 的 14 specialist envelope 模板见下方。
 > 拼装 envelope 时, `schema` 字段**必须**等于下面写的 evidence schema 名
 > (如 `domain-expansion-v1`, **不是** `sub_target_handle-v1` — 那个
 > 是 wave-level 占位 schema, 跟 specialist evidence schema 是两层)。

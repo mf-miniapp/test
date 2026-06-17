@@ -6,7 +6,7 @@ Each specialist is a separate subpackage with its own SOUL_BODY.md and
 from each to register the agent in ``~/.opensquilla/config.toml``.
 
 v4 (2026-06-17) refactor: 16 specialists -> 13 by consolidating
-3 v3 splits and adding 1 new aggregator. The 13 specialists are
+3 v3 splits and adding 1 new aggregator. The 14 specialists are
 organized by 5 tiers:
 
   Tier 1 (network surface, 5):
@@ -32,16 +32,20 @@ organized by 5 tiers:
                              hack-deep-find specialist contract)
     - secret-scanner        (v3 retained)
 
-  Tier 4 (synthesis, 1):
+  Tier 4 (synthesis, 2):
     - surface-aggregator    (NEW in v4: produces attack-priority-v1
                              evidence from the AssetTree, replacing
                              legacy attack-surface-enumeration's
                              free-text output)
+    - vuln-prioritizer       (NEW in v4.4: nuclei-driven CVE
+                             priority scan; assets get an active
+                             vulnerability scan before handoff to
+                             hack-deep)
 
   Tier 5 (terminal, 1):
     - leaf-verifier         (v3 retained)
 
-  Total: 13 specialists (down from 16 v3 by 3-way merge, +2 new).
+  Total: 14 specialists (v4: 13 by 3-way merge +2 new; v4.4 +vuln-prioritizer).
 
 Backward compat: the 8 retired v3 specialist names
 (subdomain-discoverer, ip-resolver, seed-expander, api-surface,
@@ -102,6 +106,7 @@ _SUBMODULES = (
     "secret-scanner",         # v3 retained
     # Tier 4 - synthesis (1)
     "surface-aggregator",     # v4 NEW: AssetTree -> attack-priority-v1
+    "vuln-prioritizer",       # v4.4 NEW: nuclei-driven CVE priority scan
     # Tier 5 - terminal (1)
     "leaf-verifier",          # v3 retained
 )
@@ -126,23 +131,24 @@ _ALIAS = {
     "osint-collector": "osint_collector",
     "secret-scanner": "secret_scanner",
     "surface-aggregator": "surface_aggregator",
+    "vuln-prioritizer": "vuln_prioritizer",
     "leaf-verifier": "leaf_verifier",
 }
 
-# v3 retired specialist names (kept on disk for reference but NOT
-# imported or aliased). Importing these via the package raises
-# ModuleNotFoundError by design — the v3 SOUL_BODY.md files remain
-# readable from disk (e.g. via scripts/clone_hack_deep_find.py's
-# importlib) but no Python attribute is exposed.
+# v3 retired specialist names. v4.4: the directories have been
+# physically removed from disk. This constant is kept for historical
+# documentation and for any audit log that references the v3 names.
 _RETIRED_V3_SPECIALISTS: tuple[str, ...] = (
-    "subdomain-discoverer",
-    "ip-resolver",
-    "seed-expander",
-    "api-surface",
-    "parameter-extract",
-    "static-asset",
-    "auth-mapper",
-    "cookie-header",
+    "subdomain-discoverer",  # v4 merged into domain-expander
+    "ip-resolver",           # v4 merged into domain-expander
+    "seed-expander",         # v4 merged into domain-expander
+    "api-surface",           # v4 merged into api-surface-mapper
+    "parameter-extract",     # v4 merged into api-surface-mapper
+    "static-asset",          # v4 merged into content-classifier
+    "auth-mapper",           # v4 merged into content-classifier
+    "cookie-header",         # v4 merged into content-classifier
+    "cloud-storage",         # v4 renamed to storage-discoverer
+    "service-detailed",      # v4 renamed to component-detector
 )
 
 # Eagerly import each so SOUL_BODY is hot-loaded when the clone script

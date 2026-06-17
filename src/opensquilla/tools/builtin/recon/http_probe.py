@@ -1,11 +1,17 @@
-"""HTTP recon tools — stdlib only, no curl.
+"""HTTP recon tools — httpx binary (preferred) / stdlib (fallback).
 
 Group: ``group:recon:http``.
 
-Why stdlib HTTP rather than curl: the existing ``scanner_tools.py`` used
-``asyncio.create_subprocess_exec("curl", ...)`` which conflicts with the
-sandbox approval pipeline. Stdlib ``urllib`` runs inline and stays inside
-the pure-data-plane contract.
+v4.4 (2026-06-18) hardening: httpx binary
+(https://github.com/projectdiscovery/httpx) probes many URLs in
+parallel with a single subprocess. Stdlib urllib is the FALLBACK
+for hosts without httpx.
+
+Why not curl: the legacy ``scanner_tools.py`` used
+``asyncio.create_subprocess_exec("curl", ...)`` which conflicts with
+the sandbox approval pipeline. httpx is preferred over curl
+because httpx does status+title+tech+server+TLS-grab in ONE call
+(banner-grab, fingerprint, content-type), reducing round-trips.
 """
 
 from __future__ import annotations
@@ -18,6 +24,44 @@ import urllib.request
 from typing import Any
 
 from opensquilla.tools.registry import tool
+from opensquilla.tools.builtin.recon import _binaries
+import tempfile
+from pathlib import Path
+
+
+# ── httpx output parser ──────────────────────────────────
+
+
+def _parse_httpx_jsonl(text: str) -> list[dict[str, Any]]:
+    """Parse httpx -json JSONL output. One record per URL.
+
+    httpx -json emits records like:
+      {"url":"https://1.2.3.4","status_code":200,"title":"...",
+       "webserver":"nginx/1.18","tech":["Nginx"],"content_type":"...",
+       "final_url":"https://1.2.3.4/","scheme":"https","method":"GET",
+       "host":"1.2.3.4","a":["1.2.3.4"],"timestamp":"..."}
+    """
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        out.append({
+            "url": rec.get("url", ""),
+            "status_code": rec.get("status_code"),
+            "title": rec.get("title"),
+            "server": rec.get("webserver"),
+            "content_type": rec.get("content_type"),
+            "final_url": rec.get("final_url") or rec.get("url"),
+            "tech": rec.get("tech", []) or [],
+            "scheme": rec.get("scheme"),
+            "host": rec.get("host"),
+        })
+    return out
 
 
 @tool(
@@ -244,6 +288,88 @@ async def recon_url_validate(
     """
     import ssl
     from datetime import datetime, timezone
+
+    # v4.4: httpx short-circuit. Single URL via httpx costs a subprocess
+    # start (~100ms) but gets us status+title+server+tech+final_url in
+    # ONE call. Stdlib fallback below takes 2 round-trips (HEAD + GET).
+    bp = _binaries.detect("httpx")
+    if bp.available:
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+                f.write(url + "\n")
+                tmp = f.name
+            try:
+                rc, stdout, stderr = await _binaries._run_binary(
+                    ["httpx", "-l", tmp, "-status-code", "-title", "-webserver",
+                     "-content-type", "-follow-redirects", "-no-stdin",
+                     "-json", "-timeout", str(int(timeout_s))],
+                    timeout_s=timeout_s + 5,
+                )
+                records = _parse_httpx_jsonl(stdout)
+                rec = records[0] if records else None
+                if rec and rec.get("status_code") is not None:
+                    result: dict[str, Any] = {
+                        "url": url,
+                        "verified": False,
+                        "reason": None,
+                        "probe": {
+                            "status_code": rec["status_code"],
+                            "server": rec["server"],
+                            "content_type": rec["content_type"],
+                            "title": rec["title"],
+                            "final_url": rec["final_url"],
+                            "error": None,
+                            "tech": rec["tech"],
+                        },
+                        "verified_at": None,
+                    }
+                    # httpx doesn't return body for error-page detection
+                    # unless -body is set. For 200 OK with html, we fall
+                    # back to body check via stdlib GET below if -body not set.
+                    if rec["status_code"] != 200:
+                        result["reason"] = f"status_{rec['status_code']}"
+                    else:
+                        # 200 — try body check (httpx -body in second pass)
+                        try:
+                            rc2, stdout2, _ = await _binaries._run_binary(
+                                ["httpx", "-l", tmp, "-status-code",
+                                 "-body", "-no-stdin", "-timeout", str(int(timeout_s))],
+                                timeout_s=timeout_s + 5,
+                            )
+                            for line2 in stdout2.splitlines():
+                                line2 = line2.strip()
+                                if not line2:
+                                    continue
+                                try:
+                                    r2 = json.loads(line2)
+                                except json.JSONDecodeError:
+                                    continue
+                                body = r2.get("body", "") or ""
+                                ct = r2.get("content_type") or rec["content_type"]
+                                err = _is_error_body(body, ct)
+                                if err:
+                                    result["reason"] = f"error_body:{err}"
+                                else:
+                                    result["reason"] = "ok"
+                                    result["verified"] = True
+                                break
+                            else:
+                                # httpx -body not available; trust status=200.
+                                result["reason"] = "ok_no_body_check"
+                                result["verified"] = True
+                        except (asyncio.TimeoutError, OSError):
+                            # body check failed; trust status=200
+                            result["reason"] = "ok_no_body_check"
+                            result["verified"] = True
+                    result["verified_at"] = datetime.now(timezone.utc).isoformat()
+                    return json.dumps(result, ensure_ascii=False)
+            finally:
+                try:
+                    Path(tmp).unlink()
+                except OSError:
+                    pass
+        except (asyncio.TimeoutError, OSError, IndexError) as exc:
+            pass  # fall through to stdlib
 
     result: dict[str, Any] = {
         "url": url,

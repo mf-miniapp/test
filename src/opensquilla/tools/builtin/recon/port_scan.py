@@ -1,15 +1,28 @@
-"""TCP port recon tools — pure stdlib ``asyncio.open_connection``.
+"""TCP port recon tools — naabu (preferred) / masscan (large-scale) / stdlib (fallback).
 
 Group: ``group:recon:portscan``.
+
+v4.4 (2026-06-18) hardening: naabu binary
+(https://github.com/projectdiscovery/naabu) does SYN scan at
+1k-10k pps. masscan binary
+(https://github.com/robertdavidgraham/masscan) does
+Internet-scale scans (10M pps). Stdlib asyncio.open_connection
+is the FALLBACK for hosts without either binary. The routing:
+  - ip + ports (≤500)        -> naabu
+  - ip + ports (>500 / full) -> masscan if available, else naabu
+  - single port verify       -> stdlib (overhead too high to spawn binary)
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from opensquilla.tools.registry import tool
+from opensquilla.tools.builtin.recon import _binaries
 
 
 @tool(
@@ -53,12 +66,48 @@ async def recon_port_scan_tcp(ip: str, port: int, timeout_s: float = 2.0) -> str
     return json.dumps(result, ensure_ascii=False)
 
 
+async def _parse_naabu_text(text: str) -> list[dict[str, Any]]:
+    """Parse naabu plain-text output. One 'ip:port' per line.
+
+    naabu -json emits richer records; we accept the plain format here
+    because the range tool is bandwidth-conscious.
+    """
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        try:
+            host, p = line.rsplit(":", 1)
+            out.append({"ip": host, "port": int(p), "state": "open"})
+        except ValueError:
+            continue
+    return out
+
+
+async def _parse_masscan_text(text: str) -> list[dict[str, Any]]:
+    """Parse masscan plain-text output. Format: 'open tcp PORT IP TIMESTAMP'"""
+    out: list[dict] = []
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 4 and parts[0] == "open":
+            try:
+                port = int(parts[2])
+                ip = parts[3]
+                out.append({"ip": ip, "port": port, "state": "open"})
+            except (ValueError, IndexError):
+                continue
+    return out
+
+
 @tool(
     name="recon_port_scan_range",
     description=(
-        "Probe a list of TCP ports concurrently with bounded fanout. "
-        "Returns only the open ports (closed/filtered are omitted from "
-        "the output to keep the payload small)."
+        "Probe a list of TCP ports. v4.4-preferred: routes to naabu "
+        "(SYN scan, fast) for normal ranges, masscan (Internet-scale) "
+        "for >500 ports. Falls back to stdlib asyncio.open_connection "
+        "when neither binary is on PATH. Returns only the open ports "
+        "as a JSON list of {ip, port, state} records."
     ),
     params={
         "ip": {"type": "string", "description": "Target IP address."},
@@ -67,35 +116,79 @@ async def recon_port_scan_tcp(ip: str, port: int, timeout_s: float = 2.0) -> str
             "items": {"type": "integer"},
             "description": "List of TCP port numbers to probe.",
         },
-        "concurrency": {
+        "rate": {
             "type": "integer",
-            "description": "Max concurrent open connections. Default: 100.",
-            "default": 100,
+            "description": "naabu -rate / masscan --rate. Packets/sec. Default: 1000.",
+            "default": 1000,
         },
         "timeout_s": {
-            "type": "number",
-            "description": "Per-port connect timeout. Default: 2.0.",
-            "default": 2.0,
+            "type": "integer",
+            "description": "Total scan timeout. Default: 60.",
+            "default": 60,
         },
     },
     required=["ip", "ports"],
-    execution_timeout_seconds=120.0,
+    execution_timeout_seconds=300.0,
 )
 async def recon_port_scan_range(
     ip: str,
     ports: list[int],
-    concurrency: int = 100,
-    timeout_s: float = 2.0,
+    rate: int = 1000,
+    timeout_s: int = 60,
 ) -> str:
-    """Concurrent TCP probe over a port list."""
-    semaphore = asyncio.Semaphore(concurrency)
+    """Range port scan via naabu/masscan (preferred) or stdlib (fallback)."""
+    if not ports:
+        return json.dumps({
+            "ip": ip, "scanned": 0, "open": [], "open_count": 0,
+            "source": "noop",
+        }, ensure_ascii=False)
+
+    # Pick binary by port count. >500 → masscan if available.
+    if len(ports) > 500:
+        bp = _binaries.detect("masscan")
+        if bp.available:
+            try:
+                port_spec = ",".join(str(p) for p in ports)
+                rc, stdout, stderr = await _binaries._run_binary(
+                    ["masscan", ip, "-p", port_spec, "--rate", str(rate),
+                     "-oL", "-", "--wait", "1"],
+                    timeout_s=timeout_s,
+                )
+                open_ports = await _parse_masscan_text(stdout)
+                return json.dumps({
+                    "ip": ip, "scanned": len(ports), "open": open_ports,
+                    "open_count": len(open_ports), "source": "masscan",
+                    "binary_version": bp.version,
+                }, ensure_ascii=False)
+            except (asyncio.TimeoutError, OSError) as exc:
+                pass  # fall through
+
+    bp = _binaries.detect("naabu")
+    if bp.available:
+        try:
+            port_spec = ",".join(str(p) for p in ports)
+            rc, stdout, stderr = await _binaries._run_binary(
+                ["naabu", "-host", ip, "-p", port_spec, "-rate", str(rate),
+                 "-silent", "-no-stdin"],
+                timeout_s=timeout_s,
+            )
+            open_ports = await _parse_naabu_text(stdout)
+            return json.dumps({
+                "ip": ip, "scanned": len(ports), "open": open_ports,
+                "open_count": len(open_ports), "source": "naabu",
+                "binary_version": bp.version,
+            }, ensure_ascii=False)
+        except (asyncio.TimeoutError, OSError) as exc:
+            pass  # fall through to stdlib
+
+    # Stdlib fallback.
+    semaphore = asyncio.Semaphore(100)
 
     async def _probe(port: int) -> dict[str, Any] | None:
         async with semaphore:
             try:
                 _reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port),
-                    timeout=timeout_s,
+                    asyncio.open_connection(ip, port), timeout=2.0,
                 )
                 writer.close()
                 try:
@@ -109,7 +202,8 @@ async def recon_port_scan_range(
     results = await asyncio.gather(*[_probe(p) for p in ports])
     open_ports = [r for r in results if r is not None]
     return json.dumps(
-        {"ip": ip, "scanned": len(ports), "open": open_ports, "open_count": len(open_ports)},
+        {"ip": ip, "scanned": len(ports), "open": open_ports,
+         "open_count": len(open_ports), "source": "stdlib"},
         ensure_ascii=False,
     )
 

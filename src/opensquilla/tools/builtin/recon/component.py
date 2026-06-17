@@ -22,6 +22,7 @@ import urllib.request
 from typing import Any
 
 from opensquilla.tools.registry import tool
+from opensquilla.tools.builtin.recon import _binaries
 
 
 # ── 1. recon_cpe_resolve ─────────────────────────────
@@ -231,22 +232,85 @@ def _parse_cert_basic(cert_der: bytes) -> dict[str, Any]:
     return out
 
 
-@tool(
-    name="recon_tls_cert_parse",
-    description=(
-        "Open a TLS connection to ip:port, fetch the server certificate, and "
-        "extract subject CN / issuer / SAN DNS entries / validity window. "
-        "Pure-stdlib ssl module."
-    ),
-    params={
-        "ip": {"type": "string"},
-        "port": {"type": "integer", "default": 443},
-        "timeout_s": {"type": "number", "default": 5.0},
-    },
-    required=["ip", "port"],
-    execution_timeout_seconds=15.0,
-)
+def _parse_tlsx_jsonl(text: str) -> list[dict[str, Any]]:
+    """Parse tlsx -json output. One record per probed host:port.
+
+    tlsx -json emits records like:
+      {"host":"1.2.3.4","ip":"1.2.3.4","port":"443","probe_status":true,
+       "tls_version":"TLS 1.3","cipher":"TLS_AES_128_GCM_SHA256",
+       "certificate":"-----BEGIN CERTIFICATE-----\n...",
+       "subject":"CN=example.com","issuer":"CN=R3","subject_an":["api.example.com"],
+       "issuer_dn":"CN=R3, O=Let's Encrypt","fingerprint_hash":{"sha256":"..."},
+       "not_before":"2025-...","not_after":"2026-..."}
+    """
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        out.append({
+            "host": rec.get("host", ip if "ip" in dir() else ""),
+            "ip": rec.get("ip"),
+            "port": rec.get("port"),
+            "probe_status": rec.get("probe_status"),
+            "tls_version": rec.get("tls_version"),
+            "cipher": rec.get("cipher"),
+            "subject": rec.get("subject_cn") or rec.get("subject") or rec.get("cn"),
+            "subject_an": rec.get("subject_an", []) or [],
+            "issuer": rec.get("issuer"),
+            "issuer_dn": rec.get("issuer_dn"),
+            "not_before": rec.get("not_before"),
+            "not_after": rec.get("not_after"),
+            "fingerprint_sha256": (rec.get("fingerprint_hash") or {}).get("sha256") or rec.get("sha256"),
+        })
+    return out
+
+
 async def recon_tls_cert_parse(ip: str, port: int = 443, timeout_s: float = 5.0) -> str:
+    """TLS cert parse via tlsx (preferred) or stdlib ssl (fallback)."""
+    bp = _binaries.detect("tlsx")
+    if bp.available:
+        # tlsx 1.2.2: cn/san cannot coexist with tls-version/cipher
+        # (FTL: "san or cn flag cannot be used with other probes").
+        # Run two passes and merge.
+        merged: dict[str, Any] = {}
+        pass_a = ["tlsx", "-host", f"{ip}:{port}", "-sm", "openssl", "-json",
+                  "-cn", "-san", "-so", "-hash", "sha256", "-probe-status"]
+        pass_b = ["tlsx", "-host", f"{ip}:{port}", "-sm", "openssl", "-json",
+                  "-tls-version", "-cipher"]
+        any_ok = False
+        for argv in (pass_a, pass_b):
+            try:
+                rc, stdout, _stderr = await _binaries._run_binary(
+                    argv, timeout_s=timeout_s + 5,
+                )
+            except (asyncio.TimeoutError, OSError):
+                continue
+            for r in _parse_tlsx_jsonl(stdout):
+                for k, v in r.items():
+                    if v:
+                        merged[k] = v
+                any_ok = True
+        if any_ok:
+            return json.dumps({
+                "ok": True, "source": "tlsx", "binary_version": bp.version,
+                "cert": {
+                    "subject_cn": merged.get("subject_cn") or merged.get("subject"),
+                    "subject_org": merged.get("subject_org") or merged.get("so"),
+                    "issuer": merged.get("issuer_dn") or merged.get("issuer"),
+                    "san_dns": merged.get("subject_an", []) or [],
+                    "tls_version": merged.get("tls_version"),
+                    "cipher": merged.get("cipher"),
+                    "not_before": merged.get("not_before"),
+                    "not_after": merged.get("not_after"),
+                    "fingerprint_sha256": merged.get("sha256") or merged.get("fingerprint_sha256"),
+                },
+            }, ensure_ascii=False)
+
     loop = asyncio.get_running_loop()
 
     def _fetch() -> dict[str, Any]:
@@ -256,7 +320,7 @@ async def recon_tls_cert_parse(ip: str, port: int = 443, timeout_s: float = 5.0)
         try:
             with ctx.wrap_socket(__import__("socket").create_connection((ip, port), timeout=timeout_s), server_hostname=ip) as s:
                 der = s.getpeercert(binary_form=True) or b""
-            return {"ok": True, "cert": _parse_cert_basic(der)}
+            return {"ok": True, "source": "stdlib", "cert": _parse_cert_basic(der)}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
