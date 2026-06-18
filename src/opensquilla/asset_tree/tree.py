@@ -689,7 +689,199 @@ class AssetTree:
         with self._lock:
             return self._compute_depth_locked(node_id)
 
+    # ── v5 (2026-06-18) 8 层骨架核查 ──────────────────────
+    #
+    # hack-deep-find 结束标记: 资产树 8 层骨架完整建好。
+    # 业务硬约束 = 树上有节点触及 L8 (path_depth == MAX_TREE_DEPTH)
+    #              且没有任何 UNSEEN 节点 (即每个非根节点都被探过)。
+    #
+    # 这些 API 是公开的、可被编排器 / 工具 / tree-finalizer 读取。
+
+    def nodes_per_layer(self) -> dict[int, int]:
+        """按 path_depth 分组统计节点数。
+
+        Returns:
+            ``{depth: count}`` 字典, 仅含树中实际存在的 depth 层级。
+            例: ``{0: 1, 1: 12, 2: 18, 3: 47, 4: 21, 5: 64, 6: 132, 7: 18, 8: 3}``。
+        """
+        with self._lock:
+            layers: dict[int, int] = {}
+            for n in self._nodes.values():
+                d = n.depth if n.depth >= 0 else 0
+                layers[d] = layers.get(d, 0) + 1
+            return dict(sorted(layers.items()))
+
+    def max_depth_reached(self) -> int:
+        """当前树实际触及的最深 depth (= 0 if only root)。"""
+        layers = self.nodes_per_layer()
+        return max(layers.keys()) if layers else 0
+
+    def skeleton_completion_pct(self) -> float:
+        """8 层骨架完成度 (0.0 ~ 1.0)。
+
+        公式: ``max_depth_reached / MAX_TREE_DEPTH``。
+        例: max_depth=4, MAX_TREE_DEPTH=8 → 0.5。
+        例: max_depth=8, MAX_TREE_DEPTH=8 → 1.0 (完成)。
+        """
+        return self.max_depth_reached() / MAX_TREE_DEPTH
+
+    def is_skeleton_complete(self) -> bool:
+        """8 层骨架是否完整建好。
+
+        条件 (v5 hack-deep-find 终止契约):
+          (1) ``max_depth_reached() == MAX_TREE_DEPTH`` (树触及 L8)
+          (2) 没有任何 UNSEEN 节点 (所有节点都被探过)
+        注: ABANDONED 节点**不**算阻塞 — 软删节点合法, F-resume
+        可选择 retry 或继续。
+        """
+        with self._lock:
+            if self.max_depth_reached() < MAX_TREE_DEPTH:
+                return False
+            for n in self._nodes.values():
+                if n.state == AssetState.UNSEEN:
+                    return False
+            return True
+
+    def skeleton_report(self) -> dict[str, Any]:
+        """8 层骨架完整性报告 (给 tree-finalizer / 编排器使用)。
+
+        Returns:
+            dict 含:
+              - ``complete``: bool, is_skeleton_complete()
+              - ``max_depth_reached``: int
+              - ``max_depth_cap``: int (= MAX_TREE_DEPTH)
+              - ``completion_pct``: float (0.0..1.0)
+              - ``nodes_per_layer``: {depth: count}
+              - ``unseen_total``: int
+              - ``unseen_by_type``: {asset_type: count}
+              - ``unseen_by_layer``: {depth: count}
+              - ``abandoned_total``: int
+        """
+        with self._lock:
+            max_d = self.max_depth_reached()
+            nodes_per_layer = self.nodes_per_layer()
+            unseen_total = 0
+            unseen_by_type: dict[str, int] = {}
+            unseen_by_layer: dict[int, int] = {}
+            abandoned_total = 0
+            for n in self._nodes.values():
+                if n.state == AssetState.UNSEEN:
+                    unseen_total += 1
+                    unseen_by_type[n.asset_type.value] = (
+                        unseen_by_type.get(n.asset_type.value, 0) + 1
+                    )
+                    d = n.depth if n.depth >= 0 else 0
+                    unseen_by_layer[d] = unseen_by_layer.get(d, 0) + 1
+                elif n.state == AssetState.ABANDONED:
+                    abandoned_total += 1
+            return {
+                "complete": self.is_skeleton_complete(),
+                "max_depth_reached": max_d,
+                "max_depth_cap": MAX_TREE_DEPTH,
+                "completion_pct": self.skeleton_completion_pct(),
+                "nodes_per_layer": nodes_per_layer,
+                "unseen_total": unseen_total,
+                "unseen_by_type": dict(
+                    sorted(unseen_by_type.items(), key=lambda kv: -kv[1])
+                ),
+                "unseen_by_layer": dict(sorted(unseen_by_layer.items())),
+                "abandoned_total": abandoned_total,
+            }
+
+    def dispatch_plan(
+        self,
+        *,
+        max_chains: int = 50,
+        batch_size_bulk: int = 10,
+    ) -> dict[str, Any]:
+        """v5 (2026-06-18) 编排器 spawn 计划生成器。
+
+        按 wave 读取 ``attack_dispatch.waves.DISCOVERY_STRATEGY_MAP``,
+        对每个 wave 返回:
+          - ``strategy``: ``bulk_layer`` 或 ``chain_fanout``
+          - ``spawn_count``: 编排器应 fire 的 sessions_spawn 数量
+          - ``unseen_total``: 该 wave 涉及的 UNSEEN 节点数
+          - ``sample_targets``: 抽样前 3 个目标 (给编排器拼 envelope)
+        L0..L3 (bulk_layer) 走 ``asset_tree_find_unseen`` 全量; L4+
+        (chain_fanout) 走 ``asset_tree_find_unseen_chain`` 按 parent 分组,
+        每条 chain 1 spawn。
+
+        Returns:
+            ``{wave_id: {strategy, spawn_count, unseen_total, sample_targets}}``
+        """
+        try:
+            from opensquilla.attack_dispatch.waves import (
+                DISCOVERY_STRATEGY_MAP,
+                WAVES,
+            )
+        except ImportError:
+            # 避免 import cycle; 退化到全 chain_fanout
+            return {}
+
+        with self._lock:
+            plan: dict[str, Any] = {}
+            # wave -> 触发该 wave 的 UNSEEN 节点类型
+            wave_unseen_types: dict[str, list[str]] = {
+                "W0.5": ["sub_domain"],
+                "W1": ["ip", "port"],
+                "W1.5": ["service", "sub_domain", "url"],
+                "W1.5c": ["url"],
+                "W2.5": ["endpoint"],
+                "W3.5": ["url", "endpoint", "component"],
+            }
+            for wave_id, types in wave_unseen_types.items():
+                if wave_id not in DISCOVERY_STRATEGY_MAP:
+                    continue
+                strategy = DISCOVERY_STRATEGY_MAP[wave_id]
+                # 收集 UNSEEN 节点 (按 types 过滤)
+                unseen_nodes = [
+                    n for n in self._nodes.values()
+                    if n.state == AssetState.UNSEEN
+                    and n.asset_type.value in types
+                ]
+                unseen_total = len(unseen_nodes)
+                if strategy == "bulk_layer":
+                    spawn_count = (
+                        (unseen_total + batch_size_bulk - 1) // batch_size_bulk
+                        if unseen_total else 0
+                    )
+                    sample = [
+                        {
+                            "node_id": n.id,
+                            "asset_type": n.asset_type.value,
+                            "value": n.value,
+                            "depth": n.depth,
+                        }
+                        for n in unseen_nodes[:3]
+                    ]
+                else:  # chain_fanout
+                    # 按 parent_id 分组, 1 chain 1 spawn
+                    chains: dict[str, list] = {}
+                    for n in unseen_nodes:
+                        pid = n.parent_id or "<root>"
+                        chains.setdefault(pid, []).append(n)
+                    spawn_count = min(len(chains), max_chains) if chains else 0
+                    sample = [
+                        {
+                            "parent_node_id": pid,
+                            "unseen_count": len(children),
+                        }
+                        for pid, children in list(chains.items())[:3]
+                    ]
+                plan[wave_id] = {
+                    "strategy": strategy,
+                    "spawn_count": spawn_count,
+                    "unseen_total": unseen_total,
+                    "sample_targets": sample,
+                    "fanout_agents": list(
+                        getattr(WAVES.get(wave_id), "fanout_agents", ())
+                    ),
+                }
+            return plan
+
+
     def max_depth(self) -> int:
+
         """树的最大深度。"""
         if not self.root_id:
             return 0

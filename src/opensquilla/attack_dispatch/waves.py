@@ -102,6 +102,19 @@ LAYERS: dict[str, tuple[str, ...]] = {
 
 FanoutMode = Literal["single", "static_fanout", "dynamic_fanout"]
 
+# v5 (2026-06-18) DiscoveryStrategy: hack-deep-find 编排器对每个 wave 选用
+# 的扇出形状。两个策略明确区分 L0..L3 (全部一起逐层并行) 和 L4+ (单链
+# 深度, 避免 context 爆炸):
+#
+#   BULK_LAYER    L0..L3 (W0.5 / W1): 一次取全层 UNSEEN, 多 batch 并发
+#                                  (port-scanner 10 IP / batch 等)。
+#                                  同层多 specialist 同时跑, 资源利用率高。
+#   CHAIN_FANOUT  L4+  (W1.5 / W1.5c / W2.5 / W3.5): 按 parent chain
+#                                  分组, 每条 chain 1 specialist 深度下钻,
+#                                  避免 1 个 service 出 1000+ endpoint
+#                                  时 specialist context 爆掉。
+DiscoveryStrategy = Literal["bulk_layer", "chain_fanout"]
+
 
 # 2026-06-15 (3-harness split): each wave has a single owner_agent.
 # The owner is the LLM orchestrator authorized to drive that wave's
@@ -538,17 +551,62 @@ def list_drill_in_slots(parent_wave: str) -> tuple[str, ...]:
 # - W4.5* / W6.5*  drill-in:       继承父波次 max_path_depth
 WAVE_MAX_PATH_DEPTH: dict[str, int] = {
     # 值是 path_depth 索引 (节点 depth ∈ [0, 8])。
-    "W0.5": 2,    # ROOT(0) → SUB(1) → IP(2)  写到 IP
-    "W1": 5,      # ROOT..URL(5) — 写 PORT(3)/SERVICE(4)/URL(5)
-    "W1.5": 5,
+    # 与 workflow 文档严格一致:
+    #   W0.5   = 2 (L2 IP, 网络起点)
+    #   W1     = 4 (L4 SERVICE, 不写 URL — URL 由 W1.5 webapp-discoverer 派生)
+    #   W1.5   = 5 (L5 URL, 派生 endpoint 留给 W1.5c)
+    #   W1.5c  = 7 (L7 PARAMETER, 闭环 url→endpoint→parameter)
+    #   W2.5   = 8 (L8 INJECTION_VECTOR, 业务最深, 跨 owner dispatch)
+    #   W3.5   = 6 (L6 ENDPOINT, 派生 STATIC_ASSET/COOKIE/HEADER/SECRET 等 L5 跨层)
+    #   W4     = 8 (攻击面读取, 不写)
+    "W0.5": 2,    # ROOT(0) → SUB(1) → IP(2)
+    "W1": 4,      # PORT(3)/SERVICE(4)
+    "W1.5": 5,    # URL(5) — 派生 url_candidates, 跨 sub_domain 拿 storage
     "W1.5c": 7,   # url(5)/endpoint(6)/parameter(7) 都在 W1.5c 闭环
-    "W2.5": 8,    # injection_vector(8) 由 W2.5 (Tier 2 web) 写入, 业务最深
-    "W3.5": 8,    # secret 跨层挂载, 自身 depth 算, 但允许挂在 path_depth<=8 的父位
+    "W2.5": 8,    # injection_vector(8) 跨 owner dispatch
+    "W3.5": 6,    # endpoint(6) 派生 STATIC_ASSET/COOKIE/HEADER/SECRET (跨层挂载)
     "W4": 8,      # 攻击面读取, 不写
 }
 
+# v5 (2026-06-18) 探测策略映射 — hack-deep-find 编排器按 wave 选用扇出形状。
+# 硬约束: L0..L3 (path_depth 0..3) 全部一起逐层并行 = bulk_layer;
+#        L4+   (path_depth 4..8) 单链深度探测 = chain_fanout。
+DISCOVERY_STRATEGY_MAP: dict[str, DiscoveryStrategy] = {
+    # L0..L3 bulk_layer
+    "W0.5": "bulk_layer",   # root -> sub -> ip (横向 + 网络层全量)
+    "W0.6": "bulk_layer",   # resource-checkpoint, 静态 fanout, 不写资产树
+    "W1": "bulk_layer",     # ip -> port -> service (网络层全量逐层)
+    # L4+ chain_fanout
+    "W1.5": "chain_fanout",  # service / url / sub_domain -> web / 组件 / 存储
+    "W1.5c": "chain_fanout", # url -> endpoint / parameter (per-url 链)
+    "W2.5": "chain_fanout",  # endpoint -> injection_vector (per-port 链)
+    "W3.5": "chain_fanout",  # url / endpoint / component -> secret / cookie / header
+    "W4": "chain_fanout",    # 攻击面读取, 沿用 chain_fanout 形状
+}
+
+
+def strategy_of_wave(wave: str) -> DiscoveryStrategy:
+    """Return the discovery strategy for a wave. Falls back to chain_fanout."""
+    if wave in DISCOVERY_STRATEGY_MAP:
+        return DISCOVERY_STRATEGY_MAP[wave]
+    for parent, slots in DRILL_IN_SLOTS.items():
+        if wave in slots:
+            return strategy_of_wave(parent)
+    return "chain_fanout"
+
+
+def is_bulk_layer_wave(wave: str) -> bool:
+    """True iff the wave uses bulk_layer (L0..L3, all-together)."""
+    return strategy_of_wave(wave) == "bulk_layer"
+
+
+def is_chain_fanout_wave(wave: str) -> bool:
+    """True iff the wave uses chain_fanout (L4+, per-chain depth)."""
+    return strategy_of_wave(wave) == "chain_fanout"
+
 
 def wave_owns_depth(wave: str, target_depth: int) -> bool:
+
     """判断某 wave 是否"拥有"指定 depth 的写入权。
 
     v5 (2026-06-18): 编排器在派发 specialist 之前, 必须用此函数判断

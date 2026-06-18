@@ -2515,6 +2515,49 @@ class FindCompleteEvidence(EvidenceBase):
             "hack-deep reason about coverage gaps."
         ),
     )
+    # v5 (2026-06-18) 8 层骨架完成度 — hack-deep-find 终止契约。
+    skeleton_complete: bool = Field(
+        default=False,
+        description=(
+            "True iff the 8-layer skeleton is fully built. Means: "
+            "(a) tree reached path_depth == MAX_TREE_DEPTH (8); "
+            "(b) no node is in UNSEEN state. ABANDONED nodes are allowed."
+        ),
+    )
+    skeleton_max_depth_reached: int = Field(
+        default=0,
+        description=(
+            "Actual deepest path_depth in the tree at handoff time."
+        ),
+    )
+    skeleton_completion_pct: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "max_depth_reached / MAX_TREE_DEPTH (0.0..1.0)."
+        ),
+    )
+    skeleton_nodes_per_layer: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Per-depth node counts, e.g. {0: 1, 1: 12, ..., 8: 3}. "
+            "JSON-friendly: keys are stringified depth ints."
+        ),
+    )
+    skeleton_unseen_total: int = Field(
+        default=0,
+        description=(
+            "Total UNSEEN nodes at handoff. Must be 0 for skeleton_complete=True."
+        ),
+    )
+    discovery_strategy_applied: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-wave discovery strategy actually used: bulk_layer "
+            "(L0..L3) or chain_fanout (L4+). v5 (2026-06-18)."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

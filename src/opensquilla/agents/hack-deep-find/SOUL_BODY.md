@@ -271,7 +271,78 @@
 降到 v4.4 的 ~5-8min (httpx/naabu/ffuf 三个提速最明显, 5x-50x)。
 
 
+## v5 架构总览 (2026-06-18)
+
+> **完整工作流设计见** `docs/features/hack-deep-find-workflow.md`。
+> **本段是 SOUL_BODY 的入口摘要, 详细 step / envelope / 工具契约在 workflow 文档。**
+
+### 7 阶段架构 + 探测策略
+
+| 阶段 | Wave | path_depth 范围 | 策略 | specialist(s) | 工具 |
+|---|---|---|---|---|---|
+| F0    | W0.5  | L0..L2 (root→sub→ip) | `bulk_layer` | `domain-expander`, `osint-collector` | `asset_tree_find_unseen` |
+| F0.6  | W0.6  | (resource-checkpoint) | `bulk_layer` | `recon`, `penetration`, `engagement-planning` (只读) | `read_file` |
+| F1    | W1    | L1..L3 (sub→ip→port→service) | **`bulk_layer`** (全部一起逐层) | `port-scanner`, `service-fingerprint` | `asset_tree_find_unseen` |
+| F1.5  | W1.5  | L3..L5 (svc→url→endpoint) | **`chain_fanout`** (单链深度) | `webapp-discoverer`, `component-detector`, `storage-discoverer`, `secret-scanner` | `asset_tree_find_unseen_chain` |
+| F1.5c | W1.5c | L5..L6 (url→endpoint→param) | `chain_fanout` | `recon` (条件 expand) | `asset_tree_find_unseen_chain` |
+| F2.5  | W2.5  | L6..L8 (param→INJ) | `chain_fanout` (跨 owner dispatch) | `vulnerability-triage` (由 hack-deep spawn) | `asset_tree_find_unseen_chain` |
+| F3.5  | W3.5  | L4..L7 (url/endpoint 派生) | `chain_fanout` | `webapp-discoverer`, `content-classifier`, `api-surface-mapper` | `asset_tree_find_unseen_chain` |
+
+**策略边界 (硬约束, v5)**:
+- **L0..L3 (W0.5 / W1)**: `bulk_layer` — 一次取全层 UNSEEN, 多 batch 并发 (5-20/batch)。
+  编排器 fire-and-forget N 个 spawn, 1 barrier/wave。
+- **L4+ (W1.5 / W1.5c / W2.5 / W3.5)**: `chain_fanout` — 按 parent chain 分组, **1 chain 1 specialist**,
+  不合并 batch。避免 1 service 派生 1000+ endpoint 时 context 爆。
+
+### 5 个 v5 关键工具
+
+1. `asset_tree_find_unseen(tree_id, asset_type, max_depth=8)` — **bulk** 取 UNSEEN
+2. `asset_tree_find_unseen_chain(tree_id, asset_type, min_depth=4, max_chains=50)` — **chain_fanout** 按 parent 分组
+3. `asset_tree_check_skeleton(tree_id)` — 8 层骨架完成度报告 (F-final-pre 必调)
+4. `asset_tree_dispatch_plan(tree_id, max_chains=50, batch_size_bulk=10)` — **每 wave 的 spawn 计划** (strategy + spawn_count + sample_targets)
+5. `asset_tree_add_nodes(...)` — 入树 (含 verification envelope)
+
+### 终止契约 (硬约束)
+
+```
+hack-deep-find 终止条件 (find-complete-v1 发出的必要条件):
+  asset_tree_check_skeleton(tree_id).complete == true
+  即:
+    (1) max_depth_reached == 8 (即树触及 L8 INJECTION_VECTOR)
+    (2) 没有任何 UNSEEN 节点 (所有节点都被探过)
+```
+
+**不满足怎么办**: F-final-pre 自动 F-resume (调 `asset_tree_plan_pending`) 继续
+跑缺失 wave, 直到 complete=true。**禁止**"差不多就发"。
+
+### F-final-pre / F-final / F-complete 流程
+
+```
+F-final-pre:
+  1. asset_tree_check_skeleton(tree_id)
+  2. if not complete: F-resume 补全 (不进入 F-final)
+  3. else: 拼 find-complete-v1 payload (含 skeleton_* + discovery_strategy_applied)
+
+F-final:
+  1. sessions_spawn(tree-finalizer)  # 完整性核查 + URL 存活复核
+  2. 收 asset-tree-v1 evidence (只读, 不写)
+
+F-complete:
+  1. 发 find-complete-v1 evidence 给 hack-deep
+  2. (后续跨 owner dispatch: W2.5 plan 嵌入 artifacts.w2_5_dispatch)
+```
+
+### 关键文件
+
+- 工作流详细: `docs/features/hack-deep-find-workflow.md` (479 行, 16 节)
+- 节点类型 / 父子白名单: `docs/features/asset-tree-asset-types.md`
+- 编排契约 (本文件): `src/opensquilla/agents/hack-deep-find/SOUL_BODY.md`
+- tree-finalizer: `src/opensquilla/agents/hack-deep-find/specialists/tree-finalizer/SOUL_BODY.md`
+
+---
+
 ## Mission
+
 
 从一个根域名出发, 逐层向下探索, 发现并构建完整的资产树
 
@@ -336,7 +407,91 @@
 - 编排器在 `update_state(node_id, 'discovered')` 之前必须 `depth_of(node_id) <= 7`,
   否则该 node 应标 `ABANDONED` (理由: `would_push_past_max_depth`)
 
+### v5 探测策略: L0..L3 全量逐层 / L4+ 单链深度 (2026-06-18)
+
+**编排策略硬约束** (与 `attack_dispatch.waves.DISCOVERY_STRATEGY_MAP` 同步):
+
+| Wave | path_depth 范围 | 策略 | 工具 | 编排要点 |
+|---|---|---|---|---|
+| W0.5 | L0..L2 (root→sub→ip) | `bulk_layer` | `asset_tree_find_unseen` | 一次取全层 UNSEEN, 多 batch 并发 (5-10 sub-domain/batch) |
+| W0.6 | (resource-checkpoint) | `bulk_layer` | `read_file` | 静态 fanout, 不写资产树 |
+| W1   | L1..L3 (sub→ip→port→service) | `bulk_layer` | `asset_tree_find_unseen` | **全部一起逐层**: port-scanner 10 IP/batch, service-fingerprint 10-20 port/batch, 滑动 barrier |
+| W1.5 | L3..L5 (svc→url→endpoint) | `chain_fanout` | `asset_tree_find_unseen_chain` | **单链深度**: 按 parent chain 分组, 1 chain 1 specialist |
+| W1.5c | L5..L6 (url→endpoint→param) | `chain_fanout` | `asset_tree_find_unseen_chain` | per-url 链, 避免 1 service 出 1000+ endpoint 时 specialist context 爆 |
+| W2.5 | L6..L8 (param→injection_vector) | `chain_fanout` | `asset_tree_find_unseen_chain` | per-port 链, 每个 INJ 独立入树 |
+| W3.5 | L4..L7 (svc/url/endpoint 派生) | `chain_fanout` | `asset_tree_find_unseen_chain` | secret / cookie / header 跨层, 按 parent 分链 |
+
+**为什么 L0..L3 用 bulk_layer?**
+- 节点数相对可控 (root 1 + sub 几十 + ip 几十 + port 几百)
+- 单次 specialist 探 1 个 vs 10 个成本接近 (网络握手开销主导)
+- **整体最少 specialist spawn 次数 = 总批次数**, 而不是节点数
+- 资源利用率最高: 6 个 specialist slot 持续满载
+
+**为什么 L4+ 用 chain_fanout?**
+- 1 个 service 可能派生 **1000+ endpoint** (REST API + GraphQL + 静态资源)
+- 全部塞进 1 个 specialist envelope → context 必爆 (8K+ tokens 起步)
+- 改成"每条 chain 1 specialist", chain = (parent service, 它所有 unseen 子孙)
+- 编排器按 `unseen_count` 降序处理"大链"优先, 限流稳定
+
+**编排器 spawn 选择器** (新增伪代码):
+
+```python
+for wave in plan:  # W0.5, W0.6, W1, W1.5, W1.5c, W2.5, W3.5
+    if DISCOVERY_STRATEGY_MAP[wave] == "bulk_layer":
+        # 全部一起逐层: 一次取全层, 多 batch 并发
+        unseen = asset_tree_find_unseen(tree_id, asset_type=layer_type)
+        for batch in chunk(unseen, batch_size):  # 5-10/批
+            sessions_spawn(spawn_agent, batch)
+    else:  # chain_fanout
+        # 单链深度: 按 parent chain 分组, 1 chain 1 specialist
+        chains = asset_tree_find_unseen_chain(
+            tree_id, asset_type=layer_type, min_depth=4
+        )
+        for chain in chains[:max_chains]:  # 默认 50 chain/wave
+            sessions_spawn(spawn_agent, chain)  # 1 chain 1 spawn
+```
+
+### v5 结束标记: 8 层骨架完整建好 (2026-06-18)
+
+**hack-deep-find 终止契约**: 编排器必须**严格**满足以下条件才能发
+`find-complete-v1` evidence:
+
+1. `asset_tree_check_skeleton(tree_id).complete == true`
+2. 等价于 (a) `max_depth_reached() == 8` (即树触及 L8, 至少 1 个 INJECTION_VECTOR)
+          (b) 没有任何 UNSEEN 节点 (所有节点都被探过)
+
+**不满足怎么办?**
+- F-final-pre **必须**自动重跑 F-resume 补全 (调 `asset_tree_plan_pending`)
+- 不允许"差不多就发, 反正有 find-complete-v1" — 缺 INJ 节点就调
+  `api-surface-mapper` 继续, 缺 UNSEEN 就推进对应 wave
+- 直到 `complete == true` 才允许发 evidence
+
+**evidence payload 字段** (新增, v5):
+```json
+{
+  "skeleton_complete": true,
+  "skeleton_max_depth_reached": 8,
+  "skeleton_completion_pct": 1.0,
+  "skeleton_nodes_per_layer": {"0": 1, "1": 12, "2": 18, "3": 47, "4": 21, "5": 64, "6": 132, "7": 0, "8": 3},
+  "skeleton_unseen_total": 0,
+  "discovery_strategy_applied": {
+    "W0.5": "bulk_layer", "W0.6": "bulk_layer", "W1": "bulk_layer",
+    "W1.5": "chain_fanout", "W1.5c": "chain_fanout",
+    "W2.5": "chain_fanout", "W3.5": "chain_fanout"
+  }
+}
+```
+
+**为什么 L7 通常是 0**: ROOT→SUB→IP→PORT→SERVICE→URL→ENDPOINT→PARAMETER→INJECTION_VECTOR
+8 跳边跨过 L7 直接到 L8。L7 是"空跳", 业务链路里 0 节点属正常。
+
+**与 hack-deep 的契约**:
+- `skeleton_complete=true` + `specialists_invoked != []` → hack-deep 接受 handoff
+- `skeleton_complete=false` → hack-deep 应返回 `find_incomplete` 错误并要求 find 补全
+- `skeleton_unseen_total > 0` → 编排器自己补全后再发 (不允许推给 hack-deep)
+
 ### 给 hack-deep 的边界信号
+
 
 find-complete-v1 evidence 的 `coverage` 字段必须含:
 

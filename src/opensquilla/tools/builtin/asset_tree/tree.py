@@ -728,6 +728,132 @@ async def asset_tree_find_unseen(
     )
 
 
+@tool(
+    name="asset_tree_find_unseen_chain",
+    description=(
+        "v5 (2026-06-18) chain-fanout mode for L4+ discovery. Returns "
+        "UNSEEN nodes grouped by their parent chain so the orchestrator "
+        "can dispatch ONE specialist per chain (avoiding context blow-up "
+        "when a service has 1000+ endpoints). Each chain entry: "
+        "chain_root_node_id, chain_root_value, chain_path (L0..L[n] "
+        "breadcrumb), unseen_children (list of {node_id, asset_type, "
+        "value, depth}). Use this for W1.5 / W1.5c / W2.5 / W3.5 (L4+). "
+        "Use asset_tree_find_unseen (bulk) for W0.5 / W1 (L0..L3)."
+    ),
+    params={
+        "tree_id": {"type": "string", "description": "Tree id."},
+        "asset_type": {
+            "type": "string",
+            "description": (
+                "Optional AssetType filter. Common: url, endpoint, "
+                "parameter, injection_vector."
+            ),
+        },
+        "min_depth": {
+            "type": "integer",
+            "description": (
+                "Only include chains whose root depth >= min_depth. "
+                "Default 4 (= L4 URL layer) so bulk L0..L3 waves do not "
+                "see this output."
+            ),
+            "default": 4,
+        },
+        "max_chains": {
+            "type": "integer",
+            "description": (
+                "Limit number of chains returned (orchestrator pacing). "
+                "Default 50. Each chain may itself have many unseen "
+                "children; caller decides sub-batch size."
+            ),
+            "default": 50,
+        },
+    },
+    required=["tree_id"],
+)
+async def asset_tree_find_unseen_chain(
+    tree_id: str,
+    asset_type: str | None = None,
+    min_depth: int = 4,
+    max_chains: int = 50,
+) -> str:
+    """List UNSEEN nodes grouped by their parent chain (L4+ discovery)."""
+    tree = _load_tree(tree_id)
+    type_filter: AssetType | None = None
+    if asset_type is not None:
+        type_filter = _validate_asset_type(asset_type)
+    if min_depth < 0:
+        min_depth = 0
+    if max_chains <= 0:
+        max_chains = 50
+
+    # 1. Collect UNSEEN nodes (type filter + min_depth filter).
+    unseen = [
+        n for n in tree.nodes_by_state(AssetState.UNSEEN)
+        if (type_filter is None or n.asset_type == type_filter)
+        and n.depth >= min_depth
+        and n.depth <= MAX_TREE_DEPTH
+    ]
+
+    # 2. Group by parent_id (one parent = one chain).
+    by_parent: dict[str, list[AssetNode]] = {}
+    for n in unseen:
+        pid = n.parent_id or "<root>"
+        by_parent.setdefault(pid, []).append(n)
+
+    # 3. Assemble chain structure.
+    chains: list[dict[str, Any]] = []
+    for parent_id, children in by_parent.items():
+        if len(chains) >= max_chains:
+            break
+        if parent_id == "<root>":
+            chain_root_id = tree.root_id
+            chain_root_value = tree.root_domain
+        else:
+            chain_root_id = parent_id
+            parent_node = tree.get_node(parent_id)
+            chain_root_value = parent_node.value if parent_node else "<unknown>"
+        # Path breadcrumb: ROOT -> ... -> parent_id
+        path_parts: list[str] = []
+        cur = parent_id if parent_id != "<root>" else tree.root_id
+        seen_pids: set[str] = set()
+        while cur and cur not in seen_pids:
+            seen_pids.add(cur)
+            node = tree.get_node(cur)
+            if node is None:
+                break
+            path_parts.append(f"{node.asset_type.value}={node.value}")
+            cur = node.parent_id
+        path_parts.reverse()
+        chains.append({
+            "chain_root_node_id": chain_root_id,
+            "chain_root_value": chain_root_value,
+            "chain_path": " → ".join(path_parts),
+            "unseen_children": [
+                {
+                    "node_id": c.id,
+                    "asset_type": c.asset_type.value,
+                    "value": c.value,
+                    "depth": c.depth,
+                }
+                for c in children
+            ],
+            "unseen_count": len(children),
+        })
+    # Sort by unseen_count desc so orchestrator tackles the "biggest" chains first.
+    chains.sort(key=lambda c: -c["unseen_count"])
+
+    return json.dumps(
+        {
+            "chains": chains,
+            "chain_count": len(chains),
+            "unseen_total": len(unseen),
+            "min_depth_applied": min_depth,
+            "strategy": "chain_fanout",
+        },
+        ensure_ascii=False,
+    )
+
+
 # ── Phase 2 工具 ──────────────────────────────────────
 
 
@@ -914,6 +1040,74 @@ async def asset_tree_stats(tree_id: str) -> str:
     """Return tree statistics."""
     tree = _load_tree(tree_id)
     return json.dumps(tree.stats(), ensure_ascii=False, default=str)
+
+
+@tool(
+    name="asset_tree_check_skeleton",
+    description=(
+        "v5 (2026-06-18) 8-layer skeleton integrity report. "
+        "Returns: completion flag, max_depth_reached, completion_pct, "
+        "nodes_per_layer, unseen counts (total / by_type / by_layer), "
+        "abandoned count. Call this BEFORE emitting find-complete-v1 to "
+        "verify the skeleton is fully built (complete=true), otherwise "
+        "F-final-pre must run another F-resume pass."
+    ),
+    params={
+        "tree_id": {"type": "string", "description": "Tree id."},
+    },
+    required=["tree_id"],
+)
+async def asset_tree_check_skeleton(tree_id: str) -> str:
+    """Return 8-layer skeleton integrity report."""
+    tree = _load_tree(tree_id)
+    return json.dumps(tree.skeleton_report(), ensure_ascii=False, default=str)
+
+
+@tool(
+    name="asset_tree_dispatch_plan",
+    description=(
+        "v5 (2026-06-18) orchestrator spawn-plan generator. For each "
+        "wave, returns: strategy (bulk_layer or chain_fanout), "
+        "spawn_count (number of sessions_spawn to fire), unseen_total, "
+        "sample_targets, fanout_agents. Use this ONCE per find-run to "
+        "compute the full dispatch plan before F0..F3.5; or per wave "
+        "to decide spawning. L0..L3 (W0.5, W1) use bulk_layer; L4+ "
+        "(W1.5, W1.5c, W2.5, W3.5) use chain_fanout."
+    ),
+    params={
+        "tree_id": {"type": "string", "description": "Tree id."},
+        "max_chains": {
+            "type": "integer",
+            "description": (
+                "For chain_fanout waves, max number of chains to dispatch. "
+                "Default 50."
+            ),
+            "default": 50,
+        },
+        "batch_size_bulk": {
+            "type": "integer",
+            "description": (
+                "For bulk_layer waves, batch size (UNSEEN per spawn). "
+                "Default 10. port-scanner uses 5-10 IP, "
+                "service-fingerprint uses 10-20 port."
+            ),
+            "default": 10,
+        },
+    },
+    required=["tree_id"],
+)
+async def asset_tree_dispatch_plan(
+    tree_id: str,
+    max_chains: int = 50,
+    batch_size_bulk: int = 10,
+) -> str:
+    """Return per-wave dispatch plan (strategy + spawn_count)."""
+    tree = _load_tree(tree_id)
+    return json.dumps(
+        tree.dispatch_plan(max_chains=max_chains, batch_size_bulk=batch_size_bulk),
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 @tool(
