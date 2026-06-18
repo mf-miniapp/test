@@ -292,7 +292,7 @@ class BackgroundCompletionManager:
                 error_message=error_message,
             )
             async with self._state_lock:
-                self._wake_groups.discard(group_id)
+                self._wake_groups.pop(group_id, None)
             return
 
         synthesis_task_id = getattr(handle, "task_id", None)
@@ -506,7 +506,7 @@ class BackgroundCompletionManager:
     async def _evict_group(self, group_id: str) -> None:
         async with self._state_lock:
             self._waiting_groups.discard(group_id)
-            self._wake_groups.discard(group_id)
+            self._wake_groups.pop(group_id, None)
             self._delivery_attempted.discard(group_id)
             self._delivery_targets.pop(group_id, None)
 

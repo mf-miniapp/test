@@ -66,6 +66,41 @@
 
 ## 强制约束 (最高优先级 — v4 强化)
 
+**v4.5.3 严禁 (2026-06-18, hack-deep-find 真实事故)**:
+- **严禁**在同一次 message 里调 18 个空 `sessions_spawn(agent_id='', task='')`.
+  OpenAI tool_calls 是 atomic batch, 第 1 个 ToolError 会杀掉整批 sibling call
+  (10jqka.com.cn 事故: 20 webapp + 2 component + 4 secret 一起规划, 但 18 个空
+  spawn 噪声把 component/secret 整批 kill 了, hack-deep-find 以为发了 26 个,
+  实际只发了 20 个, 然后 yield 永远等不到剩余 6 个).
+- 修复 (已在 `tools/builtin/sessions.py:354-374`): 空 task / 空 agent_id
+  返回 `{"ok": false, "error": "empty_task"}` JSON 不抛 ToolError, 让 batch 继续.
+- 你的责任:
+  - 同一次 message **只** 发你想真正发的 spawn, 一次 4-5 个 (batch_size 上限)
+  - 不要 LLM 自动补 18 个空调用占位
+  - 如果想发 N 个, 就**精确** N 个, 全部带 agent_id + task
+  - v4.5.2 加速原则 #1: batch 4-5 specialist 一次, 不超过 max_children=20
+- **重启 gateway 前必查 zombie** (硬约束 6): `SELECT count(*) FROM sessions WHERE
+  status='running' AND updated_at < now-600s`, 若 > 0 先 SQL mark killed
+- **zombie supervisor 自动检测** (硬约束 8): gateway supervisor 每 60s 扫
+  running sessions, 连续 180s 无 activity → mark failed
+- **boot orphan cleanup** (硬约束 9): gateway 启动自动 mark 残留 running
+  sessions 为 failed, 走 `SessionManager.mark_orphan_subagents_failed`
+- **mark_orphan 不等于生效** (硬约束 10): storage 层 aiosqlite WAL 不
+  auto-commit, 必须显式 `await self.conn.commit()`, 否则 rowcount=N
+  是 log 假象, DB 实际没写. 验证: `sqlite3 sessions.db "SELECT ... WHERE
+  label LIKE '%gateway_restart_orphan%'"`
+
+
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 10 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **hack-deep-find 是一个 LLM orchestrator, 它不执行任何具体的扫描/枚举工作**。
 > **v4.5 incremental 兼容**: 如果根域名的 AssetTree 已存在, 跑 find 时
 > 必须先走 Step F-pre (incremental gate) — 复用已有 DISCOVERED 节点,
@@ -238,7 +273,84 @@
 
 ## Mission
 
-从一个根域名出发, 逐层向下探索, 发现并构建完整的资产树:
+从一个根域名出发, 逐层向下探索, 发现并构建完整的资产树
+
+---
+
+## v5 硬约束: 资产树深度上限 = 8 层 (2026-06-18)
+
+**业务硬约束**: AssetTree 路径深度上限为 **8 跳边** (节点 path_depth ∈ [0, 8],
+**8 层深度 = 8 跳边 = 9 节点层 L0..L8**), 由 ``MAX_TREE_DEPTH = 8``
+(在 ``opensquilla.asset_tree.models``) 定义, 并由
+``ck_asset_nodes_depth_max`` (DB CHECK: `path_depth <= 8`) 和
+``validate_depth`` (Python 层) 双重兜底。**任何越界写入都会被拒绝**,
+不论来自 specialist 还是编排器自身。
+
+### 8 层映射表 (L0 = ROOT_DOMAIN, 8 跳边 = 9 节点层)
+
+| Layer | 节点类型 | 触发 specialist | wave |
+|---|---|---|---|
+| L0 | `ROOT_DOMAIN` | (种子, 自动建) | W0.5 |
+| L1 | `SUB_DOMAIN` | `domain-expander` | W0.5 |
+| L2 | `IP`, `STORAGE` | `domain-expander`, `storage-discoverer` | W0.5 / W1 |
+| L3 | `PORT`, `SERVICE`, `STORAGE_OBJECT` | `port-scanner`, `service-fingerprint`, `storage-discoverer` | W1 |
+| L4 | `URL`, `COMPONENT` | `webapp-discoverer`, `component-detector` | W1 / W1.5c |
+| L5 | `ENDPOINT`, `AUTH_SURFACE`, `STATIC_ASSET`, `API_SCHEMA`, `COOKIE`, `HEADER` | `api-surface-mapper`, `content-classifier` | W1.5c / W2.5 |
+| L6 | `PARAMETER` | `api-surface-mapper` (内部闭环) | W1.5c / W2.5 |
+| L7 | (保留) | (链路空跳, PARAMETER 直接 L8) | — |
+| L8 | `INJECTION_VECTOR` | `api-surface-mapper` (Tier 2 web 派生) | W2.5 |
+
+**跨层挂载** (不增加主链 depth, 自身是叶): `SECRET` (L0..L7 白名单),
+`GENERIC` (兜底)。
+
+### 入树前自检 (每批次必跑)
+
+```
+对每个待入树节点 (asset_type, value, parent_id):
+  1. parent_id -> parent node -> parent.metadata['depth']  (L0..L7)
+  2. would_be = parent.metadata['depth'] + 1
+  3. 若 would_be > 8, 即 9, raise DepthExceededError — 整批拒绝
+  4. 入树后, 通过 ``node.set_depth(would_be)`` 注入, 供后续 specialist 读取
+```
+
+### wave → depth 边界
+
+`attack_dispatch.waves.WAVE_MAX_PATH_DEPTH` 显式定义每个 wave 的
+`max_path_depth` 上限。编排器在调 `asset_tree_find_unseen` 之前必须
+用 `wave_owns_depth(wave, target_depth)` 二次确认:
+
+| wave | max_path_depth | 说明 |
+|---|---|---|
+| W0.5 | 3 | sub_domain + ip + port 写入 |
+| W1   | 4 | service / url 写入 |
+| W1.5 | 4 | 继承 W1 |
+| W1.5c | 6 | url + endpoint + parameter 闭环 |
+| W2.5 | 7 | injection_vector 写入 (业务最深) |
+| W3.5 | 7 | secret 跨层挂载 (不增加主链) |
+| W4   | 7 | 攻击面读取, 不写 |
+
+### 违规处理
+
+- 任何 specialist evidence 试图产出 L8+ 节点 → `validate_depth` 拒入
+- `asset_tree_find_unseen` 默认 `max_depth=8`, 调用方传更小值即更窄波次
+- 编排器在 `update_state(node_id, 'discovered')` 之前必须 `depth_of(node_id) <= 7`,
+  否则该 node 应标 `ABANDONED` (理由: `would_push_past_max_depth`)
+
+### 给 hack-deep 的边界信号
+
+find-complete-v1 evidence 的 `coverage` 字段必须含:
+
+```json
+{
+  "coverage": {
+    "max_depth_reached": 7,
+    "by_depth": {"0": 1, "1": 12, "2": 18, "3": 47, "4": 21, "5": 64, "6": 132, "7": 18},
+    "depth_cap": 8
+  }
+}
+```
+
+:
 
 ```
 ROOT_DOMAIN ─┬─ (horizontal: seed-expander) ─── 多 seed (ASN / 关联域 / IP range) ───┐
@@ -1055,12 +1167,68 @@ eta=240
 """.strip()
          sessions_spawn(agent_id=spec, task=envelope)
 8.   sessions_yield()  # 1 barrier per bucket
-9.   ingest_evidence("W3.5", evidence_for_this_bucket)
-10.  asset_tree_add_nodes(...):
+9.   **🔥 INGEST 协议 (v4.5.3 强制, 2026-06-18)**:
+    编排器在 specialist sessions 跑完后, **必须**亲自把 specialist
+    返回的 evidence payload 拆解并通过 `asset_tree_add_nodes` 写入
+    AssetTree. 严禁: (a) 信任 specialist 自觉调 `asset_tree_add_nodes`
+    (specialist 工具 allow 不一定包含 `group:asset_tree`, 即使包含
+    LLM 也经常忘调), (b) 把整个 evidence JSON 作为 1 个 metadata 写
+    进某个节点 (破坏树结构, evidence 散落查不到).
+
+    **INGEST 9 步 (W3.5 specialist 完成后必走)**:
+    ```
+    a. **拉 specialist 真实输出** — 用 `sessions_history(sk, last_n=1)`
+       拿 specialist session_key 的最后 1 条 assistant 消息, 解析其
+       transcript tool_calls 末尾的 evidence JSON. (transcript 也可
+       走 sqlite 直接 SELECT, 但 LLM 走 sessions_history 更稳.)
+    b. **拆 evidence 为 (parent_id, asset_type, values[]) 多元组**:
+       - content-classifier 每个 url 产 4 路:
+         * security_headers 缺失列表 → HEADER 节点 (asset_type=header, values=[name])
+         * info_disclosure → HEADER 节点 (asset_type=header, values=[f"{k}: {v}"])
+         * cookies → COOKIE 节点 (asset_type=cookie, values=[name])
+         * auth_endpoints (real, 非 SPA false positive) → AUTH_SURFACE 节点
+         * static_assets → STATIC_ASSET 节点
+       - api-surface-mapper 每个 url 产:
+         * schemas → API_SCHEMA 节点
+         * endpoints → ENDPOINT 节点 (parent=API_SCHEMA.id)
+         * parameters → PARAMETER 节点 (parent=ENDPOINT.id)
+       - webapp-discoverer 每个 service 产 url_candidates:
+         * 新 url → URL 节点 (parent=service.id)
+         * tech_stack → HEADER 节点 (asset_type=header)
+    c. **对每个 (parent, asset_type, values) 调 1 次 add_nodes**:
+       asset_tree_add_nodes(
+         tree_id, parent_id=parent.id, asset_type=asset_type,
+         values=values, source_wave="W3.5.{spec}",
+         metadata={specialist=spec, evidence_ts=now_iso()}
+       )
+       一次只 1 个 (parent, asset_type); 多 parent 多次调.
+    d. **dedup 是 add_nodes 内置的**, 不需要 LLM 自己预判. add_nodes
+       命中已存在 (parent, asset_type, value) → 返回 deduped 不报错.
+    e. **批量 add_nodes** (F3.5 一次性最多调 N 次, 一次最多 values=200
+       个) — 不要 N×M 次循环. 4 url × 5 asset_type = 20 次 add_nodes.
+    f. **INGEST 完成硬约束**:
+       if content-classifier evidence 解析成功 but add_nodes 全部
+       deduped (没新节点) → 仍算 [W3.5 COMPLETE] (说明之前已 ingest)
+       if 解析失败 → 标 [W3.5 INGEST FAILED], 把 evidence payload
+       存到 state.failed_ingest["W3.5"] (不丢, 给 hack-deep F-final 复核)
+       if add_nodes 报错 (ToolError) → 重试 1 次; 仍错则计入
+       state.failed_ingest
+    g. **顺手调 update_state** — 把新生成的 url/api_schema/endpoint/
+       component/header/cookie/auth_surface/static_asset 节点标
+       state="discovered". 一次 update_state 一个节点, 不批量.
+    h. **证据保留**: specialist 最后一条 assistant 消息的 evidence
+       JSON 完整保留在 transcript (gateway 自动持久化), 不需要 LLM
+       复制. LLM 只负责触发 add_nodes.
+    i. **禁止**: 把 evidence 写进某个 parent 节点的 metadata 字段
+       (那会让"找 url 下的所有 header"这种查询走 metadata JSON 解析,
+       性能差且 tree 失去结构化).
+    ```
+10.  asset_tree_add_nodes(...) — 即上面 step 9 拆出的 N 次调用:
       - webapp-discoverer.urls          → URL 节点 (deep crawl)
-      - content-classifier.4_signals    → STATIC_ASSET + AUTH_SURFACE + COOKIE + HEADER 节点 (4 路 1 次 HTTP 探测)
-      - api-surface-mapper.schemas      → API_SCHEMA + ENDPOINT + PARAMETER 节点 (闭环, schema_id 在 agent 内)
-11. 输出 [WAVE W3.5 COMPLETE] buckets={N} web_services={count}
+      - content-classifier.4_signals    → STATIC_ASSET + AUTH_SURFACE + COOKIE + HEADER 节点
+      - api-surface-mapper.schemas      → API_SCHEMA + ENDPOINT + PARAMETER 节点
+11. ingest_evidence("W3.5", evidence_for_this_bucket)  # 落盘到 memory/W3.5/
+12. 输出 [WAVE W3.5 COMPLETE] buckets={N} web_services={count}
 ```
 
 **v4 F3.5 关键变化**:

@@ -95,10 +95,12 @@ pick_launcher() {
 # Print all PIDs (and PPIDs) of processes whose command line matches the
 # `opensquilla gateway run` invocation. Returns 1 if none found.
 find_gateway_pids() {
-  # pgrep -f matches the full command line; we filter to only the
-  # python process running "opensquilla gateway run" so we don't kill our
-  # own shell wrapper.
-  pgrep -f "opensquilla gateway run" 2>/dev/null || true
+  # pgrep -f matches the full command line.
+  # On macOS pgrep -f does NOT support ERE alternation, so we just match the
+  # unique module name. This works for both `python -m opensquilla.cli.main ...`
+  # AND `uv run opensquilla gateway run` (since the latter expands to
+  # `python -m opensquilla ...` inside the uv shim).
+  pgrep -f "opensquilla.cli.main" 2>/dev/null | grep -v "^$$\$" || true
 }
 
 # Print the PID currently bound to PORT (LISTEN state), if any.
@@ -177,10 +179,37 @@ else
       exit 1
     fi
   fi
-  # Also reap any uv wrapper PID that might still be lingering
-  pgrep -f "uv run opensquilla gateway" 2>/dev/null | while read -r p; do
+  # Also reap any uv wrapper PID that might still be lingering.
+  # Note: macOS pgrep -f has no ERE support, so no `|`.
+  pgrep -f "uv run opensquilla" 2>/dev/null | while read -r p; do
     kill -KILL "$p" 2>/dev/null || true
   done
+fi
+
+# --- Port-occupant fallback: if the port is still held by some non-opensquilla
+# process (e.g. a stray openclaw-gateway, a forgotten debug python, a leftover
+# node service), surface a clear error AND, when PORT_FORCE_KILL=1 is set,
+# escalate to SIGKILL on the occupant. This used to silently abort with
+# "no running process to kill" leaving the user confused. ---
+port_pid=$(port_listen_pid)
+if [ -n "$port_pid" ]; then
+  occ_cmd=$(ps -o command= -p "$port_pid" 2>/dev/null | head -c 120 || true)
+  log "port ${LISTEN_HOST}:${PORT} still held by pid=${port_pid}: ${occ_cmd}"
+  if [ "${PORT_FORCE_KILL:-0}" = "1" ]; then
+    log "PORT_FORCE_KILL=1 -> sending SIGTERM to occupant pid=${port_pid}"
+    kill -TERM "$port_pid" 2>/dev/null || true
+    if wait_for_port_free; then
+      log "port freed after SIGTERM to occupant"
+    else
+      log "SIGTERM timed out; SIGKILL occupant pid=${port_pid}"
+      kill -KILL "$port_pid" 2>/dev/null || true
+      wait_for_port_free || log "port still bound after SIGKILL (will fail at start)"
+    fi
+  else
+    log "set PORT_FORCE_KILL=1 to also kill whatever is bound to ${PORT}"
+    log "aborting: refusing to start gateway on an occupied port"
+    exit 1
+  fi
 fi
 
 if [ "$MODE" = "kill" ]; then
@@ -206,8 +235,16 @@ if [ "${KEEP_LOG:-0}" != "1" ]; then
   : > "$LOG_FILE"
 fi
 
-# Ensure OPENAI_API_KEY fallback is set (the user has been using this env)
-# so the local llamacpp provider doesn't error out.
+# Ensure provider auth envs are present so first-time boots don't 401.
+# mimo uses MINIMAX_API_KEY (per provider/registry.py). If unset, we
+# fall back to the value in ~/.opensquilla/.env so the user doesn't
+# have to remember to export it on every shell.
+if [ -z "${MINIMAX_API_KEY:-}" ] && [ -f "$HOME/.opensquilla/.env" ]; then
+  # shellcheck disable=SC1090
+  set -a; . "$HOME/.opensquilla/.env"; set +a
+fi
+# The mimo provider registry entry reads MINIMAX_API_KEY; the legacy openai
+# local-qwen path needs OPENAI_API_KEY so we keep that fallback too.
 export OPENAI_API_KEY="${OPENAI_API_KEY:-not-needed-for-llamacpp}"
 
 # nohup + disown so the gateway survives the script exiting.

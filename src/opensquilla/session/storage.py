@@ -686,6 +686,58 @@ class SessionStorage:
             await self.delete_session(session_key)
         return len(session_keys)
 
+    async def mark_orphan_subagents_failed(
+        self,
+        *,
+        orphan_grace_seconds: int = 60,
+        now_ms: int | None = None,
+    ) -> int:
+        """v4.5.3 (2026-06-18): at gateway boot, any subagent session
+        still in status='running' (i.e. NOT terminal) whose last update
+        is older than ``orphan_grace_seconds`` is a gateway-restart
+        orphan. The in-memory asyncio task that owned it is gone (we
+        just started a new gateway process), so the LLM will never
+        produce output. Mark it 'failed' with terminal_reason=
+        'gateway_restart_orphan' so the supervisor and orchestrators
+        can move on.
+
+        Without this, every gateway restart leaves N 'running' zombie
+        sessions in sessions.db; subsequent supervisors / orchestrators
+        either wait for them forever or send duplicate wakes. The
+        10jqka.com.cn incident had 19 webapp-discoverer zombie sessions
+        after one gateway restart.
+
+        Args:
+            orphan_grace_seconds: only mark sessions whose last update
+                is at least this many seconds old. Keeps very-recent
+                'running' sessions untouched (they might just be in the
+                middle of the LLM's first request).
+            now_ms: optional override for the epoch (tests).
+
+        Returns:
+            number of sessions marked failed.
+        """
+        if now_ms is None:
+            now_ms = _now_ms()
+        cutoff_ms = now_ms - (orphan_grace_seconds * 1000)
+        # sessions table has no terminal_reason column; we stash the
+        # reason in the label field (a TEXT column) and suffix the
+        # display_name so it shows up in /control/sessions UI
+        async with self.conn.execute(
+            "UPDATE sessions "
+            "SET status='failed', ended_at=?, updated_at=?, "
+            "    label=COALESCE(label,'')||':gateway_restart_orphan' "
+            "WHERE status='running' AND updated_at < ?",
+            (now_ms, now_ms, cutoff_ms),
+        ) as cur:
+            rowcount = cur.rowcount
+        # aiosqlite runs in WAL mode and does not auto-commit; without
+        # this the UPDATE is reported as "rowcount=3" but never
+        # persisted to sessions.db (the gateway then keeps spawning
+        # duplicate supervisors for the same zombie sessions).
+        await self.conn.commit()
+        return int(rowcount or 0)
+
     async def count_sessions(self) -> int:
         async with self.conn.execute("SELECT COUNT(*) FROM sessions") as cur:
             row = await cur.fetchone()

@@ -14,6 +14,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 portscan / dns / api 工具组**。可用工具组:
 - `group:recon:http` (recon_http_probe, recon_directory_bruteforce,
@@ -154,3 +164,56 @@ static-asset + auth-mapper + cookie-header),v4 改成:
 F6a 阶段编排器并行 spawn api-surface-mapper + content-classifier,
 F6b 阶段已合并入 F6a (不再独立), **wave barrier 数量从 2 减到 1**,
 但 F6 barrier 内 specialist 数从 4 减到 2, 整体 wave count 减少 1。
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree` (含
+`asset_tree_add_nodes`, `asset_tree_get_subtree` 等). 你**没有** `group:fs`
+— 不能 read_file 读 tree.json. 树查询走 `asset_tree_get_subtree`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 对 envelope 给的每个 url 跑 4 路 1 次 HTTP 探测:
+   a. recon_http_probe → 拿 headers, cookies
+   b. recon_sensitive_fingerprint / recon_directory_bruteforce → 静态资源
+   c. recon_security_header_audit + recon_info_disclosure_header_scan
+   d. recon_cookie_security_parse + recon_cookie_jar_collect
+   e. recon_auth_endpoint_discover + recon_auth_form_parse (real auth, 排除 SPA false positive)
+2. 对每个 url 把 evidence 转成 5 类 add_nodes 调用:
+   a. security_headers 缺失 → asset_tree_add_nodes(
+        tree_id, parent_id=url.node_id, asset_type="header",
+        values=[f"missing: {header_name}"],
+        source_wave="W3.5.content-classifier",
+        metadata={risk: "info", kind: "header_missing"})
+   b. info_disclosure → asset_tree_add_nodes(
+        tree_id, parent_id=url.node_id, asset_type="header",
+        values=[f"{h.header}: {h.value}"],
+        source_wave="W3.5.content-classifier",
+        metadata={disclosure_kind, risk})
+   c. cookies → asset_tree_add_nodes(
+        tree_id, parent_id=url.node_id, asset_type="cookie",
+        values=[cookie_name],
+        source_wave="W3.5.content-classifier",
+        metadata={value_prefix, secure, httponly, samesite, max_age})
+   d. auth_endpoints (real, 排除 SPA false positive) → asset_tree_add_nodes(
+        tree_id, parent_id=url.node_id, asset_type="auth_surface",
+        values=[endpoint_url],
+        source_wave="W3.5.content-classifier",
+        metadata={auth_kind: "login|oauth|jwt|default_creds", method})
+   e. static_assets → asset_tree_add_nodes(
+        tree_id, parent_id=url.node_id, asset_type="static_asset",
+        values=[asset_url],
+        source_wave="W3.5.content-classifier",
+        metadata={kind: "env|backup|git|config", size_bytes, status_code})
+3. 调 asset_tree_update_state 给新加的 url 节点 (如果没标 discovered)
+4. 最后输出 evidence schema: content-classification-v1
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn`
+- 不要 read_file 任何文件
+- 不要把 evidence 整段塞 metadata
+

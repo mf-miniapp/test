@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from opensquilla.asset_tree.models import AssetState, AssetType
+from opensquilla.asset_tree.models import AssetState, AssetType, MAX_TREE_DEPTH
 from opensquilla.asset_tree.tree import AssetTree
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import ToolError
@@ -137,6 +137,111 @@ def _load_tree(tree_id: str) -> AssetTree:
     return tree
 
 
+def _find_existing_tree_for_root(
+    root_domain: str, requested_tree_id: str
+) -> tuple[str | None, str | None]:
+    """Locate an existing AssetTree on disk that already covers
+    ``root_domain`` so ``asset_tree_create`` can reconcile instead of
+    spawning a duplicate.
+
+    Returns ``(tree_id, json_payload)`` for the best match, or
+    ``(None, None)`` if no candidate exists. Match rules, in order:
+
+    1. Exact match: ``requested_tree_id`` file exists and its
+       ``root_id`` points to a node whose ``value`` matches
+       ``root_domain`` (case-insensitive). This is the happy path for
+       idempotent re-runs of the same F0 / F1 wave.
+    2. Same-root scan: any ``*.json`` under the asset_trees dir whose
+       root node's ``value`` matches ``root_domain``. This catches the
+       legacy ``tree-<sanitized>--<ts>`` files that a previous run
+       might have left behind — the bug we are fixing.
+
+    The function deliberately returns the JSON payload as-is so the
+    caller (``asset_tree_create``) can stream it straight back to the
+    LLM without re-serializing.
+    """
+    if not root_domain:
+        return None, None
+    target = root_domain.strip().lower()
+
+    # Rule 1 + Rule 2 are folded into a single scan: we always look at
+    # every candidate and keep the *largest* by node count. Rule 1 (the
+    # exact tree_id the caller asked for) gets a small head-start so a
+    # happy-path idempotent re-run still prefers it — but if a sibling
+    # file with the same root has more nodes we still upgrade to it.
+    # This prevents a fresh small duplicate (e.g. a 55-node tree that
+    # an earlier F0 just spawned) from being reused forever.
+    requested_payload: str | None = None
+    requested_nodes: int = 0
+    if _tree_path(requested_tree_id).exists():
+        try:
+            d = json.loads(_tree_path(requested_tree_id).read_text(encoding="utf-8"))
+            root_id = d.get("root_id")
+            nodes = d.get("nodes", {})
+            root = nodes.get(root_id or "", {}) if root_id else {}
+            if (root.get("value") or "").strip().lower() == target and nodes:
+                requested_payload = _tree_path(requested_tree_id).read_text(encoding="utf-8")
+                requested_nodes = len(nodes)
+        except Exception:
+            pass
+    # Now scan all candidates and pick the one with the most nodes.
+    # Prefer the tree with the most nodes — that is the one with the
+    # most prior work, even if a fresh duplicate was just created by
+    # a parallel F0 wave. mtime alone is unreliable: a brand-new
+    # 55-node duplicate is *newer* than a 640-node old tree, but the
+    # 640-node tree is what we want to reuse.
+    best_id: str | None = None
+    best_payload: str | None = None
+    best_nodes: int = 0
+    try:
+        for path in _default_state_root().glob("*.json"):
+            if path.name.startswith(".") or path.name.endswith(".tmp"):
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            root_id = data.get("root_id")
+            nodes = data.get("nodes", {})
+            root = nodes.get(root_id or "", {}) if root_id else {}
+            value = (root.get("value") or "").strip().lower()
+            if value != target:
+                continue
+            # Skip the empty / sentinel trees (1 node, no edges).
+            if len(nodes) <= 1 and not data.get("edges"):
+                continue
+            n = len(nodes)
+            if n > best_nodes:
+                best_id = path.stem
+                best_payload = path.read_text(encoding="utf-8")
+                best_nodes = n
+    except Exception:
+        pass
+    if best_id is not None and best_nodes > requested_nodes:
+        return best_id, best_payload
+    if requested_payload is not None:
+        return requested_tree_id, requested_payload
+    return None, None
+
+
+def _snapshot_dir() -> Path:
+    """Directory where ``asset_tree_complete`` writes time-stamped snapshots.
+
+    v4.6 (2026-06-18) hardening: snapshots are an audit artifact for
+    ``recon_diff_snapshots`` and the web UI's diff button, NOT a
+    separate tree. They must live in a subdirectory so that
+    ``_default_state_root().glob("*.json")`` (used by
+    ``_find_existing_tree_for_root`` to reconcile per root_domain) does
+    not pick them up as candidate canonical trees. The sidebar used
+    to list every snapshot as its own tree, which both confused the
+    operator and made reconcile pick a snapshot over the real
+    canonical when the snapshot happened to have more nodes.
+    """
+    d = _default_state_root() / ".snapshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _validate_asset_type(asset_type_str: str) -> AssetType:
     try:
         return AssetType(asset_type_str)
@@ -227,13 +332,56 @@ async def asset_tree_create(
     if not root_domain or not root_domain.strip():
         raise ToolError("root_domain must be non-empty")
 
-    if tree_id is None:
-        sanitized = "".join(c if c.isalnum() or c in "-_." else "-" for c in root_domain)
-        tree_id = f"tree-{sanitized}" if sanitized else "tree-root"
+    # v4.6 (2026-06-18) canonical tree_id contract:
+    # The single canonical tree_id for ``root_domain=X`` is
+    # ``tree-{X}`` with dots preserved (e.g. ``tree-10jqka.com.cn``).
+    # Reject any caller-supplied tree_id that does not match the
+    # canonical form — the LLM orchestrator used to invent names
+    # like ``10jqka.com.cn.zombie`` or
+    # ``tree-51ifind.com-fresh-20260617T1346`` which created phantom
+    # trees that the asset-tree sidebar listed alongside the real
+    # canonical tree. Snapshots and reconciliation are handled
+    # separately by ``asset_tree_complete`` (writes JSON only, no
+    # DB row) and ``_find_existing_tree_for_root`` (picks the
+    # largest tree for the root_domain), so callers never need to
+    # invent a tree_id.
+    def _canonical_tree_id(domain: str) -> str:
+        # Keep alnum + dot + dash only; collapse anything else to ``-``
+        # and strip leading/trailing dashes. Dots are preserved (the
+        # ``root_domain`` already includes the TLD).
+        sanitized = "".join(c if c.isalnum() or c in "-." else "-" for c in domain.strip())
+        sanitized = sanitized.strip("-")
+        return f"tree-{sanitized}" if sanitized else "tree-root"
 
-    path = _tree_path(tree_id)
-    if path.exists():
-        raise ToolError(f"Tree already exists: {tree_id} (at {path})")
+    canonical = _canonical_tree_id(root_domain)
+    if tree_id is not None and tree_id != canonical:
+        raise ToolError(
+            f"tree_id must equal the canonical id {canonical!r} for "
+            f"root_domain={root_domain!r} (got {tree_id!r}). "
+            "Pass tree_id=None to use the canonical id, or use "
+            "asset_tree_complete to take a historical snapshot."
+        )
+    tree_id = canonical
+
+    # Reuse-reconcile: if a tree with this exact tree_id already exists,
+    # return it (idempotent). If a *different* tree has the same
+    # root_domain, prefer it — this prevents the F0 specialist from
+    # accidentally creating a fresh tree when an old one (named via the
+    # legacy ``tree-<sanitized>--<ts>`` convention) is still on disk.
+    # The orchestrator can still force a fresh tree by passing an
+    # explicit, never-before-used tree_id.
+    existing_id, existing_payload = _find_existing_tree_for_root(root_domain.strip(), tree_id)
+    if existing_payload is not None:
+        # Reuse the existing tree — return its tree_id + root_id, do not
+        # create a new one. This is idempotent: callers can safely call
+        # asset_tree_create at the start of every F0 / F1 wave without
+        # worrying about whether a prior run already bootstrapped the
+        # tree.
+        return existing_payload
+    if _tree_path(tree_id).exists():
+        # tree_id is new but a file with this name already exists —
+        # surface as a real error to avoid silent overwrites.
+        raise ToolError(f"Tree already exists: {tree_id} (at {_tree_path(tree_id)})")
 
     # Build in-memory tree, then mirror to both stores. Bind the
     # backend up-front so the in-memory tree's auto-persist hook is
@@ -499,9 +647,11 @@ async def asset_tree_add_nodes(
         "List nodes in state UNSEEN — these are the targets for the next "
         "wave. Optionally filter by asset_type to drive a single wave at "
         "a time (e.g. only ROOT_DOMAIN nodes for the subdomain-enumeration "
-        "wave, only IP nodes for the port-scan wave). Returns node ids plus "
-        "type and value so the LLM can build HANDOFF envelopes without a "
-        "follow-up read."
+        "wave, only IP nodes for the port-scan wave). v5 (2026-06-18) adds "
+        "a max_depth filter to keep the orchestrator from issuing waves "
+        "against nodes that would push the tree past MAX_TREE_DEPTH=8. "
+        "Returns node ids plus type and value so the LLM can build HANDOFF "
+        "envelopes without a follow-up read."
     ),
     params={
         "tree_id": {"type": "string", "description": "Tree id from asset_tree_create."},
@@ -512,31 +662,68 @@ async def asset_tree_add_nodes(
                 "nodes (caller must group them by type to drive waves)."
             ),
         },
+        "max_depth": {
+            "type": "integer",
+            "description": (
+                "v5 (2026-06-18): only return UNSEEN nodes with "
+                "``path_depth <= max_depth``. Default ``MAX_TREE_DEPTH`` (= 8). "
+                "Set lower to constrain the wave scope to upper layers "
+                "(e.g. ``max_depth=2`` returns only root + sub + ip)."
+            ),
+            "default": MAX_TREE_DEPTH,
+        },
     },
     required=["tree_id"],
 )
 async def asset_tree_find_unseen(
     tree_id: str,
     asset_type: str | None = None,
+    max_depth: int = MAX_TREE_DEPTH,
 ) -> str:
-    """List UNSEEN nodes, optionally filtered by type."""
+    """List UNSEEN nodes, optionally filtered by type and depth."""
     tree = _load_tree(tree_id)
     type_filter: AssetType | None = None
     if asset_type is not None:
         type_filter = _validate_asset_type(asset_type)
+    if max_depth < 0:
+        raise ToolError(
+            f"max_depth must be >= 0, got {max_depth}; "
+            f"MAX_TREE_DEPTH={MAX_TREE_DEPTH}"
+        )
+    if max_depth > MAX_TREE_DEPTH:
+        # 业务硬约束 8 层; 超过该值的入树请求被 validate_depth 拒绝, 
+        # find_unseen 返回更深层无意义, 直接截断到 MAX_TREE_DEPTH。
+        max_depth = MAX_TREE_DEPTH
 
+    # v5 (2026-06-18): 读取 ``n.depth`` (AssetNode 上的 property, 由
+    # ``AssetTree._add_node_locked`` 写入时 set_depth() 设置)。
     unseen = [
-        {"node_id": n.id, "asset_type": n.asset_type.value, "value": n.value}
+        {
+            "node_id": n.id,
+            "asset_type": n.asset_type.value,
+            "value": n.value,
+            "depth": n.depth,
+        }
         for n in tree.nodes_by_state(AssetState.UNSEEN)
-        if type_filter is None or n.asset_type == type_filter
+        if (type_filter is None or n.asset_type == type_filter)
+        and n.depth <= max_depth
     ]
 
     by_type: dict[str, int] = {}
+    by_depth: dict[str, int] = {}
     for entry in unseen:
         by_type[entry["asset_type"]] = by_type.get(entry["asset_type"], 0) + 1
+        d = entry["depth"]
+        by_depth[str(d)] = by_depth.get(str(d), 0) + 1
 
     return json.dumps(
-        {"unseen": unseen, "count": len(unseen), "by_type": by_type},
+        {
+            "unseen": unseen,
+            "count": len(unseen),
+            "by_type": by_type,
+            "by_depth": by_depth,
+            "max_depth_applied": max_depth,
+        },
         ensure_ascii=False,
     )
 
@@ -604,8 +791,12 @@ async def asset_tree_update_state(tree_id: str, node_id: str, state: str) -> str
         },
         "max_depth": {
             "type": "integer",
-            "description": "Max depth to render. Default: 3.",
-            "default": 3,
+            "description": (
+                "Max depth to render. v5 (2026-06-18) default 8 (= "
+                "MAX_TREE_DEPTH) so a subtree render covers the full "
+                "business-deepest chain (root → ... → injection_vector)."
+            ),
+            "default": MAX_TREE_DEPTH,
         },
     },
     required=["tree_id"],
@@ -613,7 +804,7 @@ async def asset_tree_update_state(tree_id: str, node_id: str, state: str) -> str
 async def asset_tree_get_subtree(
     tree_id: str,
     node_id: str | None = None,
-    max_depth: int = 3,
+    max_depth: int = MAX_TREE_DEPTH,
 ) -> str:
     """Render a subtree as text."""
     tree = _load_tree(tree_id)
@@ -732,7 +923,13 @@ async def asset_tree_stats(tree_id: str) -> str:
         "structural change), returns the absolute path to the persisted "
         "tree JSON. Phase 3 will pass this path to `sessions_spawn` as "
         "an artifact for the handoff to hack-deep. Always call this "
-        "before reporting [DEEP FIND COMPLETE]."
+        "before reporting [DEEP FIND COMPLETE].\n\n"
+        "v4.6 (2026-06-18): a time-stamped snapshot copy is written to "
+        "``~/.opensquilla/state/asset_trees/.snapshots/<tree_id>--<ts>.json`` "
+        "(separate from the live canonical tree) so the web UI's "
+        "diff-vs-last button and ``recon_diff_snapshots`` keep working. "
+        "Snapshots are NOT inserted into the MySQL ``asset_trees`` table "
+        "and must not be confused with new trees."
     ),
     params={
         "tree_id": {"type": "string", "description": "Tree id."},
@@ -758,7 +955,10 @@ async def asset_tree_complete(tree_id: str) -> str:
     # stable historical baseline. Without this, the snapshot_id
     # in the response is just metadata — only ``<tree_id>.json``
     # exists on disk, so there's nothing to diff against later.
-    snapshot_path = _default_state_root() / f"{snapshot_id}.json"
+    # v4.6 (2026-06-18) snapshots go under ``.snapshots/`` so the
+    # reconcile glob in ``_default_state_root().glob("*.json")`` does
+    # not mistake them for live trees. See ``_snapshot_dir`` docstring.
+    snapshot_path = _snapshot_dir() / f"{snapshot_id}.json"
     try:
         snapshot_path.write_text(tree.to_json(), encoding="utf-8")
     except Exception as exc:  # pragma: no cover — best-effort

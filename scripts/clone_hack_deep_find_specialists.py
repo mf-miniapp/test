@@ -252,6 +252,19 @@ SPECIALISTS: tuple[dict[str, object], ...] = (
 )
 
 
+
+
+# LLM endpoint for hack-deep-find specialists (pinned to c1 = mimo-v2.5-pro).
+# Inline so the entry is self-contained and does not depend on router config
+# resolution at spawn time. Keep in sync with [squilla_router.tiers.c1].
+SPECIALIST_PROVIDER = "mimo"
+SPECIALIST_MODEL = "mimo-v2.5-pro"
+SPECIALIST_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
+SPECIALIST_API_KEY = "tp-c86kd17l884glv6p39pndllwpqxa5mfcli8jyzrs308kzjkj"
+SPECIALIST_TIER = "c1"
+SPECIALIST_ALLOWED_TIERS = ["c1", "c2"]
+
+
 def _write_soul(dst_dir: Path, soul_body: str) -> None:
     (dst_dir / "SOUL.md").write_text(soul_body, encoding="utf-8")
 
@@ -360,10 +373,12 @@ async def _register_specialist(spec: dict[str, object]) -> None:
             name=name,
             description=description,
             workspace=str(dst_dir),
-            provider="mimo",
-            model="mimo-v2.5-pro",
-            tier="c1",
-            allowed_tiers=["c1", "c2"],
+            provider=SPECIALIST_PROVIDER,
+            model=SPECIALIST_MODEL,
+            base_url=SPECIALIST_BASE_URL,
+            api_key=SPECIALIST_API_KEY,
+            tier=SPECIALIST_TIER,
+            allowed_tiers=list(SPECIALIST_ALLOWED_TIERS),
             max_history_turns=8,
             enabled=True,
             system_prompt=soul_body,
@@ -377,12 +392,19 @@ async def _register_specialist(spec: dict[str, object]) -> None:
             name=name,
             description=description,
             workspace=str(dst_dir),
+            provider=SPECIALIST_PROVIDER,
+            model=SPECIALIST_MODEL,
+            base_url=SPECIALIST_BASE_URL,
+            api_key=SPECIALIST_API_KEY,
+            tier=SPECIALIST_TIER,
+            allowed_tiers=list(SPECIALIST_ALLOWED_TIERS),
+            max_history_turns=8,
             enabled=True,
             system_prompt=soul_body,
             subagents=subagents,
             tools={"allow": list(tools_allow), "deny": deny_list},
         )
-        print(f"  + registered {summary['id']} (tools.allow={tools_allow})")
+        print(f"  + registered {summary['id']} (model=mimo-v2.5-pro tier=c1)")
 
     result = persist_config(cfg, path=str(config_path), restart_required=True)
     print(f"  + persisted to {result.path}")

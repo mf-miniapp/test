@@ -153,8 +153,10 @@ asset_nodes = Table(
     # material_path: slash-separated id chain. e.g. root/abc/def.
     # 512 chars handles depth-50 trees with 10-char ids (50*11 = 550, padded).
     Column("material_path", String(512), nullable=False),
-    # 0 = root, 1 = sub_domain, ..., 5 = endpoint. Use TINYINT UNSIGNED on
-    # MySQL TINYINT UNSIGNED for 1-byte storage of path_depth / child_order.
+    # path_depth: 0 = root, 1 = sub_domain, ..., 7 = injection_vector (L7).
+    # v5 (2026-06-18) 业务硬上限 MAX_TREE_DEPTH=8; 入库时由 validate_depth
+    # 拦截越界写入, 并由 ck_asset_nodes_depth_max CHECK 约束做 DB 层兜底。
+    # SMALLINT UNSIGNED 最多 65535, 远超 8 层需要。
     Column("path_depth", SmallInteger, nullable=False, server_default="0"),
     Column("source_wave", String(128), nullable=True),
     Column("assigned_wave", String(128), nullable=True),
@@ -398,6 +400,7 @@ DDL_STATEMENTS: tuple[str, ...] = (
             ('root_domain','sub_domain','ip','port','service','url','endpoint','parameter',
              'injection_vector','auth_surface','static_asset','api_schema','component','cookie','header',
              'storage','storage_object','secret','generic')),
+        CONSTRAINT ck_asset_nodes_depth_max CHECK (path_depth <= 8),
         INDEX ix_asset_nodes_tree_type (tree_id, asset_type),
         INDEX ix_asset_nodes_tree_state (tree_id, state),
         INDEX ix_asset_nodes_tree_parent (tree_id, parent_id),

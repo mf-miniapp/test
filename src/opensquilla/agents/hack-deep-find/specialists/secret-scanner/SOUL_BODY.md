@@ -8,6 +8,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 dns / portscan 工具组**。可用 secret 工具组 + http 工具组。
 
@@ -156,3 +166,38 @@ SECRET 节点 metadata:
     - `evidence` (截断 80 字符)
 - **双 scan 不重复**: recon_secret_scan_text 已经覆盖大部分模式, 其它工具是补强
 - **不与 static-asset 的 recon_secret_extract 重复**: static-asset 命中 secret 时只建 STATIC_ASSET 节点, secret-scanner 显式建 SECRET 节点 (更结构化)
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree`. 你**没有**
+`group:fs` — 不能 read_file 读 tree.json. 树查询走 `asset_tree_get_subtree`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 对 envelope 给的每个 url 跑密钥扫描:
+   a. recon_secret_scan_text (HTML body)
+   b. recon_secret_scan_js_bundle (前端 JS bundle)
+   c. recon_secret_scan_env_dump (如果有 .env 端点)
+   d. recon_secret_classify (按 kind 分类)
+   e. recon_secret_validate_aws_key (确认真假)
+2. 把 evidence 转成 1 类 add_nodes 调用 (secret 节点):
+   asset_tree_add_nodes(
+     tree_id, parent_id=url.node_id, asset_type="secret",
+     values=[f"{secret_kind}:{fingerprint}"],  # 例 "aws_key_id:AKIA..."
+     source_wave="W3.5.secret-scanner",
+     metadata={kind: "aws_key|github_token|api_key|private_key|jwt",
+               confidence, validation_status, source_file,
+               v4_5_note: "blast_radius field removed"})
+3. 调 asset_tree_update_state 给新 secret 节点标 discovered
+4. 最后输出 evidence schema: secret-v1
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn`
+- 不要 read_file 任何文件
+- 不要把 evidence 整段塞 metadata
+- 不要输出 blast_radius 字段 (v4.5 已废弃, 那是攻击侧视角)
+

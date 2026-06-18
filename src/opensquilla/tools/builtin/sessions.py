@@ -376,8 +376,30 @@ async def sessions_spawn(
     v3.3 fix for the W4 / W8 specialist's "TUI dialog appears
     during exploit / cleanup" interrupt issue.
     """
-    if not task:
-        raise ToolError("Task must not be empty")
+    # v4.5.3 (2026-06-18) bug fix: previously this raised ToolError
+    # when task was empty. OpenAI / Anthropic tool_calls is atomic —
+    # a single ToolError from one tool kills ALL sibling tool calls in
+    # the same message. That meant an LLM noise spawn with empty task
+    # would silently abort 20 healthy spawn calls in the same batch
+    # (10jqka.com.cn incident: 20 webapp-discoverer + 2 component-
+    # detector + 4 secret-scanner planned, but the LLM interleaved
+    # 18 empty spawn noise calls; the first empty one raised and
+    # killed the whole batch, so component-detector + secret-scanner
+    # never fired). Now we return a JSON error string so the LLM sees
+    # the failure but sibling tools continue. The error response tells
+    # the model "skip me, keep going".
+    if not task or not task.strip():
+        return json.dumps({
+            "ok": False,
+            "error": "empty_task",
+            "message": "Task must not be empty. Drop this tool call and continue with the next one in the batch.",
+        }, ensure_ascii=False)
+    if not agent_id or not (agent_id or "").strip():
+        return json.dumps({
+            "ok": False,
+            "error": "empty_agent_id",
+            "message": "agent_id must be non-empty. Drop this tool call and continue with the next one in the batch.",
+        }, ensure_ascii=False)
 
     # 2026-06-08 (Issue 1): resolve the effective ``auto_approve``
     # value once, BEFORE any expensive work. We parse the typed

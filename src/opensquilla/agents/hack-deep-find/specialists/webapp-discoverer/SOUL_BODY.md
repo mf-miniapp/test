@@ -8,6 +8,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 dns / portscan 工具组**。可用 webapp 工具组 + 部分 http 工具。
 
@@ -142,3 +152,38 @@ path  模式: "{scheme}://{host}:{port}{base_path}"     e.g. "http://1.2.3.4:808
 - **path 模式与现有 endpoint-crawler 的边界**: 命中 `/admin` 这种"明显应用前缀"才建 URL 节点, 命中 `/favicon.ico` 这种普通路径不建
 - **vhost 模式只对 web 端口 (80/443/8080/8443) 触发**, 其它端口直接跳过
 - **port 模式与 port-scanner 的关系**: 发现的端口如果不在父 SERVICE 节点的 port 集合里, evidence 里标 `extra_port_discovered: true`, 编排器 LLM 据此决定是否调 port-scanner 补全
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree` (含
+`asset_tree_add_nodes`, `asset_tree_get_subtree`, `asset_tree_stats`,
+`asset_tree_list_siblings` 等). 你**没有** `group:fs` — 不能 read_file
+读 tree.json. 树查询走 `asset_tree_get_subtree` / `asset_tree_list_siblings`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 对 envelope 给的每个 service 跑 web app 边界识别 (vhost/port/path)
+2. 对每个新发现的 URL 候选, 调:
+   asset_tree_add_nodes(
+     tree_id={tree_id},
+     parent_id={service.node_id},
+     asset_type="url",
+     values=[<candidate_url_value>],
+     source_wave="W3.5.webapp-discoverer",
+     metadata={scheme, host, port, base_path, vhost, app_type,
+               tech_stack, tls, sni_required, auth_context,
+               discovery_mode, siblings_count},
+   )
+3. tech_stack 列表 (Server / X-Powered-By) 作为 HEADER 节点
+   (asset_type=header, values=[f"{name}: {value}"]), parent=新 URL.id
+4. 最后输出 evidence schema: webapp-v1 (envelope 任务段写明)
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn` (你已经被 `subagents.allow_agents=[]` 禁了)
+- 不要 read_file / write_file 任何文件 (你拿不到 group:fs)
+- 不要把 evidence JSON 整段当某个节点的 metadata 写 (破坏树结构)
+

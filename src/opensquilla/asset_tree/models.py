@@ -220,6 +220,24 @@ class AssetNode(BaseModel):
         """是否为叶节点（无子节点）。"""
         return len(self.children_ids) == 0
 
+    # v5 (2026-06-18): 节点到根的距离 (0 = 根)。这是一个 property,
+    # **不**作为 Pydantic 字段存储 — 调用方拿不到父链时返回 -1。
+    # 真正的权威存于 db schema 的 ``path_depth`` 列, 该列在
+    # ``_add_node_locked`` 写入时设置; in-memory 节点通过
+    # ``compute_depth_from_chain`` 在树组装时回填。
+    @property
+    def depth(self) -> int:
+        """自身 depth (L0 = 根)。无法解析 (脱离树) 时返回 -1。"""
+        if self.parent_id is None:
+            return 0
+        # 默认无外部上下文时, 返回 -1; 调用方 (AssetTree.add_node
+        # 完成后会显式 set_depth) 负责注入。
+        return getattr(self, "_depth", -1)
+
+    def set_depth(self, depth: int) -> None:
+        """由 ``AssetTree._add_node_locked`` 调用, 写入 in-memory 深度。"""
+        self._depth = int(depth)
+
     def to_ref(self) -> "AssetNodeRef":
         """转为轻量引用。"""
         return AssetNodeRef(
@@ -265,7 +283,103 @@ class AssetPath(BaseModel):
         return len(self.parts)
 
 
-# ── 父子关系校验 ──────────────────────────────────────
+# ── 深度约束 ─────────────────────────────────────────────
+#
+# 业务硬约束 (v5, 2026-06-18): AssetTree 的合法路径深度上限为 8 层
+# (从 ROOT_DOMAIN 算起, 包含 L0 根节点)。这条约束由 ``_VALID_PARENT_CHILD``
+# 的最长链 ``ROOT → SUB → IP → PORT → SERVICE → URL → ENDPOINT →
+# PARAMETER → INJECTION_VECTOR`` 推导得出, 是"业务模型"与"编排器波次系统"
+# 共用的硬约束。
+#
+# 深度编号约定 (与 AssetPath.depth() 一致):
+#   L0  ROOT_DOMAIN
+#   L1  SUB_DOMAIN
+#   L2  IP / STORAGE
+#   L3  PORT / SERVICE / STORAGE_OBJECT
+#   L4  URL / COMPONENT
+#   L5  ENDPOINT / AUTH_SURFACE / STATIC_ASSET / API_SCHEMA / COOKIE / HEADER
+#   L6  PARAMETER
+#   L7  INJECTION_VECTOR   (常规最深叶节点)
+#
+# 跨层挂载 ``SECRET`` / 兜底 ``GENERIC`` 不计入主链深度 (它们允许挂在
+# 8 类父节点白名单下, 自身是叶节点)。
+#
+# ``MAX_TREE_DEPTH = 8`` 是 v5 新增常量, 含义 = **路径深度上限**
+# (节点 path_depth ∈ [0, 8])。8 层深度 = 8 跳边 = 9 节点层:
+# ROOT(L0) → SUB(L1) → IP(L2) → PORT(L3) → SERVICE(L4) → URL(L5) →
+# ENDPOINT(L6) → PARAMETER(L7) → INJECTION_VECTOR(L8)。任何 ``add_node``
+# 触发 ``validate_depth()`` 失败都会 raise ``DepthExceededError``。
+MAX_TREE_DEPTH: int = 8
+
+
+class DepthExceededError(ValueError):
+    """调用方尝试添加会超过 ``MAX_TREE_DEPTH`` 路径深度的节点。
+
+    典型触发场景: 试图在 INJECTION_VECTOR (L8) 下再挂子节点 (新节点
+    path_depth=9, 越界), 或者试图在 ``SECRET`` 下再挂子节点 (虽然
+    ``_VALID_PARENT_CHILD`` 也不允许 SECRET 有子节点, 但深度校验是
+    防御性纵深)。
+    """
+
+    def __init__(
+        self,
+        *,
+        would_be_depth: int,
+        parent_depth: int | None,
+        parent_type: AssetType | None,
+        child_type: AssetType,
+        max_depth: int = MAX_TREE_DEPTH,
+    ) -> None:
+        self.would_be_depth = would_be_depth
+        self.parent_depth = parent_depth
+        self.parent_type = parent_type
+        self.child_type = child_type
+        self.max_depth = max_depth
+        super().__init__(
+            f"Depth would be {would_be_depth} (> {max_depth}, hard cap); "
+            f"refused to add {child_type.value} under "
+            f"{parent_type.value if parent_type else '<None>'} "
+            f"(parent_depth={parent_depth}). "
+            f"Allowed deepest chain ends at INJECTION_VECTOR (L8, depth=8). "
+            f"SECRET and GENERIC are cross-layer / catch-all and may "
+            f"hang off whitelisted parents regardless of depth, but "
+            f"are leaves themselves (no further descendants)."
+        )
+
+
+def validate_depth(
+    *,
+    parent_depth: int | None,
+    parent_type: AssetType | None,
+    child_type: AssetType,
+) -> int:
+    """校验父→子边的深度不会越界, 返回新节点的深度 (parent_depth + 1)。
+
+    规则:
+      * 根节点 (parent_depth is None) 总是深度 0, 无需校验。
+      * 业务类型: 必须满足 ``parent_depth + 1 <= MAX_TREE_DEPTH`` (即新节点 depth <= 8)。
+      * ``SECRET`` / ``GENERIC`` 也走同一深度规则 (它们自身是叶,
+        因此不可能成为 "parent" — 但 ``validate_depth`` 仍然作为
+        防御性纵深)。
+    Raises:
+        DepthExceededError: 越界时。
+    """
+    if parent_depth is None:
+        return 0
+    would_be = parent_depth + 1
+    # 业务最深的合法节点是 L8 (INJECTION_VECTOR, path_depth=8)。
+    # 越界 (would_be > MAX_TREE_DEPTH=8, 即 9) 拒。
+    if would_be > MAX_TREE_DEPTH:
+        raise DepthExceededError(
+            would_be_depth=would_be,
+            parent_depth=parent_depth,
+            parent_type=parent_type,
+            child_type=child_type,
+        )
+    return would_be
+
+
+# ── 父子关系校验 ─────────────────────────────────────────────
 
 
 def validate_parent_child(parent_type: AssetType, child_type: AssetType) -> None:

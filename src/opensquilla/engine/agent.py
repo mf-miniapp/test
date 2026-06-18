@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import hashlib
 import json
 import time
@@ -1912,6 +1913,8 @@ class Agent:
                 self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
             ),
             provider_request_max_chars=self._provider_request_proof_max_chars(),
+            local_max_tools=int(os.environ.get("OPENSQUILLA_LLM_LOCAL_MAX_TOOLS", "0") or 0),
+            local_max_system_chars=int(os.environ.get("OPENSQUILLA_LLM_LOCAL_MAX_SYSTEM_CHARS", "0") or 0),
             tool_choice=None,
         )
         _thinking_fallback_done = False
@@ -3261,6 +3264,8 @@ class Agent:
                             else None
                         ),
                         provider_request_max_chars=(self._provider_request_proof_max_chars()),
+                        local_max_tools=int(os.environ.get("OPENSQUILLA_LLM_LOCAL_MAX_TOOLS", "0") or 0),
+            local_max_system_chars=int(os.environ.get("OPENSQUILLA_LLM_LOCAL_MAX_SYSTEM_CHARS", "0") or 0),
                         tool_choice=chat_cfg.tool_choice,
                     )
 

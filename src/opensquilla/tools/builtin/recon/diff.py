@@ -40,11 +40,22 @@ def _state_root() -> Path:
 
 
 def _list_snapshot_files(root_domain_substr: str | None = None) -> list[Path]:
-    """Return all *.json files in the asset_trees dir, optionally filtered."""
+    """Return all *.json files in the asset_trees dir, optionally filtered.
+
+    v4.6 (2026-06-18): include snapshots under ``.snapshots/`` (the
+    subdirectory written by ``asset_tree_complete`` since v4.6). The
+    canonical tree file ``<tree_id>.json`` is the live tree; the
+    time-stamped copies under ``.snapshots/<tree_id>--<iso_ts>.json``
+    are read-only history used by ``recon_diff_snapshots`` and the
+    web UI's diff-vs-last button.
+    """
     root = _state_root()
     if not root.exists():
         return []
     files = sorted(root.glob("*.json"))
+    snap_dir = root / ".snapshots"
+    if snap_dir.exists():
+        files.extend(sorted(snap_dir.glob("*.json")))
     if root_domain_substr:
         files = [f for f in files if root_domain_substr in f.name]
     return files

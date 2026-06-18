@@ -211,9 +211,21 @@ class AssetTreeBackend(ABC):
 
     @abstractmethod
     async def find_unseen(
-        self, tree_id: str, asset_type: str | None = None
+        self,
+        tree_id: str,
+        asset_type: str | None = None,
+        *,
+        max_depth: int | None = None,
     ) -> list[NodeRow]:
-        """List UNSEEN nodes (optionally filtered by asset_type)."""
+        """List UNSEEN nodes (optionally filtered by asset_type / depth).
+
+        v5 (2026-06-18): ``max_depth`` filters by ``path_depth`` column.
+        Default ``None`` = no depth filter (return all UNSEEN). When set,
+        only nodes with ``path_depth <= max_depth`` are returned. Use
+        ``max_depth=MAX_TREE_DEPTH`` (= 8) to keep the orchestrator
+        from issuing waves against nodes that would push the tree past
+        the business hard limit.
+        """
 
     @abstractmethod
     async def stats(self, tree_id: str) -> dict[str, Any]:
@@ -550,8 +562,35 @@ class _SqlAlchemyBackend(AssetTreeBackend):
         from_state: str,
         to_state: str,
     ) -> None:
+        # Defensive precheck: ``asset_state_transitions`` has a FK to
+        # ``asset_nodes`` (ON DELETE CASCADE). When an upstream
+        # ``asset_tree_add_nodes`` bulk insert fails partway through,
+        # the in-memory tree still calls ``update_state`` for nodes
+        # that were never committed to MySQL, and the resulting FK
+        # violation (errno 1452) floods the asyncio error log with
+        # unretrievable tasks. Skip the audit insert if the parent
+        # node row is missing — the state change is a no-op in that
+        # case (no node → no node to update), and the next successful
+        # ``add_nodes`` will record the proper transition.
         async with self._session() as session:
             async with session.begin():
+                node_exists = (
+                    await session.execute(
+                        select(asset_nodes.c.id)
+                        .where(
+                            asset_nodes.c.tree_id == tree_id,
+                            asset_nodes.c.id == node_id,
+                        )
+                        .limit(1)
+                    )
+                ).first()
+                if node_exists is None:
+                    logger.warning(
+                        "asset_state_transition_skipped_missing_node "
+                        "tree_id=%s node_id=%s from=%s to=%s",
+                        tree_id, node_id, from_state, to_state,
+                    )
+                    return
                 await session.execute(
                     asset_state_transitions.insert().values(
                         tree_id=tree_id,
@@ -673,7 +712,11 @@ class _SqlAlchemyBackend(AssetTreeBackend):
             return [self._row_to_node(r._mapping) for r in result]
 
     async def find_unseen(
-        self, tree_id: str, asset_type: str | None = None
+        self,
+        tree_id: str,
+        asset_type: str | None = None,
+        *,
+        max_depth: int | None = None,
     ) -> list[NodeRow]:
         async with self._session() as session:
             stmt = select(asset_nodes).where(
@@ -682,6 +725,8 @@ class _SqlAlchemyBackend(AssetTreeBackend):
             )
             if asset_type is not None:
                 stmt = stmt.where(asset_nodes.c.asset_type == asset_type)
+            if max_depth is not None:
+                stmt = stmt.where(asset_nodes.c.path_depth <= max_depth)
             stmt = stmt.order_by(asset_nodes.c.path_depth, asset_nodes.c.id)
             result = await session.execute(stmt)
             return [self._row_to_node(r._mapping) for r in result]

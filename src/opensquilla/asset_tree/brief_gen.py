@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .models import AssetNode, AssetType, AssetState
+from .models import AssetNode, AssetType, AssetState, MAX_TREE_DEPTH
 from .tree import AssetTree
 
 
@@ -199,6 +199,11 @@ class BriefGenerator:
     ) -> None:
         if depth >= max_depth:
             return
+        # v5 (2026-06-18): max_depth 截断到 MAX_TREE_DEPTH (= 8), 让
+        # specialist 看到完整业务链 root → ... → injection_vector。
+        effective_max = min(max_depth, MAX_TREE_DEPTH)
+        if depth >= effective_max:
+            return
         children = self._tree.get_children(node_id)
         for child in children:
             indent = "  " * depth
@@ -210,6 +215,6 @@ class BriefGenerator:
                 AssetState.ABANDONED: "✗",
             }.get(child.state, "?")
             lines.append(
-                f"{indent}{state_marker} {child.asset_type.value}: {child.value}"
+                f"{indent}{state_marker} [L{depth}] {child.asset_type.value}: {child.value}"
             )
-            self._walk_subtree(child.id, depth + 1, max_depth, lines)
+            self._walk_subtree(child.id, depth + 1, effective_max, lines)

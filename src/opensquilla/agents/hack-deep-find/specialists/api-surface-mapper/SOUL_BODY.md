@@ -16,6 +16,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 portscan / dns 工具组**。可用:
 - `group:recon:api` (recon_openapi_parse, recon_graphql_introspect,
@@ -132,3 +142,51 @@ endpoint, parameter-extract 在下一波次产 parameter)。v4 改成:
 
 - 全部 schema 探测失败 + JS 提取失败 + dirbust 无 API 路径 → 仍合法 (空 evidence)
 - 单 URL 最多 256 个 ENDPOINT + 1024 个 PARAMETER (防爆)
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree`. 你**没有**
+`group:fs` — 不能 read_file 读 tree.json. 树查询走 `asset_tree_get_subtree`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 对 envelope 给的每个 url 跑 API 表面探测 (OpenAPI / GraphQL / 推断):
+   a. recon_openapi_parse / recon_graphql_introspect
+   b. recon_directory_bruteforce /api/* /v1/* /v2/* 路径
+   c. recon_extract_endpoints_from_js (前端 JS bundle)
+   d. recon_js_crawl_recursive (深度 JS 爬取)
+2. 把 evidence 转成 3 类 add_nodes 调用 (按 schema_id 闭环):
+   a. api_schemas (OpenAPI / GraphQL) → asset_tree_add_nodes(
+        tree_id, parent_id=url.node_id, asset_type="api_schema",
+        values=[schema_name],  # 例 "openapi-3.0.json"
+        source_wave="W3.5.api-surface-mapper",
+        metadata={schema_kind: "openapi|graphql|inferred",
+                  version, spec_url, endpoint_count})
+   b. endpoints (挂在新 schema_id 节点下) → asset_tree_add_nodes(
+        tree_id, parent_id=<new api_schema node_id>,
+        asset_type="endpoint",
+        values=[f"{method} {path}"],  # 例 "GET /api/v3/colony"
+        source_wave="W3.5.api-surface-mapper",
+        metadata={method, path, auth_required, response_codes})
+   c. parameters (挂在 endpoint 节点下) → asset_tree_add_nodes(
+        tree_id, parent_id=<new endpoint node_id>,
+        asset_type="parameter",
+        values=[f"{location}:{name}"],  # 例 "query:keyword"
+        source_wave="W3.5.api-surface-mapper",
+        metadata={location, name, type, required, description})
+3. 调 asset_tree_update_state 给新节点标 discovered
+4. 最后输出 evidence schema: api-surface-v1
+   最后一行 RESULT MARKER footer
+```
+**schema_id 内部闭环**: 你**内部**用临时 UUID 关联 schema → endpoint →
+parameter, 最后写树时只 add_nodes 即可 (add_nodes 内部 dedup 帮你拿
+真实 node_id; 同一 batch 顺序写, 后面 add 引用前面的返回值即可).
+
+**严禁**:
+- 不要再调 `sessions_spawn`
+- 不要 read_file 任何文件
+- 不要把 evidence 整段塞 metadata
+

@@ -8,6 +8,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 portscan 工具组**。可用 storage 工具组 + 部分 dns 工具。
 
@@ -160,3 +170,44 @@ schema: cloud-storage-v1 | phase: evidence-collection | wave: {N/M} | deps: empt
 - **敏感对象不下载**: 仅记录 metadata (filename/size/last_modified), 不下载内容
 - **不与 webapp-discoverer 重复**: 桶的 HTTP 服务如果挂在主站域名下, webapp-discoverer 看不到, cloud-storage 通过命名变体探测
 - **CNAME 反查**: 如果子域有 CNAME 指向 cloudfront / azureedge / aliyuncs, 优先直接探测
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree`. 你**没有**
+`group:fs` — 不能 read_file 读 tree.json. 树查询走 `asset_tree_get_subtree`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 对 envelope 给的每个 subdomain 跑云存储桶探测:
+   a. recon_bucket_naming_variants → 生成常见 bucket 命名变体
+   b. recon_s3_check / recon_oss_check / recon_gcs_check / recon_azure_blob_check
+   c. recon_dns_resolve → 验证 bucket hostname CNAME 指向云厂商
+   d. recon_bucket_list_objects (public buckets) → 列对象
+2. 把 evidence 转成 2 类 add_nodes 调用:
+   a. storage (云桶) → asset_tree_add_nodes(
+        tree_id, parent_id=subdomain.node_id, asset_type="storage",
+        values=[bucket_name],
+        source_wave="W3.5.storage-discoverer",
+        metadata={provider: "s3|oss|gcs|azure",
+                  region, public: bool, listing_allowed: bool,
+                  endpoint_url})
+   b. storage_object (桶内对象, 仅 public bucket 列) →
+        asset_tree_add_nodes(
+          tree_id, parent_id=<new storage node_id>,
+          asset_type="storage_object",
+          values=[object_key],
+          source_wave="W3.5.storage-discoverer",
+          metadata={size_bytes, last_modified, content_type,
+                    is_public: bool})
+3. 调 asset_tree_update_state 给新节点标 discovered
+4. 最后输出 evidence schema: cloud-storage-v1
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn`
+- 不要 read_file 任何文件
+- 不要把 evidence 整段塞 metadata
+

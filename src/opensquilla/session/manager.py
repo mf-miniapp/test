@@ -1317,6 +1317,23 @@ class SessionManager:
         cutoff = _now_ms() - max_age_ms
         return await self._storage.prune_stale_sessions(cutoff)
 
+    async def mark_orphan_subagents_failed(
+        self,
+        *,
+        orphan_grace_seconds: int = 60,
+    ) -> int:
+        """v4.5.3 (2026-06-18): at gateway boot, mark any subagent
+        session still in status='running' whose last update is older
+        than ``orphan_grace_seconds`` as 'failed' (terminal_reason=
+        'gateway_restart_orphan'). The in-memory asyncio task that
+        owned it is gone after a gateway restart, so the LLM will
+        never produce output. Marking failed unblocks the supervisor
+        and orchestrators.
+        """
+        return await self._storage.mark_orphan_subagents_failed(
+            orphan_grace_seconds=orphan_grace_seconds,
+        )
+
     async def cap_entries(self, max_entries: int = 500) -> int:
         """Delete oldest sessions beyond max_entries. Returns number deleted."""
         total = await self._storage.count_sessions()

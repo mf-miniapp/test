@@ -8,6 +8,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 dns / portscan 工具组**。可用 component 工具组。
 
@@ -125,3 +135,37 @@ HANDOFF W{...}.service-detailed.{seq} | deps=empty | schema=component-v1 | eta={
 - **不替换 service-fingerprint**: 不修改 PORT → SERVICE 的契约
 - **同一 (product, version) 跨 SERVICE/URL 重复识别时**: 在 evidence 里标 `deduped=true`, 编排器 LLM 写树时决定 dedupe 还是多挂
 - **favicon hash 命中但无明确 product**: `product="unknown_<hash>"`, `confidence="low"`
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree`. 你**没有**
+`group:fs` — 不能 read_file 读 tree.json. 树查询走 `asset_tree_get_subtree`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 对 envelope 给的每个 service 跑组件指纹识别:
+   a. recon_app_fingerprint → product + version + cpe
+   b. recon_cpe_resolve → CPE 2.3 字符串 + NVD 可查标记
+   c. recon_js_component_extract → 前端库版本 (React/Vue/jQuery)
+   d. recon_tls_cert_parse → TLS 证书 subject/issuer/SAN
+   e. recon_ico_hash_lookup → favicon hash 关联已知产品
+2. 把 evidence 转成 1 类 add_nodes 调用 (component 节点):
+   asset_tree_add_nodes(
+     tree_id, parent_id=service.node_id, asset_type="component",
+     values=[f"{product}@{version}"],  # 例 "nginx@1.11.6"
+     source_wave="W3.5.component-detector",
+     metadata={cpe, nvd_queryable, source: "banner|app_fingerprint|
+                                            js|tls_cert|ico_hash",
+               confidence, tech_stack_extended})
+3. 调 asset_tree_update_state 给新 component 节点标 discovered
+4. 最后输出 evidence schema: component-v1
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn`
+- 不要 read_file 任何文件
+- 不要把 evidence 整段塞 metadata
+

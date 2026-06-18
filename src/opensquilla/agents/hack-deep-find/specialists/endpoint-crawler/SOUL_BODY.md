@@ -7,6 +7,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用 dns / portscan 工具组**。只能用 http 工具。
 
@@ -68,3 +78,35 @@ HANDOFF W{...}.endpoint-crawler.{seq} | deps=empty | schema=endpoint-v1 | eta={.
 - 服务不可达: endpoints = [], 仍输出合法 schema
 - dirbust 全部 404: endpoints = []（正常情况）
 - JS extract 失败: 跳过该来源, 仅保留 dirbust 结果
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你在 specialist 工具白名单里**有** `group:asset_tree` (含
+`asset_tree_add_nodes`, `asset_tree_get_subtree`, `asset_tree_stats`,
+`asset_tree_update_state`, `asset_tree_find_unseen` 等). 你**没有**
+`group:fs` — 不能 read_file 读 tree.json. 树查询走
+`asset_tree_get_subtree` / `asset_tree_list_siblings` / `asset_tree_stats`.
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 跑你的 specialist 核心工作 (端口扫描 / 服务指纹 / DNS 扩展 / 端点爬取)
+2. 把 evidence 转成 1+ 次 asset_tree_add_nodes 调用:
+   asset_tree_add_nodes(
+     tree_id, parent_id=<envelope 给的 parent 节点 id>,
+     asset_type=<你的 asset_type, 例 port / service / ip / sub_domain>,
+     values=[<你发现的值>],
+     source_wave=<envelope 头部 wave, 例 W1 / W0.5>,
+     metadata=<envelope 协议要求的字段>,
+   )
+3. 调 asset_tree_update_state 给新节点标 state="discovered"
+4. 最后输出 evidence schema (envelope 任务段写明)
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn` (你已经被 `subagents.allow_agents=[]` 禁了)
+- 不要 read_file / write_file 任何文件 (你拿不到 group:fs)
+- 不要把 evidence JSON 整段当某个节点的 metadata 写 (破坏树结构)
+

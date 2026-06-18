@@ -77,6 +77,15 @@ log = structlog.get_logger(__name__)
 # purpose: long attack-surface scans legitimately run 30+ minutes.
 DEFAULT_STUCK_THRESHOLD_SECONDS = 600.0
 
+# v4.5.3 (2026-06-18) zombie threshold: a subagent with status='running'
+# but no assistant activity in transcript for ZOMBIE_THRESHOLD_SECONDS is
+# declared a zombie (gateway restart orphan / LLM never produced output).
+# The supervisor marks it 'failed' with reason 'zombie_no_activity' so the
+# parent can move on. 10jqka.com.cn incident: 19 webapp-discoverer stuck
+# 5+ min (gateway restart) and 1 port-scanner stuck 100 min (provider
+# silent), all blocking parent progress.
+DEFAULT_ZOMBIE_THRESHOLD_SECONDS = 180.0
+
 # Per-(parent, child) retry cap. Once hit, the supervisor emits a
 # terminal-failure warning event and stops nudging.
 DEFAULT_MAX_RETRIES = 3
@@ -177,6 +186,8 @@ class SubagentHealthSupervisor:
         self._session_manager = session_manager
         self._task_runtime = task_runtime
         self._stuck_threshold_s = float(stuck_threshold_seconds)
+        # v4.5.3: zombie detection (faster than stuck, marks failed)
+        self._zombie_threshold_s = float(DEFAULT_ZOMBIE_THRESHOLD_SECONDS)
         self._max_retries = int(max_retries)
         self._context_overflow_max_retries = int(context_overflow_max_retries)
         self._clock: Callable[[], float] = clock or asyncio.get_event_loop().time
@@ -381,6 +392,21 @@ class SubagentHealthSupervisor:
         # if the child task is in a terminal status but the tracker has
         # not seen the child_session_key, we replay the announce.
         if not _is_terminal_status(child_status):
+            # v4.5.3 (2026-06-18) ZOMBIE detection first (faster than
+            # stuck). A running subagent with no assistant transcript
+            # activity for >= zombie_threshold is a zombie — typically
+            # a gateway-restart orphan whose in-memory task is gone but
+            # sessions.db row still says 'running'. Mark it failed and
+            # trigger announce so the parent moves on.
+            if stuck_seconds >= self._zombie_threshold_s:
+                zombie = await self._detect_zombie(child_session_key)
+                if zombie:
+                    return await self._handle_zombie(
+                        parent_session_key=parent_session_key,
+                        parent_task_id=parent_task_id,
+                        child_session_key=child_session_key,
+                        stuck_seconds=stuck_seconds,
+                    )
             if stuck_seconds >= self._stuck_threshold_s:
                 return await self._handle_stuck(
                     parent_session_key=parent_session_key,
@@ -617,6 +643,111 @@ class SubagentHealthSupervisor:
             attempts=attempts,
         )
         return "escalated"
+
+    async def _detect_zombie(
+        self,
+        child_session_key: str,
+    ) -> bool:
+        """v4.5.3: is this running child actually a zombie?
+
+        A child is a zombie when status='running' but the transcript has
+        no assistant messages (only the initial user message). This is
+        the gateway-restart orphan pattern: the in-memory task is gone
+        but sessions.db still says 'running' (sessions table writes are
+        best-effort, not transactional with the asyncio task lifecycle).
+
+        Returns True if zombie, False otherwise. We do NOT raise — the
+        caller treats both cases as "child is stuck" but zombie is the
+        more aggressive failure mode.
+        """
+        try:
+            storage = getattr(self._session_manager, "_storage", None)
+            if storage is None:
+                return False
+            count = await storage.count_transcript_messages(
+                session_key=child_session_key, role="assistant"
+            )
+            return count == 0
+        except Exception:
+            return False
+
+    async def _handle_zombie(
+        self,
+        *,
+        parent_session_key: str,
+        parent_task_id: str,
+        child_session_key: str,
+        stuck_seconds: float,
+    ) -> str:
+        """v4.5.3: declare a running child a zombie, mark it failed,
+        and trigger the parent wake so the parent moves on.
+
+        Without this, a gateway-restart-orphan subagent blocks the
+        parent forever (the parent's wave barrier waits for terminal
+        status; the zombie never reaches terminal because its LLM
+        task is gone).
+        """
+        log.error(
+            "subagent_supervisor.zombie_detected",
+            parent_session_key=parent_session_key,
+            parent_task_id=parent_task_id,
+            child_session_key=child_session_key,
+            stuck_seconds=round(stuck_seconds, 1),
+        )
+        try:
+            finish_fn = getattr(self._session_manager, "finish", None)
+            if callable(finish_fn):
+                await finish_fn(child_session_key, status="failed")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "subagent_supervisor.zombie_finish_failed",
+                child_session_key=child_session_key,
+                error=str(exc),
+            )
+        try:
+            event = SubagentCompletionEvent(
+                parent_session_key=parent_session_key,
+                child_session_key=child_session_key,
+                task_id=child_session_key,
+                agent_task_status=AgentTaskStatus.FAILED,
+                terminal_reason="zombie_no_activity",
+            )
+            await announce_subagent_completion(event)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "subagent_supervisor.zombie_announce_failed",
+                child_session_key=child_session_key,
+                error=str(exc),
+            )
+        try:
+            append_message = getattr(self._session_manager, "append_message", None)
+            if callable(append_message):
+                payload = {
+                    "type": "subagent_zombie_killed",
+                    "kind": "internal_system",
+                    "source_session_key": child_session_key,
+                    "source_tool": "subagent_supervisor",
+                    "message": (
+                        f"Subagent {child_session_key} declared zombie "
+                        f"(no assistant activity for {round(stuck_seconds, 1)}s, "
+                        f"typical of gateway-restart orphan). Marked failed, "
+                        f"dispatched next planned sub-task. "
+                        f"Do NOT retry the same call."
+                    ),
+                }
+                await append_message(
+                    parent_session_key,
+                    role="system",
+                    content=json.dumps(payload, ensure_ascii=False),
+                    provenance={
+                        "kind": "internal_system",
+                        "source_session_key": child_session_key,
+                        "source_tool": "subagent_supervisor",
+                    },
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return "zombie_killed"
 
     async def _emit_transcript_warning(
         self,

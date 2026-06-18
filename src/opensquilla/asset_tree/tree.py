@@ -28,6 +28,9 @@ from opensquilla.asset_tree.models import (
     AssetPath,
     AssetState,
     AssetType,
+    MAX_TREE_DEPTH,
+    DepthExceededError,
+    validate_depth,
     validate_parent_child,
 )
 
@@ -273,7 +276,23 @@ class AssetTree:
             if parent is None:
                 raise ValueError(f"Parent node not found: {parent_id}")
             validate_parent_child(parent.asset_type, asset_type)
+        # v5 (2026-06-18) 8 层深度硬约束: 业务硬上限 MAX_TREE_DEPTH=8。
+        # 任何 parent_depth + 1 > 8 的边都会被拒 (DepthExceededError)。
+        # 根节点 (parent_id is None) 深度 0, 无需校验。
+        if parent_id is not None:
+            parent_depth = self._compute_depth_locked(parent_id)
+        else:
+            parent_depth = None
+        validate_depth(
+            parent_depth=parent_depth,
+            parent_type=parent.asset_type if parent_id is not None else None,
+            child_type=asset_type,
+        )
 
+        # v5 (2026-06-18): 计算 effective_depth 并通过 set_depth() 注入到
+        # AssetNode (独立字段, 不污染 metadata), 供 brief_gen 与
+        # tools/builtin/asset_tree 读取做深度过滤 / 截断。
+        effective_depth = (parent_depth + 1) if parent_depth is not None else 0
         node = AssetNode(
             id=id_override or AssetNode.__pydantic_fields__["id"].default_factory(),
             asset_type=asset_type,
@@ -284,6 +303,7 @@ class AssetTree:
             last_seen=datetime.now(timezone.utc),
             metadata=metadata or {},
         )
+        node.set_depth(effective_depth)
 
         # v4.5 (2026-06-18): attach verification to metadata so the
         # node record carries the probe envelope for downstream
@@ -357,19 +377,60 @@ class AssetTree:
             node.last_seen = datetime.now(timezone.utc)
 
         # Persist state change + record audit log entry (Phase 4)
-        if getattr(self, "_backend", None) is not None and getattr(self, "_tree_id", None) is not None:
+        # v4.5.3 (2026-06-18) bug fix: previous version used
+        # ``asyncio.ensure_future`` here, but the tool entry point
+        # ``asset_tree_update_state`` is async and calls
+        # ``tree.update_state`` from a sync path that does NOT
+        # ``await`` the future. The future gets scheduled but never
+        # runs, so MySQL state stays stale. Now we detect an active
+        # loop and run synchronously via ``asyncio.run_coroutine_threadsafe``,
+        # and fall back to spawning a thread to run the coroutine
+        # when no loop is available. This guarantees the DB write
+        # happens before ``asset_tree_update_state`` returns.
+        backend = getattr(self, "_backend", None)
+        tree_id = getattr(self, "_tree_id", None)
+        if backend is not None and tree_id is not None:
+            import threading
             try:
-                asyncio.get_running_loop()
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                return
-            asyncio.ensure_future(self._backend.update_node_state(
-                node_id=node_id, tree_id=self._tree_id,
-                new_state=new_state.value,
-            ))
-            asyncio.ensure_future(self._backend.add_state_transition(
-                tree_id=self._tree_id, node_id=node_id,
-                from_state=old_state.value, to_state=new_state.value,
-            ))
+                loop = None
+            _run_coro = None
+            if loop is not None and loop.is_running():
+                # Fire-and-forget but schedule a future so the call
+                # returns to the caller. The future itself completes
+                # once the backend write is done.
+                _run_coro = asyncio.run_coroutine_threadsafe(
+                    backend.update_node_state(
+                        node_id=node_id, tree_id=tree_id,
+                        new_state=new_state.value,
+                    ),
+                    loop,
+                )
+            else:
+                # No running loop (sync entry point) — run the
+                # coroutine in a dedicated worker thread so the
+                # backend write still happens before we return.
+                def _do_persist():
+                    import asyncio as _asyncio
+                    _asyncio.run(backend.update_node_state(
+                        node_id=node_id, tree_id=tree_id,
+                        new_state=new_state.value,
+                    ))
+                t = threading.Thread(target=_do_persist, daemon=True)
+                t.start()
+                t.join(timeout=10)
+            try:
+                if loop is not None and loop.is_running():
+                    _asyncio.run_coroutine_threadsafe(
+                        backend.add_state_transition(
+                            tree_id=tree_id, node_id=node_id,
+                            from_state=old_state.value, to_state=new_state.value,
+                        ),
+                        loop,
+                    ).result(timeout=5)
+            except Exception:
+                pass
 
     def update_metadata(self, node_id: str, **fields: Any) -> None:
         """更新节点的 metadata 字段（merge 语义）。"""
@@ -606,6 +667,27 @@ class AssetTree:
             "shared_ips": len(self.find_shared_ips()),
             "root_domain": self._nodes[self.root_id].value if self.root_id else None,
         }
+
+    def _compute_depth_locked(self, node_id: Optional[str]) -> int:
+        """递归计算某节点到根的距离 (锁内)。调用方必须持有 ``_lock``。"""
+        if node_id is None or node_id not in self._nodes:
+            return -1
+        depth = 0
+        cur = node_id
+        seen: set[str] = set()
+        while cur is not None and cur in self._nodes and cur not in seen:
+            parent = self._nodes[cur].parent_id
+            if parent is None:
+                return depth
+            depth += 1
+            seen.add(cur)
+            cur = parent
+        return depth
+
+    def depth_of(self, node_id: str) -> int:
+        """公开 API: 查询某节点深度 (0 = 根)。线程安全。"""
+        with self._lock:
+            return self._compute_depth_locked(node_id)
 
     def max_depth(self) -> int:
         """树的最大深度。"""

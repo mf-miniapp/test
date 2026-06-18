@@ -214,6 +214,15 @@ class ChatConfig(BaseModel):
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
     tool_choice: Any | None = None
+    # Cap on tools sent to local OpenAI-compatible servers. 0 = no cap.
+    local_max_tools: int = 0
+    # Cap on the system prompt size sent to local OpenAI-compatible servers.
+    # 0 = no cap. Default 0 (set per deployment via env). When set, the
+    # first N chars of the system prompt are kept (persona / instructions)
+    # and the trailing tail (task-specific context, recall, etc.) is
+    # trimmed. Keeps small-ctx local models viable for agents with very
+    # large SOUL.md content.
+    local_max_system_chars: int = 0
 
 
 # ---------------------------------------------------------------------------

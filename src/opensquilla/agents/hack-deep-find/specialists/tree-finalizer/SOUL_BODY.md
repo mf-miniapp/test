@@ -18,6 +18,16 @@
 
 ## 强制约束
 
+> **🔥 v4.5.3 必读 skill (2026-06-18)**: 在跑 F1.5c / F3.5 / 任何 web 资产深度发现之前,
+> **必须先读** `~/.agents/skills/hack-deep-find-deep-discovery/SKILL.md`. 里面 8 条硬约束
+> 是 10jqka.com.cn 6 小时事故的根因 + 验证过的修复 (specialist 越界用 read_file / 编排器
+> 不 ingest specialist evidence / update_state 不写 MySQL / zombie session 100 分钟 /
+> ENDPOINT 不能挂在 API_SCHEMA 下 / verification envelope 必须传 / F1.5c 三模式 URL
+> 探测 / 4 类 cross-cutting signal batch ingest 协议). **违反任何一条会导致 27 URL
+> 永远停在水面下**.
+
+
+
 **你不允许调用 `sessions_spawn`**。`subagents.allow_agents=[]`。
 **你不允许使用任何 `recon_*` 主动探测工具组** (除了存活复核用的 `recon_http_probe`)。
 **你不允许调 `asset_tree_add_nodes` / `update_state`** (你只读; F-final 编排器自己落盘)。
@@ -182,3 +192,30 @@ hack-deep W2 (vulnerability-triage) 接收:
 - **存活复核 ≠ 漏洞验证**: HEAD 200 只表示服务在线, 不表示可利用
 - **verified=false 的 URL 不复核**: 它们已经被某 specialist 标记为不可达
 - **fuzz / dirbust 不在本阶段跑**: 发现阶段的目录爆破在 F6 已结束
+
+
+---
+
+## 🔥 v4.5.3 INGEST 协议 (2026-06-18, 强加)
+
+**重要**: 你是 read-only specialist. 你在 specialist 工具白名单里**有**
+`group:asset_tree` (含 `asset_tree_get_subtree`, `asset_tree_stats`,
+`asset_tree_find_unseen`), 但**不**会写树. 你**没有** `group:fs` — 不能
+read_file 读 tree.json (走 `asset_tree_get_subtree`).
+
+**完成后必做 (你而不是编排器)**:
+```
+1. 跑存活复核 (对 verified=true 的 URL 调 recon_http_probe HEAD)
+2. 调 asset_tree_stats(tree_id) / asset_tree_get_subtree(tree_id, root_id)
+   拿完整树 (替代 read_file)
+3. 统计 coverage_gaps / missing_evidence
+4. **不**调 asset_tree_add_nodes (你只读, F-final 编排器自己落盘)
+5. 最后输出 evidence schema: asset-tree-v1
+   最后一行 RESULT MARKER footer
+```
+**严禁**:
+- 不要再调 `sessions_spawn`
+- 不要 read_file 任何文件
+- 不要调 `asset_tree_add_nodes` / `asset_tree_update_state` (read-only)
+- 不要算 exploitability_score / 关联 CVE / 推荐 specialist (那是 hack-deep W2 工作)
+

@@ -179,6 +179,11 @@ class WaveSpec:
     deps: tuple[str, ...]
     drill_in_allowed: bool
     owner_agent: OwnerAgent = "hack-deep"
+    # v5 (2026-06-18): 本波次允许写入的最深节点 depth (含).
+    # 编排器在派发 specialist 之前, 必须确保目标 node 的 path_depth
+    # <= max_path_depth, 否则该 specialist 不会入树 (避免越界到 L8+)。
+    # 业务硬上限由 asset_tree.models.MAX_TREE_DEPTH (= 8) 提供。
+    max_path_depth: int = 8
 
     def is_drill_in(self) -> bool:
         return ".5" in self.wave
@@ -199,10 +204,12 @@ def _w(
     fanout_agents: tuple[str, ...] = (),
     drill_in_allowed: bool = False,
     owner_agent: OwnerAgent = "hack-deep",
+    max_path_depth: int = 8,
 ) -> WaveSpec:
     return WaveSpec(
         wave=wave,
         layer=layer,
+        max_path_depth=max_path_depth,
         specialist=specialist,
         fanout=fanout,
         fanout_agents=fanout_agents,
@@ -519,6 +526,56 @@ def is_drill_in_allowed(parent_wave: str) -> bool:
 def list_drill_in_slots(parent_wave: str) -> tuple[str, ...]:
     """All allowed drill-in slot names for a parent wave, or empty tuple."""
     return DRILL_IN_SLOTS.get(parent_wave, ())
+
+
+# v5 (2026-06-18): 每波次允许写出的最深节点 path_depth。
+# - W0.5 / W1   (Tier 1 网络层):   写 SUB_DOMAIN / IP / PORT / SERVICE  → L1..L3
+# - W1.5       (Tier 1 fan-out):  继承 W1 max_path_depth
+# - W1.5c      (URL/endpoint):    写到 URL/ENDPOINT/PARAMETER          → L4..L6
+# - W2.5       (Tier 2 web):      写到 L5..L7                            → L5..L7
+# - W3.5       (Tier 3 横向):     SECRET (跨层), 不增加主链 depth      → L0..L7
+# - W4         (攻击面, hack-deep) 不写资产树, 只是消费 → 不限
+# - W4.5* / W6.5*  drill-in:       继承父波次 max_path_depth
+WAVE_MAX_PATH_DEPTH: dict[str, int] = {
+    # 值是 path_depth 索引 (节点 depth ∈ [0, 8])。
+    "W0.5": 2,    # ROOT(0) → SUB(1) → IP(2)  写到 IP
+    "W1": 5,      # ROOT..URL(5) — 写 PORT(3)/SERVICE(4)/URL(5)
+    "W1.5": 5,
+    "W1.5c": 7,   # url(5)/endpoint(6)/parameter(7) 都在 W1.5c 闭环
+    "W2.5": 8,    # injection_vector(8) 由 W2.5 (Tier 2 web) 写入, 业务最深
+    "W3.5": 8,    # secret 跨层挂载, 自身 depth 算, 但允许挂在 path_depth<=8 的父位
+    "W4": 8,      # 攻击面读取, 不写
+}
+
+
+def wave_owns_depth(wave: str, target_depth: int) -> bool:
+    """判断某 wave 是否"拥有"指定 depth 的写入权。
+
+    v5 (2026-06-18): 编排器在派发 specialist 之前, 必须用此函数判断
+    目标 node 的 path_depth 是否在 wave 允许范围内。如果不在, 跳过
+    该 node (或者下放到下一个 wave), 避免写入 L8+ 越界节点。
+
+    Lookup 顺序:
+      1) WAVE_MAX_PATH_DEPTH 显式表 (覆盖大多数)
+      2) WaveSpec.max_path_depth (注册波次自带字段, 兜底)
+      3) 未知 wave / drill-in slot: 沿父波次上溯
+      4) 全部失败: 拒绝 (保守拒绝, 等于 MAX_TREE_DEPTH 8 也允许)
+    """
+    if wave in WAVE_MAX_PATH_DEPTH:
+        return target_depth <= WAVE_MAX_PATH_DEPTH[wave]
+    try:
+        spec = get_wave(wave)
+    except KeyError:
+        spec = None
+    if spec is not None:
+        return target_depth <= spec.max_path_depth
+    # drill-in slot: 沿父波次上溯 (W1.6a -> W1 -> 4; W4.5a -> W4 -> 7)
+    for parent, slots in DRILL_IN_SLOTS.items():
+        if wave in slots:
+            return wave_owns_depth(parent, target_depth)
+    # 兜底: 业务硬上限 (新节点 depth <= 8)
+    from opensquilla.asset_tree.models import MAX_TREE_DEPTH
+    return target_depth <= MAX_TREE_DEPTH
 
 
 def get_wave(wave: str) -> WaveSpec:

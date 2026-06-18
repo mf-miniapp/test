@@ -520,6 +520,35 @@ def _is_direct_deepseek_v4_request(provider_kind: str, model: str) -> bool:
     return provider_kind == "deepseek" and _is_direct_deepseek_v4_model_id(model)
 
 
+# Local OpenAI-compatible servers (llama-server / vLLM / LM Studio / Ollama) are
+# often pinned to small context windows (e.g. ``-c 16384``) to keep KV-cache
+# RAM in check. When the gateway sends a request whose estimated token count
+# exceeds the model ctx, the upstream rejects it with HTTP 400 and the turn
+# fails before any compaction can run. Detect loopback / private base URLs and
+# downscale the per-turn proof budget so the in-turn compaction ladder always
+# lands below the local model ctx.
+_LOCAL_CTX_CEILING_TOKENS = 14_000  # safe for llama-server -c 16384 (input only)
+
+
+def _is_local_openai_base_url(base_url: str) -> bool:
+    if not base_url:
+        return False
+    lowered = base_url.lower()
+    return (
+        "127.0.0.1" in lowered
+        or "localhost" in lowered
+        or "0.0.0.0" in lowered
+        or lowered.startswith("http://[::1]")
+    )
+
+
+def _local_proof_budget_chars(base_url: str, original: int) -> int:
+    if not _is_local_openai_base_url(base_url):
+        return original
+    # 14k input tokens → 56k chars; cap headroom to keep budget in budget.
+    return min(original, _LOCAL_CTX_CEILING_TOKENS * 4)
+
+
 def _should_replay_reasoning_content(
     *,
     provider_kind: str,
@@ -747,7 +776,34 @@ class OpenAIProvider:
                     content_blocks.append(block)
                 openai_messages.append({"role": "system", "content": content_blocks})
             else:
-                openai_messages.append({"role": "system", "content": cfg.system})
+                # Local OpenAI-compatible servers (llama-server on loopback)
+                # have small ctx windows. SOUL.md / persona prompts can be
+                # 30k+ chars for specialist agents — too big to fit alongside
+                # history + tools in 16k ctx. Honor ``cfg.local_max_system_chars``
+                # for loopback endpoints to keep the *first* N chars (persona,
+                # instructions) and drop the trailing tail (often task-specific
+                # recall / context that the agent can re-fetch on demand).
+                sys_content = cfg.system
+                sys_cap = int(getattr(cfg, "local_max_system_chars", 0) or 0)
+                if (
+                    sys_cap > 0
+                    and isinstance(sys_content, str)
+                    and _is_local_openai_base_url(self._base_url)
+                    and len(sys_content) > sys_cap
+                ):
+                    truncated_marker = (
+                        "\n\n[...system prompt truncated for local-ctx model; "
+                        "tail context available via tools...]"
+                    )
+                    sys_content = sys_content[:sys_cap] + truncated_marker
+                    log.info(
+                        "provider.local_system_capped",
+                        model=self._model,
+                        base_url=self._base_url,
+                        cap=sys_cap,
+                        original=len(cfg.system),
+                    )
+                openai_messages.append({"role": "system", "content": sys_content})
         for m in messages:
             openai_messages.extend(
                 _build_openai_messages(
@@ -792,9 +848,36 @@ class OpenAIProvider:
         if cfg.stop_sequences:
             payload["stop"] = cfg.stop_sequences
         if tools:
-            payload["tools"] = [_build_openai_tool(t) for t in tools]
+            tool_objs = [_build_openai_tool(t) for t in tools]
+            # Local OpenAI-compatible servers (llama-server / vLLM / LM Studio)
+            # typically have small ctx windows. The full tool schema can blow
+            # past the ctx ceiling even with all messages compacted, since
+            # the compaction ladder does not shrink the tools list. Honor
+            # ``cfg.local_max_tools`` for loopback endpoints so a 16k-ctx
+            # llama-server is not flooded with hundreds of tool descriptions.
+            local_cap = int(getattr(cfg, "local_max_tools", 0) or 0)
+            if local_cap > 0 and _is_local_openai_base_url(self._base_url) and len(tool_objs) > local_cap:
+                tool_objs = tool_objs[:local_cap]
+                log.info(
+                    "provider.local_tools_capped",
+                    model=self._model,
+                    base_url=self._base_url,
+                    cap=local_cap,
+                    total=len(tools),
+                )
+            payload["tools"] = tool_objs
             if cfg.tool_choice is not None:
                 payload["tool_choice"] = cfg.tool_choice
+        # Qwen3+ chat templates (llama-server / vLLM / DashScope) default to
+        # ``enable_thinking=true`` and emit ``reasoning_content`` with an empty
+        # ``content`` field, which trips the gateway's ``malformed_empty``
+        # classifier. Force-disable thinking unless the caller explicitly asked.
+        if (
+            self._model.lower().startswith("qwen")
+            and "chat_template_kwargs" not in payload
+            and "enable_thinking" not in payload
+        ):
+            payload["chat_template_kwargs"] = {"enable_thinking": bool(cfg.thinking)}
         if self._provider_kind == "openrouter":
             pinned_provider = self._provider_routing.get(self._model)
             if pinned_provider:
@@ -876,7 +959,9 @@ class OpenAIProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter=self._provider_kind,
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=_local_proof_budget_chars(
+                self._base_url, cfg.provider_request_max_chars
+            ),
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
         )

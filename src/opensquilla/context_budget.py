@@ -155,6 +155,19 @@ class ContextBudgetGovernor:
                 SMALL_CONTEXT_MAX_PROOF_CHARS,
                 max(SMALL_CONTEXT_MIN_PROOF_CHARS, derived_provider_chars),
             )
+            # When the user explicitly sets a small context window (e.g. a
+            # local llama-server with 16k ctx), the derived proof budget can
+            # still be larger than the model itself, which causes the
+            # request to exceed the model ctx and the upstream to reject it
+            # outright. Clamp the proof budget to a hard ceiling of
+            # ``context_window_tokens * CHARS_PER_TOKEN * 0.85`` (i.e. 85 %
+            # of the model window in chars) so the in-turn compaction
+            # ladder always has room to land below ctx.
+            small_ctx_chars_ceiling = max(
+                SMALL_CONTEXT_MIN_PROOF_CHARS,
+                int(context_tokens * CHARS_PER_TOKEN * 0.85),
+            )
+            derived_provider_chars = min(derived_provider_chars, small_ctx_chars_ceiling)
         provider_chars = explicit_proof or max(1, derived_provider_chars)
 
         explicit_argument = _positive_int(tool_use_argument_provider_request_max_chars)

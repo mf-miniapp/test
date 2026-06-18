@@ -85,7 +85,7 @@ async def _stdlib_scan(ip: str, ports: list[int], timeout_s: float) -> list[dict
         },
     },
     required=["ips"],
-    execution_timeout_seconds=600.0,
+    execution_timeout_seconds=1200.0,
 )
 async def recon_port_batch(
     ips: list[str],
@@ -93,7 +93,33 @@ async def recon_port_batch(
     timeout_s: int = 2,
     rate: int = 1000,
 ) -> str:
-    """Batch port scan via naabu (preferred) or stdlib (fallback)."""
+    """Batch port scan via naabu (preferred) or stdlib (fallback).
+
+    v4.6 (2026-06-18) cap: naabu full-range (1-65535) over a typical
+    sub-domain IP set takes 30-60 min and trips the subagent
+    supervisor's 10-min stuck-kill (DEFAULT_STUCK_THRESHOLD_SECONDS),
+    leaving a zombie naabu process and an unannounced subagent that
+    the parent LLM keeps retrying. Auto-cap to TOP-1000 when callers
+    pass "1-65535"/"full"; 1000 ports is the standard recon coverage
+    (covers 99% of production-exposed services per ProjectDiscovery
+    defaults) and fits in the 10-min budget for 5-10 IPs at
+    rate=1000. Callers needing full-range must pass ports explicitly
+    to a different tool (e.g. nmap -p-).
+    """
+    _PORT_CAP = 1000  # auto-cap threshold
+    _port_cap_applied = False
+    if ports in ("1-65535", "full"):
+        ports = f"top-{_PORT_CAP}"
+        _port_cap_applied = True
+    elif "-" in ports:
+        try:
+            a, b = ports.split("-", 1)
+            span = int(b) - int(a) + 1
+            if span > _PORT_CAP:
+                ports = f"top-{_PORT_CAP}"
+                _port_cap_applied = True
+        except (ValueError, TypeError):
+            pass
     bp = _binaries.detect("naabu")
     if not bp.available or not ips:
         # Stdlib fallback path.
@@ -120,6 +146,7 @@ async def recon_port_batch(
             "binary_error": "naabu not on PATH" if not bp.available else None,
             "scanned_ips": len(ips),
             "scanned_ports_per_ip": len(port_list),
+            "port_cap_applied": _port_cap_applied,
             "open_count": open_count,
             "results": all_results,
         }, ensure_ascii=False)
@@ -157,6 +184,7 @@ async def recon_port_batch(
             "binary_error": f"{type(exc).__name__}: {exc}",
             "scanned_ips": len(ips),
             "scanned_ports_per_ip": len(port_list),
+            "port_cap_applied": _port_cap_applied,
             "open_count": sum(1 for r in all_results if r["state"] == "open"),
             "results": all_results,
         }, ensure_ascii=False)
@@ -208,6 +236,7 @@ async def recon_port_batch(
         "binary_version": bp.version,
         "scanned_ips": len(ips),
         "scanned_ports_per_ip": ports,
+        "port_cap_applied": _port_cap_applied,
         "open_count": len(results),
         "results": results,
     }, ensure_ascii=False)

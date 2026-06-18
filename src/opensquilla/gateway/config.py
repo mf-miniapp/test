@@ -250,6 +250,14 @@ class LlmProviderConfig(BaseSettings):
     # Optional global thinking level: off|minimal|low|medium|high|xhigh|adaptive.
     # When unset, squilla_router may suggest thinking for selected tiers.
     thinking: str | None = None
+    # Cap the OpenAI tool schema list sent to local OpenAI-compatible servers
+    # (e.g. llama-server on 127.0.0.1) so a small-ctx model is not flooded
+    # with hundreds of tool descriptions. 0 = no cap. Default 20 — fits
+    # comfortably in a 16k ctx window alongside system + history. Each
+    # entry preserves its full JSON Schema, so the chosen tools still
+    # work normally; uncapped tools are dropped from this single request
+    # only (the agent still knows about them and can re-request by name).
+    local_max_tools: int = 20
     # OpenRouter-only: map model id -> upstream provider name. Mapped models
     # send provider.order=[name] so the provider is preferred without disabling
     # OpenRouter fallback.

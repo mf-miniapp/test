@@ -1668,6 +1668,29 @@ async def build_services(
             checkpoint_workspace_dir=config.workspace_dir,
         )
 
+    # v4.5.3 (2026-06-18): on gateway boot, mark any subagent session
+    # still in status='running' (from the previous gateway process) as
+    # 'failed' (terminal_reason='gateway_restart_orphan'). Without this,
+    # every restart leaves N zombie 'running' sessions; the LLM task
+    # that owned them is gone, so they will never complete, and the
+    # parent orchestrators wait forever. The 10jqka.com.cn incident
+    # had 19 webapp-discoverer zombies after one gateway restart.
+    try:
+        marked = await session_manager.mark_orphan_subagents_failed(
+            orphan_grace_seconds=60,
+        )
+        if marked:
+            log.warning(
+                "session_manager.mark_orphan_subagents_failed",
+                count=marked,
+                reason="gateway_restart_orphan",
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "session_manager.mark_orphan_subagents_failed.error",
+            error=str(exc),
+        )
+
     # Wire session manager into tool layer (like set_scheduler, set_gateway_config)
     from opensquilla.tools.builtin.sessions import (
         set_gateway_config as _set_sessions_gateway_config,
