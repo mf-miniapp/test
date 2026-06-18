@@ -152,8 +152,12 @@ async def _run_binary(
         proc.kill()
         await proc.wait()
         raise
+    rc = proc.returncode if proc.returncode is not None else 0
+    # v4.6.1 (2026-06-18) 不要把 None 偷偷转成 0 — httpx v1.x 在错误标志
+    # (e.g. "flag provided but not defined: -c") 时返回 rc=2. 调用方需要
+    # 知道这是失败, 否则会解析空 stdout 当作"无响应"而不是"工具出错".
     return (
-        proc.returncode or 0,
+        rc,
         stdout_b.decode("utf-8", errors="ignore"),
         stderr_b.decode("utf-8", errors="ignore"),
     )

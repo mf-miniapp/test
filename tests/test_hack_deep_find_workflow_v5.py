@@ -159,8 +159,9 @@ class TestSkeletonComplete:
         svc = tree.add_node(
             AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True,
         )
-        # max_depth = 4 (service L4)
-        assert tree.skeleton_completion_pct() == 4.0 / MAX_TREE_DEPTH
+        # max_depth = 4 (service L4), v5.2 改: pct 基于 FIND_TERMINATION_DEPTH=7
+        # 4 / 7 ≈ 0.571, 而不是旧的 4 / MAX_TREE_DEPTH = 0.5
+        assert tree.skeleton_completion_pct() == 4.0 / 7
         assert tree.is_skeleton_complete() is False
 
     def test_abandoned_does_not_block_completion(self) -> None:

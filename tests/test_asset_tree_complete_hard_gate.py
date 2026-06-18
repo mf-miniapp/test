@@ -1,8 +1,9 @@
-"""v5 (2026-06-18) asset_tree_complete 8 层硬关卡测试。
+"""v5.2 (2026-06-18) asset_tree_complete find-skeleton 硬关卡测试。
 
-覆盖:
-- 树只到 L3 (UNSEEN=0, max_depth<8): 调 asset_tree_complete 应 raise IncompleteSkeletonError
-- 树到 L8 + 无 UNSEEN: 调 asset_tree_complete 应成功
+v5.2 变更: find 终止深度从 L8 (INJECTION_VECTOR) 改为 L7 (PARAMETER).
+- 树只到 L3 (UNSEEN=0, max_depth<7): 调 asset_tree_complete 应 raise IncompleteSkeletonError
+- 树到 L7 + 无 UNSEEN: 调 asset_tree_complete 应成功 (find 终止)
+- 树到 L8 (有 INJ) + 无 UNSEEN: 仍 complete (L8 允许但不是 find 终止条件)
 - force=True 可绕过 (审计标记)
 - IncompleteSkeletonError 字段: tree_id, max_depth_reached, missing_waves 等
 """
@@ -22,19 +23,23 @@ from opensquilla.asset_tree.tree import AssetTree
 # ─── 1. 单元: IncompleteSkeletonError ─────────────────
 class TestIncompleteSkeletonError:
     def test_construction(self) -> None:
+        # v5.2: max_depth_required 默认 = FIND_TERMINATION_DEPTH = 7 (L7 PARAMETER)
+        # missing_waves 不再含 W2.5 (W2.5 不在 find 责任范围)
         err = IncompleteSkeletonError(
             tree_id="t-1",
             max_depth_reached=3,
-            max_depth_required=8,
+            max_depth_required=7,
             unseen_total=0,
-            completion_pct=0.375,
-            missing_waves=["W1.5", "W1.5c", "W2.5", "W3.5"],
+            completion_pct=3 / 7,
+            missing_waves=["W1.5", "W1.5c", "W3.5"],
         )
         assert err.tree_id == "t-1"
         assert err.max_depth_reached == 3
+        assert err.max_depth_required == 7
         assert err.unseen_total == 0
-        assert err.completion_pct == 0.375
-        assert err.missing_waves == ["W1.5", "W1.5c", "W2.5", "W3.5"]
+        assert err.completion_pct == pytest.approx(3 / 7)
+        assert err.missing_waves == ["W1.5", "W1.5c", "W3.5"]
+        assert "W2.5" not in err.missing_waves  # v5.2: W2.5 不在 find 责任
         msg = str(err)
         assert "DO NOT emit find-complete-v1" in msg
         assert "F-resume" in msg
@@ -96,7 +101,44 @@ class TestAssetTreeCompleteHardGate:
         report = tree.skeleton_report()
         assert report["unseen_total"] == 1
 
-    def test_complete_8_layer_tree(self) -> None:
+    def test_complete_l7_layer_tree(self) -> None:
+        """v5.2: find 终止深度 L7 (PARAMETER, 8 节点层 = 8 层资产深度)。"""
+        tree = AssetTree("example.com")
+        tree.update_state(tree.root_id, AssetState.DISCOVERED)
+        sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
+        tree.update_state(sub, AssetState.DISCOVERED)
+        ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
+        tree.update_state(ip, AssetState.DISCOVERED)
+        port = tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
+        tree.update_state(port, AssetState.DISCOVERED)
+        svc = tree.add_node(
+            AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True,
+        )
+        tree.update_state(svc, AssetState.DISCOVERED)
+        url = tree.add_node(
+            AssetType.URL, "https://api.example.com", parent_id=svc, allow_unverified=True,
+        )
+        tree.update_state(url, AssetState.DISCOVERED)
+        ep = tree.add_node(
+            AssetType.ENDPOINT, "GET /v1/users/:id", parent_id=url, allow_unverified=True,
+        )
+        tree.update_state(ep, AssetState.DISCOVERED)
+        param = tree.add_node(AssetType.PARAMETER, "id", parent_id=ep)
+        tree.update_state(param, AssetState.DISCOVERED)
+        # max_depth=7 (PARAMETER, 业务最深资产层), all discovered
+        assert tree.max_depth_reached() == 7
+        assert tree.is_skeleton_complete() is True
+        report = tree.skeleton_report()
+        assert report["complete"] is True
+        assert report["max_depth_reached"] == 7
+        assert report["max_depth_cap"] == 8  # 业务硬上限保留
+        assert report["find_termination_depth"] == 7
+        assert report["completion_pct"] == 1.0
+        assert report["unseen_total"] == 0
+
+    def test_complete_l7_with_inj_also_ok(self) -> None:
+        """v5.2: L8 INJECTION_VECTOR 节点存在时, is_skeleton_complete 仍 True
+        (find 不写 L8, 但允许 hack-deep attack phase 写入预留)."""
         tree = AssetTree("example.com")
         tree.update_state(tree.root_id, AssetState.DISCOVERED)
         sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
@@ -124,13 +166,37 @@ class TestAssetTreeCompleteHardGate:
             metadata={"category": "sqli"},
         )
         tree.update_state(inj, AssetState.DISCOVERED)
-        # max_depth=8, all discovered
-        assert tree.max_depth_reached() == 8
-        assert tree.is_skeleton_complete() is True
+        assert tree.max_depth_reached() == 8  # INJ 在 path_depth=8
+        assert tree.is_skeleton_complete() is True  # 仍 True (L8 是允许的)
         report = tree.skeleton_report()
         assert report["complete"] is True
-        assert report["completion_pct"] == 1.0
-        assert report["unseen_total"] == 0
+        assert report["completion_pct"] == 1.0  # clamp 到 1.0
+
+    def test_l6_only_tree_not_complete(self) -> None:
+        """v5.2: max_depth=6 (ENDPOINT) 仍不够, find 终止需要 L7。"""
+        tree = AssetTree("example.com")
+        tree.update_state(tree.root_id, AssetState.DISCOVERED)
+        sub = tree.add_node(AssetType.SUB_DOMAIN, "api.example.com", parent_id=tree.root_id)
+        tree.update_state(sub, AssetState.DISCOVERED)
+        ip = tree.add_node(AssetType.IP, "1.1.1.1", parent_id=sub)
+        tree.update_state(ip, AssetState.DISCOVERED)
+        port = tree.add_node(AssetType.PORT, "443", parent_id=ip, allow_unverified=True)
+        tree.update_state(port, AssetState.DISCOVERED)
+        svc = tree.add_node(
+            AssetType.SERVICE, "HTTPS/NGINX", parent_id=port, allow_unverified=True,
+        )
+        tree.update_state(svc, AssetState.DISCOVERED)
+        url = tree.add_node(
+            AssetType.URL, "https://api.example.com", parent_id=svc, allow_unverified=True,
+        )
+        tree.update_state(url, AssetState.DISCOVERED)
+        ep = tree.add_node(
+            AssetType.ENDPOINT, "GET /v1/users/:id", parent_id=url, allow_unverified=True,
+        )
+        tree.update_state(ep, AssetState.DISCOVERED)
+        # max_depth=6 (ENDPOINT, path_depth=6), < FIND_TERMINATION_DEPTH=7
+        assert tree.max_depth_reached() == 6
+        assert tree.is_skeleton_complete() is False  # 缺 W1.5c (PARAMETER)
 
 
 # ─── 3. 工具层: 模拟 LLM 调 asset_tree_complete ─────────────────
@@ -163,11 +229,13 @@ class TestCompleteToolIntegration:
             asyncio.run(tools_tree.asset_tree_complete("t-l3"))
         err = exc_info.value
         assert err.tree_id == "t-l3"
-        assert err.max_depth_reached < 8
+        assert err.max_depth_reached < 7  # v5.2: find 终止深度 = L7
+        assert err.max_depth_required == 7  # v5.2: required = FIND_TERMINATION_DEPTH
         assert "DO NOT emit find-complete-v1" in str(err)
         assert "F-resume" in str(err)
-        # missing_waves 应包含 W1.5 / W1.5c / W2.5 / W3.5
+        # missing_waves 应包含 W1.5 / W1.5c / W3.5 (W2.5 不在 find 责任)
         assert any("W1.5" in w for w in err.missing_waves)
+        assert not any("W2.5" in w for w in err.missing_waves)  # v5.2: W2.5 移除
 
     def test_complete_force_bypasses_gate(self, tmp_path, monkeypatch) -> None:
         import asyncio

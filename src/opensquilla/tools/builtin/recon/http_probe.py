@@ -569,11 +569,34 @@ async def recon_url_validate_batch(
         urls_path = f.name
 
     jsonl_path = urls_path + ".jsonl"
+    # v4.6.1 (2026-06-18) httpx v1.x 兼容性修复:
+    #   httpx v0.x: 并发标志是 ``-c`` (concurrency).
+    #   httpx v1.x: 改名为 ``-t`` (threads, 默认 50). 用错标志 httpx rc=2
+    #               + stderr "flag provided but not defined: -c", 但 stdout
+    #               空, 触发 _parse_httpx_jsonl 返回 [], 进而 no_response.
+    #   修复: 优先用 ``-t``; 如果 httpx 是 v0.x (--version < 1.0.0) 才用 ``-c``.
+    #   这里采用保守做法: 探测一次 ``-t`` 标志支持, 不支持则 fallback ``-c``.
+    import shutil as _shutil
+    _httpx_path = bp.path
+    _use_threads_flag = True  # httpx v1.x 默认
+    if _httpx_path:
+        _v = _shutil.which(_httpx_path)
+        # 简单判别: 跑 `httpx -h` 看是否出现 "-t, -threads"
+        try:
+            _help_proc = __import__("subprocess").run(
+                [_httpx_path, "-h"], capture_output=True, text=True, timeout=5,
+            )
+            if "-t, -threads" not in _help_proc.stdout:
+                _use_threads_flag = False
+        except Exception:
+            _use_threads_flag = False
+    _concurrency_flag = "-t" if _use_threads_flag else "-c"
+
     argv = [
         bp.path, "-l", urls_path,
         "-json", "-o", jsonl_path,
         "-timeout", str(timeout_s),
-        "-c", str(max_concurrency),
+        _concurrency_flag, str(max_concurrency),
         "-silent",
         "-no-stdin",
         "-fr",  # follow redirects; final URL recorded in json
@@ -606,6 +629,32 @@ async def recon_url_validate_batch(
             os.unlink(urls_path)
         except OSError:
             pass
+
+    # v4.6.1 (2026-06-18) 不静默吞 rc != 0: httpx 标志错误 (例如 httpx v1.x
+    # 用了已废弃的 ``-c`` 标志) 会返回 rc=2, stdout 空. 以前直接走到下面
+    # _parse_httpx_jsonl, 解析成空 records, 全部 URL 标 no_response — 这就
+    # 是用户看到"httpx 二进制有连接问题"但实际是标志错误的根因.
+    if rc != 0:
+        # 把 stderr 前 200 字符带上方便 LLM 调试
+        stderr_head = (stderr or "").strip()[:200]
+        from opensquilla.tools.builtin.recon.http_probe import recon_url_validate
+        results = []
+        for u in urls:
+            try:
+                r = json.loads(await recon_url_validate(u, method="GET", timeout_s=float(timeout_s)))
+            except Exception as inner:  # noqa: BLE001
+                r = {"url": u, "verified": False, "reason": f"stdlib_error: {inner}",
+                     "probe": {}, "verified_at": None}
+            results.append(r)
+        return json.dumps({
+            "source": "stdlib",
+            "binary_path": bp.path,
+            "binary_version": bp.version,
+            "binary_error": f"rc={rc}: {stderr_head}",
+            "verified_count": sum(1 for r in results if r.get("verified")),
+            "rejected_count": sum(1 for r in results if not r.get("verified")),
+            "results": results,
+        }, ensure_ascii=False)
 
     # Parse httpx JSONL output
     results: list[dict[str, Any]] = []

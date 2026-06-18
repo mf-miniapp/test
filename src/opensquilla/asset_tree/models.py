@@ -291,34 +291,79 @@ class AssetPath(BaseModel):
 # PARAMETER → INJECTION_VECTOR`` 推导得出, 是"业务模型"与"编排器波次系统"
 # 共用的硬约束。
 #
-# 深度编号约定 (与 AssetPath.depth() 一致):
+# 深度编号约定 (与 AssetPath.depth() 一致, L = path_depth):
 #   L0  ROOT_DOMAIN
 #   L1  SUB_DOMAIN
 #   L2  IP / STORAGE
 #   L3  PORT / SERVICE / STORAGE_OBJECT
 #   L4  URL / COMPONENT
 #   L5  ENDPOINT / AUTH_SURFACE / STATIC_ASSET / API_SCHEMA / COOKIE / HEADER
-#   L6  PARAMETER
-#   L7  INJECTION_VECTOR   (常规最深叶节点)
+#   L6  (跳过 — 当前主链未占用, 预留)
+#   L7  PARAMETER       (业务最深资产层, find 终止契约目标)
+#   L8  INJECTION_VECTOR (漏洞向量层, find 不写)
 #
 # 跨层挂载 ``SECRET`` / 兜底 ``GENERIC`` 不计入主链深度 (它们允许挂在
 # 8 类父节点白名单下, 自身是叶节点)。
 #
 # ``MAX_TREE_DEPTH = 8`` 是 v5 新增常量, 含义 = **路径深度上限**
-# (节点 path_depth ∈ [0, 8])。8 层深度 = 8 跳边 = 9 节点层:
+# (节点 path_depth ∈ [0, 8], 9 节点层)。实际最长链 (path_depth 0..7):
 # ROOT(L0) → SUB(L1) → IP(L2) → PORT(L3) → SERVICE(L4) → URL(L5) →
-# ENDPOINT(L6) → PARAMETER(L7) → INJECTION_VECTOR(L8)。任何 ``add_node``
-# 触发 ``validate_depth()`` 失败都会 raise ``DepthExceededError``。
+# ENDPOINT(L6) → PARAMETER(L7), 共 8 节点层 = 8 层资产深度。
+# INJECTION_VECTOR (L8, path_depth=8) 由 hack-deep 在 attack phase
+# 写入, 受 MAX_TREE_DEPTH=8 上限保护。任何 ``add_node`` 触发
+# ``validate_depth()`` 失败都会 raise ``DepthExceededError``。
 MAX_TREE_DEPTH: int = 8
 
 
+# v5.2 (2026-06-18) ``FIND_TERMINATION_DEPTH`` — hack-deep-find 终止深度。
+#
+# 业务硬上限仍为 ``MAX_TREE_DEPTH = 8`` (path_depth ∈ [0, 8], 9 节点层),
+# 保留作为模型合法性的天花板, 允许 INJECTION_VECTOR (path_depth=8) 这类漏洞
+# 节点在 attack phase 阶段由 hack-deep 写入树中。
+#
+# 但 hack-deep-find 的 find-complete-v1 emit 契约锚定在 L7 PARAMETER
+# (path_depth=7) — 即整棵资产树最深的"业务资产层"。从 L0 (ROOT_DOMAIN)
+# 到 L7 (PARAMETER) 一共 8 节点层 / 7 跳边, 这就是用户口中的"8 层深度"
+# 资产树, 是 find 唯一负责构建的范围。
+#
+# INJECTION_VECTOR (path_depth=8) 节点**允许出现在树中** (作为后续
+# attack-phase 写入的预留位置, 仍受 MAX_TREE_DEPTH=8 约束), 但 find 不
+# 负责产生它, 也不要求 is_skeleton_complete() 为 True 时它必须存在。
+# ``is_skeleton_complete()`` 现以 ``max_depth_reached() >=
+# FIND_TERMINATION_DEPTH`` 为终止条件。
+#
+# 关联职责划分 (v5.2):
+#   L0..L7  = 资产 (find 全权负责: discovery + verification + tree persist)
+#   L8      = 漏洞向量 (hack-deep 在 attack phase 写入, find 不触碰)
+#
+# depth 编号速查 (与 AssetPath.depth() / 实际代码验证 一致):
+#   L0  ROOT_DOMAIN          (path_depth=0)
+#   L1  SUB_DOMAIN           (path_depth=1)
+#   L2  IP / STORAGE         (path_depth=2)
+#   L3  PORT / SERVICE / SO  (path_depth=3)
+#   L4  URL / COMPONENT      (path_depth=4)
+#   L5  ENDPOINT / AUTH...   (path_depth=5)
+#   L6  (此项保留, 当前主链未占用)
+#   L7  PARAMETER            (path_depth=7, 业务最深资产层, find 终止)
+#   L8  INJECTION_VECTOR     (path_depth=8, 漏洞向量层, find 不写)
+#
+# 因此"8 层深度"资产树 = path_depth 上限 7 = 8 节点层 (L0..L7)。
+FIND_TERMINATION_DEPTH: int = 7
+
+
 class IncompleteSkeletonError(RuntimeError):
-    """v5 (2026-06-18) 8 层骨架未完整时阻断 find-complete-v1 emit。
+    """v5.2 (2026-06-18) find 终止骨架未完整时阻断 find-complete-v1 emit。
 
     ``asset_tree_complete`` 工具在 ``is_skeleton_complete() == False`` 时
     raise 此异常, 强制编排器先跑 F-resume 补全缺失 wave。LLM 收到此异常
     必须调用 ``asset_tree_plan_pending(tree_id)`` 拿 pending plan, 然后
-    跑缺失的 F1.5 / F1.5c / F2.5 / F3.5 wave, 直到 complete=True。
+    跑缺失的 F1.5 / F1.5c / F3.5 wave, 直到 complete=True。
+
+    v5.2 重大变更: find 终止深度从 L8 INJECTION_VECTOR 改为 L7 PARAMETER
+    (path_depth=7), 因为 L8 是漏洞向量节点, 不属于资产探测范畴。L8
+    节点仍可由 hack-deep 在 attack phase 写入 (受 MAX_TREE_DEPTH=8
+    业务硬上限保护), 但 find 不要求也不负责。详细职责划分见本模块
+    顶部的 ``FIND_TERMINATION_DEPTH`` 注释。
 
     不允许: 改 force=True 强行跳过 (除非真的紧急, e.g. 用户手动中断);
     不允许: 发假的 find-complete-v1 evidence 声称 complete。
@@ -329,7 +374,7 @@ class IncompleteSkeletonError(RuntimeError):
         *,
         tree_id: str,
         max_depth_reached: int,
-        max_depth_required: int = MAX_TREE_DEPTH,
+        max_depth_required: int = FIND_TERMINATION_DEPTH,
         unseen_total: int,
         completion_pct: float,
         missing_waves: list[str] | None = None,
@@ -342,7 +387,7 @@ class IncompleteSkeletonError(RuntimeError):
         self.missing_waves = missing_waves or []
         waves_str = ", ".join(self.missing_waves) if self.missing_waves else "<unknown>"
         super().__init__(
-            f"[tree_id={tree_id}] 8-layer skeleton INCOMPLETE: "
+            f"[tree_id={tree_id}] find-skeleton INCOMPLETE: "
             f"max_depth_reached={max_depth_reached} "
             f"(need {max_depth_required}), "
             f"unseen_total={unseen_total} (need 0), "

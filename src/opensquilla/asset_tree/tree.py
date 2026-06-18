@@ -28,6 +28,7 @@ from opensquilla.asset_tree.models import (
     AssetPath,
     AssetState,
     AssetType,
+    FIND_TERMINATION_DEPTH,
     MAX_TREE_DEPTH,
     DepthExceededError,
     validate_depth,
@@ -689,11 +690,16 @@ class AssetTree:
         with self._lock:
             return self._compute_depth_locked(node_id)
 
-    # ── v5 (2026-06-18) 8 层骨架核查 ──────────────────────
+    # ── v5.2 (2026-06-18) find 终止骨架核查 ──────────────────────
     #
-    # hack-deep-find 结束标记: 资产树 8 层骨架完整建好。
-    # 业务硬约束 = 树上有节点触及 L8 (path_depth == MAX_TREE_DEPTH)
-    #              且没有任何 UNSEEN 节点 (即每个非根节点都被探过)。
+    # hack-deep-find 结束标记: 资产树 find-skeleton 完整建好。
+    # 业务硬约束 = 树上有节点触及 L7 PARAMETER (path_depth >=
+    #              FIND_TERMINATION_DEPTH) 且没有任何 UNSEEN 节点
+    #              (即每个非根节点都被探过)。
+    #
+    # v5.2 重大变更: 终止深度从 L8 (INJECTION_VECTOR, 漏洞节点) 改为
+    # L7 (PARAMETER, 业务最深资产层)。L8 节点允许出现在树中
+    # (作为 attack-phase 写入的预留位置), 但 find 不要求也不负责。
     #
     # 这些 API 是公开的、可被编排器 / 工具 / tree-finalizer 读取。
 
@@ -717,25 +723,39 @@ class AssetTree:
         return max(layers.keys()) if layers else 0
 
     def skeleton_completion_pct(self) -> float:
-        """8 层骨架完成度 (0.0 ~ 1.0)。
+        """find-skeleton 完成度 (0.0 ~ 1.0)。
 
-        公式: ``max_depth_reached / MAX_TREE_DEPTH``。
-        例: max_depth=4, MAX_TREE_DEPTH=8 → 0.5。
-        例: max_depth=8, MAX_TREE_DEPTH=8 → 1.0 (完成)。
+        公式: ``min(max_depth_reached, FIND_TERMINATION_DEPTH) /
+        FIND_TERMINATION_DEPTH``。
+        例: max_depth=3 → 0.43 (3 / FIND_TERMINATION_DEPTH=7)。
+        例: max_depth=7 → 1.0 (完成 — find 终止, L7 PARAMETER)。
+        例: max_depth=8 → 仍是 1.0 (clamp, L8 INJ 是 attack-phase)。
+
+        注: max_depth > FIND_TERMINATION_DEPTH 不额外加分 (上限 = 1.0),
+        因为 L8 节点是 attack-phase 的产物, 不在 find 责任范围。
         """
-        return self.max_depth_reached() / MAX_TREE_DEPTH
+        d = self.max_depth_reached()
+        if d >= FIND_TERMINATION_DEPTH:
+            return 1.0
+        return d / FIND_TERMINATION_DEPTH
 
     def is_skeleton_complete(self) -> bool:
-        """8 层骨架是否完整建好。
+        """find-skeleton 是否完整建好 (hack-deep-find 终止契约, v5.2)。
 
-        条件 (v5 hack-deep-find 终止契约):
-          (1) ``max_depth_reached() == MAX_TREE_DEPTH`` (树触及 L8)
+        条件:
+          (1) ``max_depth_reached() >= FIND_TERMINATION_DEPTH`` (树触及 L7)
           (2) 没有任何 UNSEEN 节点 (所有节点都被探过)
         注: ABANDONED 节点**不**算阻塞 — 软删节点合法, F-resume
         可选择 retry 或继续。
+
+        v5.2 变更: 第 (1) 条从 ``== MAX_TREE_DEPTH=8`` 改为
+        ``>= FIND_TERMINATION_DEPTH=7``。这反映 find 只负责资产层
+        (L0..L7), 漏洞向量层 (L8) 由 hack-deep 后续 attack phase
+        写入。max_depth > 7 同样算完成 (L8 已存在是允许的,
+        is_skeleton_complete 仍为 True)。
         """
         with self._lock:
-            if self.max_depth_reached() < MAX_TREE_DEPTH:
+            if self.max_depth_reached() < FIND_TERMINATION_DEPTH:
                 return False
             for n in self._nodes.values():
                 if n.state == AssetState.UNSEEN:
@@ -749,8 +769,9 @@ class AssetTree:
             dict 含:
               - ``complete``: bool, is_skeleton_complete()
               - ``max_depth_reached``: int
-              - ``max_depth_cap``: int (= MAX_TREE_DEPTH)
-              - ``completion_pct``: float (0.0..1.0)
+              - ``max_depth_cap``: int (= MAX_TREE_DEPTH, 业务硬上限)
+              - ``find_termination_depth``: int (= FIND_TERMINATION_DEPTH, v5.2 新增)
+              - ``completion_pct``: float (0.0..1.0, 基于 find_termination_depth)
               - ``nodes_per_layer``: {depth: count}
               - ``unseen_total``: int
               - ``unseen_by_type``: {asset_type: count}
@@ -778,6 +799,7 @@ class AssetTree:
                 "complete": self.is_skeleton_complete(),
                 "max_depth_reached": max_d,
                 "max_depth_cap": MAX_TREE_DEPTH,
+                "find_termination_depth": FIND_TERMINATION_DEPTH,
                 "completion_pct": self.skeleton_completion_pct(),
                 "nodes_per_layer": nodes_per_layer,
                 "unseen_total": unseen_total,

@@ -17,7 +17,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from opensquilla.asset_tree.models import AssetState, AssetType, MAX_TREE_DEPTH
+from opensquilla.asset_tree.models import (
+    AssetState,
+    AssetType,
+    FIND_TERMINATION_DEPTH,
+    MAX_TREE_DEPTH,
+)
 from opensquilla.asset_tree.tree import AssetTree
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import ToolError
@@ -259,10 +264,15 @@ def _validate_asset_type(asset_type_str: str) -> AssetType:
 
 
 def _detect_missing_waves(tree) -> list[str]:
-    """v5 (2026-06-18) 推断还没跑的 wave 列表。
+    """v5.2 (2026-06-18) 推断 find 还没跑的 wave 列表 (hack-deep-find 责任范围)。
 
-    根据 (AssetType, state) 分布与 plan_pending 不直接对齐, 这里走
-    启发式: 看每层是否还有 UNSEEN / 未达到 max_depth。
+    v5.2 重大变更: W2.5 (per-port attack plan) **不在 find 责任范围** —
+    它由 hack-deep 在 find 终止后, attack phase 中执行。find 不产
+    INJECTION_VECTOR 节点 (L7/L8 是漏洞向量, 不是资产)。因此
+    ``_detect_missing_waves`` 不再建议 W2.5。
+
+    find 责任范围: W0.5 / W1 / W1.5 / W1.5c / W3.5。
+    启发式: 看每层是否还有 UNSEEN / 未达到 FIND_TERMINATION_DEPTH (L7)。
     """
     missing: list[str] = []
     max_d = tree.max_depth_reached()
@@ -270,10 +280,11 @@ def _detect_missing_waves(tree) -> list[str]:
     # max_d >= 3 表示已有 SERVICE, 需要派生 URL
     if max_d >= 3:
         # 已有 SERVICE/URL, 检查 L4+ 是否还有 UNSEEN
+        # 注意: 不再把 injection_vector 算进"find 缺漏", 它不在 find 责任范围
         unseen_url = sum(
             1 for n in tree._nodes.values()
             if n.asset_type.value in (
-                "endpoint", "parameter", "injection_vector",
+                "endpoint", "parameter",
                 "static_asset", "auth_surface", "cookie",
                 "header", "api_schema",
             )
@@ -284,9 +295,7 @@ def _detect_missing_waves(tree) -> list[str]:
             if max_d < 5:
                 missing.append("W1.5")  # URL / endpoint 派生
             if max_d < 6:
-                missing.append("W1.5c")  # parameter
-            if max_d < 8:
-                missing.append("W2.5")  # injection_vector
+                missing.append("W1.5c")  # parameter (L6 资产最深)
             missing.append("W3.5")  # STATIC_ASSET / COOKIE / HEADER
     # L3 UNSEEN
     unseen_l3 = sum(
@@ -1205,16 +1214,19 @@ async def asset_tree_dispatch_plan(
     description=(
         "Mark the find run as complete. Touches the on-disk file (no "
         "structural change), returns the absolute path to the persisted "
-        "tree JSON. Phase 3 will pass this path to `sessions_spawn` as "
-        "an artifact for the handoff to hack-deep.\n\n"
-        "v5 (2026-06-18) HARD GATE: this tool enforces the 8-layer "
-        "skeleton termination contract. If ``is_skeleton_complete()`` "
-        "returns false (i.e. tree has not reached path_depth=8 or has "
+        "tree JSON. The handoff to the next phase is handled by the "
+        "caller (orchestrator / cron / main agent) after this tool returns.\n\n"
+        "v5.2 (2026-06-18) HARD GATE: this tool enforces the find-skeleton "
+        "termination contract. If ``is_skeleton_complete()`` returns false "
+        "(i.e. tree has not reached path_depth>=7 / L7 PARAMETER or has "
         "UNSEEN nodes), the call raises ``IncompleteSkeletonError`` and "
         "returns a diagnostic report showing what is missing. To bypass "
-        "(emergency only), pass ``force=True``. v5 closes the bug where "
-        "find-complete-v1 was emitted after only F0/F1 (L0..L3) without "
-        "ever running F1.5/F1.5c/F2.5/F3.5 (L4+).\n\n"
+        "(emergency only), pass ``force=True``.\n\n"
+        "v5.2 重大变更: find 终止深度从 L8 INJECTION_VECTOR 改为 L7 "
+        "PARAMETER (path_depth=7, 业务最深资产层). L8 节点属于漏洞向量, "
+        "由 hack-deep 在 attack phase 写入, find 不再要求也不负责.\n\n"
+        "v5.1 修过的 bug: find-complete-v1 之前可能在只跑 F0/F1 (L0..L3) 时 "
+        "就 emit, 8 层骨架根本没建. 本 HARD GATE 解决此问题.\n\n"
         "v4.6 (2026-06-18): a time-stamped snapshot copy is written to "
         "``~/.opensquilla/state/asset_trees/.snapshots/<tree_id>--<ts>.json`` "
         "(separate from the live canonical tree) so the web UI's "
@@ -1227,7 +1239,7 @@ async def asset_tree_dispatch_plan(
         "force": {
             "type": "boolean",
             "description": (
-                "Bypass the 8-layer skeleton hard gate. Default False. "
+                "Bypass the find-skeleton hard gate. Default False. "
                 "Emergency-only — do not use in normal find runs. Setting "
                 "force=True emits a warning to the response."
             ),
@@ -1244,21 +1256,26 @@ async def asset_tree_complete(tree_id: str, force: bool = False) -> str:
     via `opensquilla cron add --every ...`) produces a distinct
     snapshot that can be diffed via ``recon_diff_snapshots``.
 
-    v5 (2026-06-18) HARD GATE: refuses to complete when skeleton is not
-    complete. Returns a diagnostic report and raises
+    v5.2 (2026-06-18) HARD GATE: refuses to complete when find-skeleton
+    is not complete. Returns a diagnostic report and raises
     ``IncompleteSkeletonError`` so the orchestrator can re-run F-resume.
+    Termination depth is L6 (PARAMETER), not L8.
     """
     tree = _load_tree(tree_id)
-    # v5 HARD GATE: refuse to mark complete if 8-layer skeleton is not built.
+    # v5.2 HARD GATE: refuse to mark complete if find-skeleton is not built.
+    # find 终止契约: max_depth >= FIND_TERMINATION_DEPTH (L6 PARAMETER)
+    # AND no UNSEEN nodes. ABANDONED nodes don't block (软删合法).
     if not force and not tree.is_skeleton_complete():
         report = tree.skeleton_report()
-        # 用专门的 IncompleteSkeletonError (v5), 让编排器可以精确捕获
+        # 用专门的 IncompleteSkeletonError (v5.2), 让编排器可以精确捕获
         # 并触发 F-resume, 而不是被通用 ToolError 吞掉。
+        # max_depth_required 用 find_termination_depth (L6) — 反映 find
+        # 终止契约; max_depth_cap (L8) 仍在 report 里给出, 仅作参考。
         from opensquilla.asset_tree.models import IncompleteSkeletonError as _ISE
         raise _ISE(
             tree_id=tree_id,
             max_depth_reached=report["max_depth_reached"],
-            max_depth_required=report["max_depth_cap"],
+            max_depth_required=report["find_termination_depth"],
             unseen_total=report["unseen_total"],
             completion_pct=report["completion_pct"],
             missing_waves=_detect_missing_waves(tree),

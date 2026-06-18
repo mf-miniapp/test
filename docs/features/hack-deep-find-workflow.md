@@ -1,7 +1,9 @@
-# hack-deep-find 工作流设计 (v5, 2026-06-18)
+# hack-deep-find 工作流设计 (v5.2, 2026-06-18)
 
 > **目标**: 编排器 (`agents/hack-deep-find`) 从一个 root_domain 出发, 按
-> **8 层资产树** 完整建出 资产清单; 终止条件 = 8 层骨架 (L0..L8) 全部建好。
+> **8 层资产树** (L0..L7) 完整建出 资产清单; 终止条件 = find-skeleton 完整
+> (L7 PARAMETER 触及 + 没有任何 UNSEEN)。L8 INJECTION_VECTOR 不要求存在
+> (属于漏洞向量层, 由 hack-deep attack phase 写入)。
 >
 > **核心策略** (硬约束, 与 `attack_dispatch.waves.DISCOVERY_STRATEGY_MAP` 同步):
 > - **L0..L3** (root → sub → ip → port/service) → **bulk_layer**: 一次取全层
@@ -11,7 +13,7 @@
 >   按 parent chain 分组, **每条 chain 1 个 specialist 深度下钻**。避免
 >   1 个 service 出 1000+ endpoint 时 specialist context 爆掉。
 >
-> **8 层映射** (L0 = ROOT):
+> **8 层资产映射** (L0 = ROOT, 业务资产层, v5.2 修正):
 > ```
 > L0  ROOT_DOMAIN          ─┐
 > L1  SUB_DOMAIN            │  bulk_layer
@@ -20,14 +22,18 @@
 >     STORAGE_OBJECT        ─┘
 > L4  URL / COMPONENT       ─┐
 > L5  ENDPOINT /            │
->     AUTH_SURFACE /        │
->     STATIC_ASSET /        │  chain_fanout
->     API_SCHEMA /          │  (W1.5 / W1.5c /
->     COOKIE / HEADER       │   W2.5 / W3.5)
+>     AUTH_SURFACE /        │  chain_fanout
+>     STATIC_ASSET /        │  (W1.5 / W1.5c /
+>     API_SCHEMA /          │   W3.5)
+>     COOKIE / HEADER       │
 > L6  PARAMETER             │
-> L7  (空跳, 业务无)        │
-> L8  INJECTION_VECTOR      ─┘
+> L7  (业务最深层)         ─┘  ← find 终止契约目标
+> ---
+> L8  INJECTION_VECTOR      (漏洞向量层, 不在 find 责任范围)
 > ```
+> **重要**: 旧版 (v5) 把 L6 标为 PARAMETER, L7 为"空跳", L8 为 INJ;
+> v5.2 核对实际代码: PARAMETER 在 path_depth=7 (L7), L6 主链未占用.
+> find 终止契约 = max_depth >= 7 = 触及 L7 PARAMETER.
 >
 > 跨层挂载 (不占主链 depth): `SECRET`, `GENERIC` 兜底。
 
@@ -58,7 +64,7 @@ class FindRunState:
 
 ---
 
-## 1. 7 阶段架构 (与 7 wave 严格对应)
+## 1. 6 阶段架构 (与 6 wave 严格对应, v5.2: W2.5 不在 find 责任范围)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -67,7 +73,7 @@ class FindRunState:
 │ F1   (W1)   bulk_layer  ──── port + service (网络层, 全部一起逐层)       │
 │ F1.5 (W1.5) chain_fanout ─── per-chain web app / component / storage     │
 │ F1.5c(W1.5c) chain_fanout ── per-chain 条件 expand scan                  │
-│ F2.5 (W2.5) chain_fanout ─── per-chain injection_vector (跨 owner dispatch)│
+│ ~~F2.5 (W2.5)~~        ─── ~~per-chain injection_vector (跨 owner)~~   │
 │ F3.5 (W3.5) chain_fanout ─── per-chain secret / cookie / header 跨层信号 │
 └──────────────────────────────────────────────────────────────────────────┘
                           │
@@ -78,10 +84,10 @@ class FindRunState:
                  F-final (tree-finalizer 完整性核查 + URL 存活复核)
                           │
                           ▼
-                 find-complete-v1 (handoff to hack-deep)
+                 find-complete-v1 (find 自身终止, 不再 handoff hack-deep)
                           │
                           ▼
-              8 层骨架 complete == true 才允许发
+              find-skeleton complete == true 才允许发 (L7 PARAMETER)
 ```
 
 ---
@@ -244,50 +250,6 @@ class FindRunState:
 
 ---
 
-## 7. F2.5 (W2.5) — per-chain injection_vector (跨 owner dispatch)
-
-**策略**: `chain_fanout`
-
-**W2.5 特殊性**: W2.5 标 `owner_agent="hack-deep-find"`, 但实际
-`vulnerability-triage` specialist 在 hack-deep 的 allow_agents。
-**find 编排器只派发"dispatch plan"**, 不直接 spawn specialist。
-
-### 子 agent 矩阵
-
-| specialist_id | 父节点 | 输出节点 | 工具组 | chain 入口 |
-|---|---|---|---|---|
-| `vulnerability-triage` (跨 owner) | ENDPOINT | INJECTION_VECTOR | 实际由 hack-deep spawn | endpoint.id |
-
-### 编排器行为 (跨 owner)
-
-```
-1. wave = WAVES["W2.5"]  # owner_agent="hack-deep-find", 但 spawn 归 hack-deep
-2. strategy = "chain_fanout"
-3. endpoint_chains = asset_tree_find_unseen_chain(
-     asset_type="endpoint", min_depth=6
-   )
-4. **W2.5 不 spawn specialist**; 而是生成 dispatch plan:
-   sub_tracks = [
-     {track_id, ports: ["ip:port", ...], vector_class: "http_sqli", eta_s: 60}
-     for chain in endpoint_chains
-   ]
-5. 调 sessions_spawn(agent_id="hack-deep" via cross-owner envelope,
-                     task=w2.5-dispatch-v1 envelope)
-6. ingest W2.5 dispatch evidence (verify sub_tracks 计数)
-7. 输出 [W2.5 DISPATCHED] sub_tracks={N} -> hack-deep
-8. hack-deep 跑完, 回调 dispatch results -> find 写入 INJ 节点
-```
-
-### 输出: L8 (INJECTION_VECTOR)
-
-### 跨 owner dispatch 协议 (v2)
-
-- find 编排器**只**规划 (`w2.5-dispatch-v1` evidence)
-- hack-deep **实际**调 `sessions_spawn(vulnerability-triage, ...)`
-- dispatch envelope 嵌入 `find-complete-v1` 的 `artifacts.w2_5_dispatch`
-
----
-
 ## 8. F3.5 (W3.5) — per-chain secret / cookie / header 跨层信号
 
 **策略**: `chain_fanout`
@@ -333,14 +295,15 @@ class FindRunState:
 
 **调用**: `asset_tree_check_skeleton(tree_id)` 工具
 
-**返回**:
+**返回** (v5.2 加 `find_termination_depth` 字段, `max_depth_reached` 改 7):
 ```json
 {
   "complete": true,
-  "max_depth_reached": 8,
+  "max_depth_reached": 7,
   "max_depth_cap": 8,
+  "find_termination_depth": 7,
   "completion_pct": 1.0,
-  "nodes_per_layer": {"0": 1, "1": 12, "2": 18, "3": 47, "4": 21, "5": 64, "6": 132, "7": 0, "8": 3},
+  "nodes_per_layer": {"0": 1, "1": 12, "2": 18, "3": 47, "4": 21, "5": 64, "6": 132, "7": 18},
   "unseen_total": 0,
   "unseen_by_type": {},
   "unseen_by_layer": {},
@@ -363,7 +326,7 @@ class FindRunState:
 
 **关键步骤** (新增 step 0):
 ```
-0. **8 层骨架核查** (v5 新增):
+0. **find-skeleton 核查** (v5.2 改名: 不是 8 层, 是 L7 PARAMETER):
    skeleton = asset_tree_check_skeleton(tree_id)
    if not skeleton["complete"]:
      raise IncompleteSkeletonError  # 回到 F-final-pre 重跑
@@ -376,7 +339,7 @@ verified 比例、URL 存活复核、evidence 完整性、coverage_gaps。
 
 ## 11. F-complete (find-complete-v1 handoff)
 
-**evidence 字段** (v5 强化):
+**evidence 字段** (v5.2 强化):
 ```json
 {
   "evidence_schema": "find-complete-v1",
@@ -389,22 +352,31 @@ verified 比例、URL 存活复核、evidence 完整性、coverage_gaps。
   "specialists_invoked": ["domain-expander", "port-scanner", ...],
 
   "skeleton_complete": true,
-  "skeleton_max_depth_reached": 8,
+  "skeleton_max_depth_reached": 7,
   "skeleton_completion_pct": 1.0,
-  "skeleton_nodes_per_layer": {"0": 1, "1": 12, ..., "8": 3},
+  "skeleton_nodes_per_layer": {"0": 1, "1": 12, ..., "7": 18},
   "skeleton_unseen_total": 0,
+  "find_termination_depth": 7,
   "discovery_strategy_applied": {
     "W0.5": "bulk_layer", "W0.6": "bulk_layer", "W1": "bulk_layer",
     "W1.5": "chain_fanout", "W1.5c": "chain_fanout",
-    "W2.5": "chain_fanout", "W3.5": "chain_fanout"
+    "W3.5": "chain_fanout"
   }
 }
 ```
 
-**与 hack-deep 的契约**:
-- `skeleton_complete=true` + `specialists_invoked != []` → hack-deep 接受
-- `skeleton_complete=false` → hack-deep 应返回 `find_incomplete` 错误
+**v5.2 重大变更**: find 自身**不**再委派 hack-deep. find-complete-v1
+写到本地磁盘后, find 自身终止.
+
+**与上层 orchestrator 的契约**:
+- `skeleton_complete=true` + `specialists_invoked != []` → 上层 orchestrator
+  可以启动 hack-deep
+- `skeleton_complete=false` → 编排器自己补全 (F-resume), 不允许推给 hack-deep
 - `skeleton_unseen_total > 0` → 编排器自己补全后再发 (不允许推给 hack-deep)
+
+**与 hack-deep 的契约 (历史, v2 之前)**:
+- ~~`skeleton_complete=true` + `specialists_invoked != []` → hack-deep 接受~~
+- ~~`skeleton_complete=false` → hack-deep 应返回 `find_incomplete` 错误~~
 
 ---
 
@@ -413,8 +385,8 @@ verified 比例、URL 存活复核、evidence 完整性、coverage_gaps。
 | 工具 | 用途 | 何时调 |
 |---|---|---|
 | `asset_tree_find_unseen` (bulk) | L0..L3 全层取 UNSEEN | F0 / F1 (bulk_layer wave) |
-| `asset_tree_find_unseen_chain` | L4+ 按 parent chain 取 | F1.5 / F1.5c / F2.5 / F3.5 (chain_fanout wave) |
-| `asset_tree_check_skeleton` | 8 层骨架完成度报告 | F-final-pre 必调 |
+| `asset_tree_find_unseen_chain` | L4+ 按 parent chain 取 | F1.5 / F1.5c / F3.5 (chain_fanout wave; F2.5 不在 find 范围) |
+| `asset_tree_check_skeleton` | find-skeleton 完成度报告 (L7 + 无 UNSEEN) | F-final-pre 必调 |
 | `asset_tree_add_nodes` | 入树 (含 verification) | 每个 specialist 跑完 ingest |
 | `asset_tree_plan_pending` | 待跑 wave 计划 | F-resume 触发时调 |
 
@@ -450,15 +422,18 @@ verified 比例、URL 存活复核、evidence 完整性、coverage_gaps。
 
 ## 15. v5 与既有版本对比
 
-| 项 | v4 (2026-06-17) | v5 (2026-06-18) |
-|---|---|---|
-| 深度上限 | 无硬约束 | `MAX_TREE_DEPTH=8` (8 跳边, 9 节点层) |
-| 父子校验 | `_VALID_PARENT_CHILD` (白名单) | 同 + DB CHECK 兜底 |
-| 编排策略 | 隐式 (每 wave 自由选) | **显式 bulk_layer / chain_fanout** |
-| 终止条件 | `find_unseen` 空 | **`is_skeleton_complete` (8 层 + 无 UNSEEN)** |
-| find-complete-v1 字段 | tree_id / tree_path / frontier | + `skeleton_*` + `discovery_strategy_applied` |
-| find_unseen 工具 | 单个 (按 type) | + `find_unseen_chain` (按 parent chain) |
-| bulk vs chain 边界 | 模糊 | **L0..L3 = bulk; L4+ = chain** (硬约束) |
+| 项 | v4 (2026-06-17) | v5 (2026-06-18) | v5.2 (2026-06-18) |
+|---|---|---|---|
+| 深度上限 | 无硬约束 | `MAX_TREE_DEPTH=8` (业务硬上限) | 同 + `FIND_TERMINATION_DEPTH=7` (find 终止深度) |
+| 父子校验 | `_VALID_PARENT_CHILD` (白名单) | 同 + DB CHECK 兜底 | 同 |
+| 编排策略 | 隐式 (每 wave 自由选) | **显式 bulk_layer / chain_fanout** | 同 (W2.5 从 find 责任范围移除) |
+| 终止条件 | `find_unseen` 空 | **`is_skeleton_complete` (L8 + 无 UNSEEN)** | **`is_skeleton_complete` (L7 + 无 UNSEEN)** |
+| find-complete-v1 字段 | tree_id / tree_path / frontier | + `skeleton_*` + `discovery_strategy_applied` | + `find_termination_depth` (7) |
+| find_unseen 工具 | 单个 (按 type) | + `find_unseen_chain` (按 parent chain) | 同 |
+| bulk vs chain 边界 | 模糊 | **L0..L3 = bulk; L4+ = chain** (硬约束) | 同 (W2.5 不在范围) |
+| **find → hack-deep 委派** | `sessions_spawn(hack-deep, find-complete-v1)` 跨 owner handoff | 同 | **取消**: find 不再 spawn hack-deep; 写 evidence 到本地后自身终止, 上层 orchestrator 自行启动 hack-deep |
+| **W2.5 (per-port attack plan)** | find 拼 dispatch + 跨 owner 转交 | 同 | **不在 find 责任范围**: W2.5 整体由 hack-deep 在 attack phase 自行执行 |
+| **INJECTION_VECTOR (L8) 节点** | find 可能产 (依赖 W2.5) | 同 | **不要求存在**: find 不写, hack-deep 后续 attack phase 自行写入 |
 
 ---
 
