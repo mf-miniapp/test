@@ -27,8 +27,9 @@ def test_asset_tree_complete_signature_has_snapshot_id():
     from opensquilla.tools.builtin.asset_tree import tree as tree_tools
 
     sig = inspect.signature(tree_tools.asset_tree_complete)
-    # No new parameters, but the return value must include snapshot_id
-    assert list(sig.parameters.keys()) == ["tree_id"]
+    # v5 (2026-06-18) added force=False parameter for 8-layer skeleton
+    # hard gate bypass. Allowed values: tree_id (required) + force (default False).
+    assert list(sig.parameters.keys()) == ["tree_id", "force"]
 
 
 def test_asset_tree_complete_returns_snapshot_id():

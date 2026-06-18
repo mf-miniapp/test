@@ -490,7 +490,51 @@ for wave in plan:  # W0.5, W0.6, W1, W1.5, W1.5c, W2.5, W3.5
 - `skeleton_complete=false` → hack-deep 应返回 `find_incomplete` 错误并要求 find 补全
 - `skeleton_unseen_total > 0` → 编排器自己补全后再发 (不允许推给 hack-deep)
 
+### v5 硬关卡: asset_tree_complete 工具拒绝未完成骨架 (2026-06-18)
+
+> **🔥 严格禁令**: 编排器**严禁**在 8 层骨架未建好时调用
+> `asset_tree_complete` 工具或 emit `find-complete-v1` evidence。
+> **v5 起, 这不再是文档自律, 是工具运行时硬关卡**。
+
+**Bug 历史 (2026-06-18, 10jqka.com.cn run)**:
+- 现象: F0 跑完, UNSEEN=0, 总节点 1153 (含 1145 DISCOVERED), LLM 直接
+  调 `asset_tree_complete` + emit `find-complete-v1` 跳到 hack-deep。
+- 问题: F1.5/F1.5c/F2.5/F3.5 (L4+) 根本没跑 — 树只到 L3, 8 层骨架没建。
+- hack-deep 收到空骨架, 进入 W1 攻击面枚举时无 url/endpoint/param/inj。
+
+**v5 修复**:
+1. `asset_tree_complete` 工具**强制检查** `is_skeleton_complete()`, 不通过时
+   raise `IncompleteSkeletonError` (从 `opensquilla.asset_tree.models` 导入)
+   并在 tool result 里返回 skeleton_report 诊断。
+2. 错误信息明确告诉 LLM: "DO NOT emit find-complete-v1", "MUST run F-resume"。
+3. 紧急情况下可传 `force=True` 跳过 (但响应里会标 `force_used: true`,
+   留作审计)。
+
+**编排器必走流程** (F-final-pre):
+```
+1. asset_tree_check_skeleton(tree_id)  → report
+2. if report.complete == true:
+     proceed to F-final (调 tree-finalizer specialist)
+   else:
+     # 1) 调 plan_pending 看缺什么
+     plan = asset_tree_plan_pending(tree_id)
+     # 2) 跑缺失 wave (W1.5 / W1.5c / W2.5 / W3.5)
+     for wave in plan.pending_waves:
+       sessions_spawn(...)
+       ingest evidence → add_nodes → update_state('discovered')
+     # 3) 重新调 check_skeleton, 循环直到 complete=true
+     goto step 1
+3. asset_tree_complete(tree_id)  → snapshot_id + tree_path
+4. sessions_spawn(agent_id='hack-deep', task=find-complete-v1 envelope)
+```
+
+**严禁行为** (fraud):
+- 改 force=True 跳过关卡 (除非用户手动中断)
+- 拼假 evidence 声称 `skeleton_complete: true`
+- L1..L3 跑完就发 find-complete-v1, 谎称 L4+ 跑过
+
 ### 给 hack-deep 的边界信号
+
 
 
 find-complete-v1 evidence 的 `coverage` 字段必须含:

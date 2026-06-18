@@ -312,6 +312,46 @@ class AssetPath(BaseModel):
 MAX_TREE_DEPTH: int = 8
 
 
+class IncompleteSkeletonError(RuntimeError):
+    """v5 (2026-06-18) 8 层骨架未完整时阻断 find-complete-v1 emit。
+
+    ``asset_tree_complete`` 工具在 ``is_skeleton_complete() == False`` 时
+    raise 此异常, 强制编排器先跑 F-resume 补全缺失 wave。LLM 收到此异常
+    必须调用 ``asset_tree_plan_pending(tree_id)`` 拿 pending plan, 然后
+    跑缺失的 F1.5 / F1.5c / F2.5 / F3.5 wave, 直到 complete=True。
+
+    不允许: 改 force=True 强行跳过 (除非真的紧急, e.g. 用户手动中断);
+    不允许: 发假的 find-complete-v1 evidence 声称 complete。
+    """
+
+    def __init__(
+        self,
+        *,
+        tree_id: str,
+        max_depth_reached: int,
+        max_depth_required: int = MAX_TREE_DEPTH,
+        unseen_total: int,
+        completion_pct: float,
+        missing_waves: list[str] | None = None,
+    ) -> None:
+        self.tree_id = tree_id
+        self.max_depth_reached = max_depth_reached
+        self.max_depth_required = max_depth_required
+        self.unseen_total = unseen_total
+        self.completion_pct = completion_pct
+        self.missing_waves = missing_waves or []
+        waves_str = ", ".join(self.missing_waves) if self.missing_waves else "<unknown>"
+        super().__init__(
+            f"[tree_id={tree_id}] 8-layer skeleton INCOMPLETE: "
+            f"max_depth_reached={max_depth_reached} "
+            f"(need {max_depth_required}), "
+            f"unseen_total={unseen_total} (need 0), "
+            f"completion_pct={completion_pct:.2%}. "
+            f"Missing waves (run F-resume): {waves_str}. "
+            f"DO NOT emit find-complete-v1 until this is resolved."
+        )
+
+
 class DepthExceededError(ValueError):
     """调用方尝试添加会超过 ``MAX_TREE_DEPTH`` 路径深度的节点。
 

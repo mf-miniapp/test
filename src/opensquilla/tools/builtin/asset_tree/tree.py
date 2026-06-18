@@ -134,6 +134,12 @@ def _load_tree(tree_id: str) -> AssetTree:
         # in-memory only. Tools still work, JSON persists.
         tree._backend = None  # type: ignore[attr-defined]
         tree._tree_id = None  # type: ignore[attr-defined]
+
+    # v5 (2026-06-18) 回填 depth: JSON round-trip 不会持久化 _depth
+    # (它是 in-memory 字段), 重新构造的 tree 没 set_depth。
+    # 没深度 -> is_skeleton_complete() 永远 False (max_depth=0)。
+    # 用 BFS 从 root 沿 parent 链下溯, 给每个节点 set_depth(parent_depth+1)。
+    _backfill_depths_locked(tree)
     return tree
 
 
@@ -250,6 +256,90 @@ def _validate_asset_type(asset_type_str: str) -> AssetType:
             f"Invalid asset_type: {asset_type_str!r}. "
             f"Must be one of {[t.value for t in AssetType]}"
         ) from exc
+
+
+def _detect_missing_waves(tree) -> list[str]:
+    """v5 (2026-06-18) 推断还没跑的 wave 列表。
+
+    根据 (AssetType, state) 分布与 plan_pending 不直接对齐, 这里走
+    启发式: 看每层是否还有 UNSEEN / 未达到 max_depth。
+    """
+    missing: list[str] = []
+    max_d = tree.max_depth_reached()
+    # L4+ = chain_fanout wave 需要 UNSEEN 处理
+    # max_d >= 3 表示已有 SERVICE, 需要派生 URL
+    if max_d >= 3:
+        # 已有 SERVICE/URL, 检查 L4+ 是否还有 UNSEEN
+        unseen_url = sum(
+            1 for n in tree._nodes.values()
+            if n.asset_type.value in (
+                "endpoint", "parameter", "injection_vector",
+                "static_asset", "auth_surface", "cookie",
+                "header", "api_schema",
+            )
+            and n.state.value == "unseen"
+        )
+        # 关键修复: 即使 unseen_url=0 (L4+ 完全没跑), max_d<5 仍应建议 W1.5
+        if unseen_url or max_d < 5:
+            if max_d < 5:
+                missing.append("W1.5")  # URL / endpoint 派生
+            if max_d < 6:
+                missing.append("W1.5c")  # parameter
+            if max_d < 8:
+                missing.append("W2.5")  # injection_vector
+            missing.append("W3.5")  # STATIC_ASSET / COOKIE / HEADER
+    # L3 UNSEEN
+    unseen_l3 = sum(
+        1 for n in tree._nodes.values()
+        if n.asset_type.value in ("port", "service", "storage_object")
+        and n.state.value == "unseen"
+    )
+    if unseen_l3:
+        missing.append("W1")
+    # L1/L2 UNSEEN
+    unseen_l12 = sum(
+        1 for n in tree._nodes.values()
+        if n.asset_type.value in ("sub_domain", "ip", "storage")
+        and n.state.value == "unseen"
+    )
+    if unseen_l12:
+        missing.append("W0.5")
+    return missing
+
+
+def _backfill_depths_locked(tree: AssetTree) -> None:
+    """v5 (2026-06-18) 从 JSON round-trip 后回填节点的 in-memory depth。
+
+    AssetNode._depth 不是 Pydantic 字段, 不会被 model_dump 持久化,
+    也不会被 from_dict 恢复。如果不补, 后续 is_skeleton_complete
+    / skeleton_report 都会拿到 max_depth=0, 误判骨架没建好。
+
+    BFS from root: root.depth=0; 子.depth=父.depth+1。
+    """
+    if tree.root_id is None:
+        return
+    # 先把 root 设为 0
+    root = tree.get_node(tree.root_id)
+    if root is not None:
+        root.set_depth(0)
+    # BFS: 用 _edges
+    queue: list[str] = [tree.root_id]
+    visited: set[str] = {tree.root_id}
+    while queue:
+        parent_id = queue.pop(0)
+        parent_node = tree.get_node(parent_id)
+        if parent_node is None:
+            continue
+        parent_d = parent_node.depth if parent_node.depth >= 0 else 0
+        for child_id in tree._edges.get(parent_id, []):
+            if child_id in visited:
+                continue
+            child = tree.get_node(child_id)
+            if child is None:
+                continue
+            child.set_depth(parent_d + 1)
+            visited.add(child_id)
+            queue.append(child_id)
 
 
 def _validate_state(state_str: str) -> AssetState:
@@ -1116,8 +1206,15 @@ async def asset_tree_dispatch_plan(
         "Mark the find run as complete. Touches the on-disk file (no "
         "structural change), returns the absolute path to the persisted "
         "tree JSON. Phase 3 will pass this path to `sessions_spawn` as "
-        "an artifact for the handoff to hack-deep. Always call this "
-        "before reporting [DEEP FIND COMPLETE].\n\n"
+        "an artifact for the handoff to hack-deep.\n\n"
+        "v5 (2026-06-18) HARD GATE: this tool enforces the 8-layer "
+        "skeleton termination contract. If ``is_skeleton_complete()`` "
+        "returns false (i.e. tree has not reached path_depth=8 or has "
+        "UNSEEN nodes), the call raises ``IncompleteSkeletonError`` and "
+        "returns a diagnostic report showing what is missing. To bypass "
+        "(emergency only), pass ``force=True``. v5 closes the bug where "
+        "find-complete-v1 was emitted after only F0/F1 (L0..L3) without "
+        "ever running F1.5/F1.5c/F2.5/F3.5 (L4+).\n\n"
         "v4.6 (2026-06-18): a time-stamped snapshot copy is written to "
         "``~/.opensquilla/state/asset_trees/.snapshots/<tree_id>--<ts>.json`` "
         "(separate from the live canonical tree) so the web UI's "
@@ -1127,18 +1224,45 @@ async def asset_tree_dispatch_plan(
     ),
     params={
         "tree_id": {"type": "string", "description": "Tree id."},
+        "force": {
+            "type": "boolean",
+            "description": (
+                "Bypass the 8-layer skeleton hard gate. Default False. "
+                "Emergency-only — do not use in normal find runs. Setting "
+                "force=True emits a warning to the response."
+            ),
+            "default": False,
+        },
     },
     required=["tree_id"],
 )
-async def asset_tree_complete(tree_id: str) -> str:
+async def asset_tree_complete(tree_id: str, force: bool = False) -> str:
     """Mark the find run complete and return the persisted path.
 
     Batch 5 (2026-06-15): generates a snapshot_id of the form
     ``<tree_id>--<iso_timestamp>`` so the same tree re-run later (e.g.
     via `opensquilla cron add --every ...`) produces a distinct
     snapshot that can be diffed via ``recon_diff_snapshots``.
+
+    v5 (2026-06-18) HARD GATE: refuses to complete when skeleton is not
+    complete. Returns a diagnostic report and raises
+    ``IncompleteSkeletonError`` so the orchestrator can re-run F-resume.
     """
     tree = _load_tree(tree_id)
+    # v5 HARD GATE: refuse to mark complete if 8-layer skeleton is not built.
+    if not force and not tree.is_skeleton_complete():
+        report = tree.skeleton_report()
+        # 用专门的 IncompleteSkeletonError (v5), 让编排器可以精确捕获
+        # 并触发 F-resume, 而不是被通用 ToolError 吞掉。
+        from opensquilla.asset_tree.models import IncompleteSkeletonError as _ISE
+        raise _ISE(
+            tree_id=tree_id,
+            max_depth_reached=report["max_depth_reached"],
+            max_depth_required=report["max_depth_cap"],
+            unseen_total=report["unseen_total"],
+            completion_pct=report["completion_pct"],
+            missing_waves=_detect_missing_waves(tree),
+        )
     _save_tree(tree, tree_id)  # touch
     path = _tree_path(tree_id)
     # ISO-8601 UTC timestamp, e.g. "2026-06-15T12-34-56Z" (filesystem-safe)
@@ -1171,6 +1295,8 @@ async def asset_tree_complete(tree_id: str) -> str:
             "snapshot_ts": snapshot_ts,
             "snapshot_path": str(snapshot_path),
             "stats": tree.stats(),
+            "skeleton": tree.skeleton_report(),
+            "force_used": force,
         },
         ensure_ascii=False,
         default=str,
