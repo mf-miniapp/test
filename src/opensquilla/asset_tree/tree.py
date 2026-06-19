@@ -28,6 +28,8 @@ from opensquilla.asset_tree.models import (
     AssetPath,
     AssetState,
     AssetType,
+    AttackEdge,
+    AttackPath,
     FIND_TERMINATION_DEPTH,
     MAX_TREE_DEPTH,
     DepthExceededError,
@@ -644,6 +646,155 @@ class AssetTree:
     def frontier(self) -> list[AssetNode]:
         """前沿节点 — 已发现但未深入（DISCOVERED 状态）。"""
         return self.nodes_by_state(AssetState.DISCOVERED)
+
+
+
+    # ── v6 (2026-06-19) 攻击路径枚举 ─────────────────────────────
+    #
+    # ``enumerate_root_to_leaf_paths`` 是 create-attack-path agent
+    # 的核心调用: 把资产树从 L0 (ROOT_DOMAIN) 到 L7 (PARAMETER) 的
+    # 全部边链以 AttackPath 列表返回。约束:
+    #   - 路径必须终止在 depth <= max_depth 的叶子上 (默认 7, L7)
+    #   - 边状态在 ``include_states`` 内的节点视为"有效可攻击"
+    #   - SECRET / GENERIC 视为跨层 catch-all, 不计入主链
+    #   - INJECTION_VECTOR (L8) 不出现在主链, find 阶段不写
+    #
+    # 性能: 内部走 BFS+回溯, 一次性展开; 假设 L0..L7 全树 < 5k 节点
+    # 时单次调用 < 50ms。如果未来超过 10k 节点, 建议改懒加载 +
+    # parent-chain 索引, 见 docs/perf-asset-tree.md。
+    def enumerate_root_to_leaf_paths(
+        self,
+        *,
+        max_depth: int = FIND_TERMINATION_DEPTH,
+        include_states: tuple[AssetState, ...] = (
+            AssetState.UNSEEN,
+            AssetState.DISCOVERED,
+            AssetState.TRIAGED,
+        ),
+    ) -> list[AttackPath]:
+        """枚举所有从根到叶的路径, 封装为 AttackPath 列表。
+
+        Args:
+            max_depth: 路径深度上限, 默认 L7 (PARAMETER) = 7。
+            include_states: 边 (to_node) 状态白名单, 决定哪些叶子
+                视为"可攻击"。默认 UNSEEN/DISCOVERED/TRIAGED;
+                EXPLOITED/ABANDONED 视为已处理完。
+
+        Returns:
+            AttackPath 列表。每条 path 的 ``path_id`` 由边链
+            SHA1 派生, 相同拓扑的两次枚举产生同一 id, 配合
+            ``vuln_attack_paths.path_hash`` UNIQUE 约束做幂等。
+        """
+        with self._lock:
+            # ``AssetTree.from_dict`` does not populate ``_tree_id``; fall
+            # back to deriving one from the root domain so the path id
+            # still has a stable shape.
+            tree_id = getattr(self, "_tree_id", None) or f"tree-{self.root_domain}"
+            root_id = self.root_id
+            if root_id is None or root_id not in self._nodes:
+                return []
+
+            results: list[AttackPath] = []
+            # 边链: list[AttackEdge], 边 i 对应 L_i → L_{i+1}
+            current_edges: list[AttackEdge] = []
+
+            def _walk(node_id: str, depth: int) -> None:
+                if depth > max_depth:
+                    return
+                node = self._nodes.get(node_id)
+                if node is None:
+                    return
+                # 叶子: 无子节点 OR 子节点都已超出 include_states
+                children = [
+                    self._nodes[cid]
+                    for cid in self._edges.get(node_id, [])
+                    if cid in self._nodes
+                ]
+                # SECRET/GENERIC 是 catch-all, 不展开它们的子节点
+                # (它们本身也没有合法子节点, 防御性纵深)。
+                if not children or node.asset_type in (
+                    AssetType.SECRET,
+                    AssetType.GENERIC,
+                ):
+                    # 路径必须以至少一条边收尾
+                    if current_edges:
+                        # 校验叶状态在白名单
+                        last = current_edges[-1]
+                        last_node = self._nodes.get(last.to_node_id)
+                        if last_node and last_node.state in include_states:
+                            leaf_id = last.to_node_id
+                            leaf = self._nodes[leaf_id]
+                            results.append(_build_attack_path(
+                                tree_id=tree_id,
+                                edges=list(current_edges),
+                                leaf=leaf,
+                            ))
+                    return
+
+                for child in children:
+                    if child.asset_type == AssetType.INJECTION_VECTOR:
+                        # L8 是漏洞向量层, find 不写; 攻击阶段才会
+                        # 由 hack-deep 写入, 跳过防越界
+                        continue
+                    edge = AttackEdge(
+                        edge_index=len(current_edges),
+                        from_node_id=node.id,
+                        to_node_id=child.id,
+                        from_type=node.asset_type,
+                        to_type=child.asset_type,
+                        from_value=node.value,
+                        to_value=child.value,
+                        edge_state=child.state,
+                    )
+                    current_edges.append(edge)
+                    # 截断判定: 加上这条 edge 后, 边数 == max_depth
+                    # (因为 edge_index 从 0 起, max_depth 个 edge
+                    # 即覆盖 L0..L_max_depth), 后面不再下钻,
+                    # 视为叶节点收尾。
+                    if len(current_edges) >= max_depth:
+                        last = current_edges[-1]
+                        last_node = self._nodes.get(last.to_node_id)
+                        if last_node and last_node.state in include_states:
+                            results.append(_build_attack_path(
+                                tree_id=tree_id,
+                                edges=list(current_edges),
+                                leaf=last_node,
+                            ))
+                        current_edges.pop()
+                        continue
+                    _walk(child.id, depth + 1)
+                    current_edges.pop()
+
+            def _build_attack_path(
+                *,
+                tree_id: str,
+                edges: list[AttackEdge],
+                leaf: AssetNode,
+            ) -> AttackPath:
+                scope = " → ".join(e.to_scope_part() for e in edges)
+                path_id = AttackPath.compute_path_id(edges)
+                # 合并所有边节点的 metadata (供 specialist 看)
+                merged: dict[str, Any] = {}
+                for e in edges:
+                    src = self._nodes[e.from_node_id].metadata
+                    dst = self._nodes[e.to_node_id].metadata
+                    if src:
+                        merged[f"L{e.edge_index}_from_meta"] = dict(src)
+                    if dst:
+                        merged[f"L{e.edge_index}_to_meta"] = dict(dst)
+                return AttackPath(
+                    path_id=path_id,
+                    tree_id=tree_id,
+                    edges=edges,
+                    leaf_node_id=leaf.id,
+                    leaf_type=leaf.asset_type,
+                    leaf_value=leaf.value,
+                    scope_string=scope,
+                    metadata=merged,
+                )
+
+            _walk(root_id, 0)
+            return results
 
     def find_node(self, asset_type: AssetType, value: str) -> Optional[AssetNode]:
         """按类型+值查找节点。"""

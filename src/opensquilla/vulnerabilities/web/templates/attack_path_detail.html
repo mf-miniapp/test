@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Attack Path — {{ attack_path.path_id }}</title>
+  <style>
+    :root { --bg: #0d1117; --surface: #161b22; --border: #30363d;
+            --text: #c9d1d9; --text-dim: #8b949e;
+            --accent: #58a6ff; --accent-dim: #1f6feb;
+            --green: #3fb950; --orange: #d29922; --red: #f85149; --radius: 6px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+           background: var(--bg); color: var(--text); }
+    .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px;
+             padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    header h1 { font-size: 20px; font-weight: 600; flex: 1; }
+    .nav-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    .nav-link:hover { text-decoration: underline; }
+    .status { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600;
+              text-transform: uppercase; }
+    .status.pending { background: var(--text-dim); color: black; }
+    .status.in_progress { background: var(--orange); color: black; }
+    .status.completed { background: var(--green); color: black; }
+    .status.failed, .status.abandoned { background: var(--red); color: white; }
+    .card { background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px;
+               color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+    .field { display: flex; padding: 6px 0; border-bottom: 1px solid var(--border); }
+    .field:last-child { border-bottom: none; }
+    .field-label { width: 160px; color: var(--text-dim); font-size: 13px; flex-shrink: 0; }
+    .field-value { flex: 1; font-size: 14px; word-break: break-all; }
+    code { background: var(--bg); padding: 2px 6px; border-radius: 3px;
+           font-size: 13px; color: var(--accent); }
+    .edge-chain { list-style: none; padding: 0; }
+    .edge-chain li { padding: 10px 12px; border-left: 3px solid var(--accent);
+                     margin-bottom: 4px; background: var(--bg); border-radius: 0 4px 4px 0;
+                     font-size: 13px; }
+    .edge-chain li:last-child { border-left-color: var(--red); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📐 Attack Path: {{ attack_path.path_id }}</h1>
+      <span class="status {{ attack_path.status }}">{{ attack_path.status }}</span>
+      <a class="nav-link" href="/vulnerabilities/?tree_id={{ attack_path.tree_id }}">本树漏洞 →</a>
+    </header>
+
+    <div class="card">
+      <h2>基本信息</h2>
+      <div class="field"><div class="field-label">Path ID</div>
+        <div class="field-value"><code>{{ attack_path.path_id }}</code></div></div>
+      <div class="field"><div class="field-label">Tree</div>
+        <div class="field-value"><code>{{ attack_path.tree_id }}</code></div></div>
+      <div class="field"><div class="field-label">Leaf</div>
+        <div class="field-value">
+          <code>{{ attack_path.leaf_type }}={{ attack_path.leaf_value }}</code>
+          ({{ attack_path.leaf_node_id[:8] }}…)
+        </div></div>
+      <div class="field"><div class="field-label">Vuln Count</div>
+        <div class="field-value">{{ attack_path.vuln_count or 0 }}</div></div>
+      {% if attack_path.error %}
+      <div class="field"><div class="field-label">Error</div>
+        <div class="field-value" style="color:var(--red)">{{ attack_path.error }}</div></div>
+      {% endif %}
+      <div class="field"><div class="field-label">Created</div>
+        <div class="field-value">{{ attack_path.created_at }}</div></div>
+      {% if attack_path.started_at %}
+      <div class="field"><div class="field-label">Started</div>
+        <div class="field-value">{{ attack_path.started_at }}</div></div>
+      {% endif %}
+      {% if attack_path.completed_at %}
+      <div class="field"><div class="field-label">Completed</div>
+        <div class="field-value">{{ attack_path.completed_at }}</div></div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Scope</h2>
+      <div class="field-value"><code>{{ attack_path.scope_string }}</code></div>
+    </div>
+
+    <div class="card">
+      <h2>边链 (L0 → Leaf, {{ edges | length }} edges)</h2>
+      {% if edges %}
+      <ul class="edge-chain">
+        {% for e in edges %}
+        <li>
+          <strong>L{{ e.edge_index }}</strong>:
+          <code>{{ e.from_type }}={{ e.from_value }}</code>
+          →
+          <code>{{ e.to_type }}={{ e.to_value }}</code>
+          <span style="color:var(--text-dim)"> [{{ e.edge_state }}]</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <div style="color:var(--text-dim)">无 edge_chain 数据。</div>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>

@@ -857,7 +857,10 @@ def test_chat_switching_existing_session_does_not_mark_new_chat_intent() -> None
     switch_body = source[switch_start:switch_end]
 
     assert "_pendingSessionIntent = 'new_chat'" not in switch_body
-    assert source.count("_pendingSessionIntent = 'new_chat'") == 2
+    # Three new_chat intent sites: the /new slash case, the new-chat
+    # "tree change" branch in the same switch, and _resetForNewSession
+    # (used by the cross-surface attack-paths handoff).
+    assert source.count("_pendingSessionIntent = 'new_chat'") == 3
     assert "params.intent = _pendingSessionIntent;" in source
 
 

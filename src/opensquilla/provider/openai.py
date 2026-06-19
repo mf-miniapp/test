@@ -527,7 +527,7 @@ def _is_direct_deepseek_v4_request(provider_kind: str, model: str) -> bool:
 # fails before any compaction can run. Detect loopback / private base URLs and
 # downscale the per-turn proof budget so the in-turn compaction ladder always
 # lands below the local model ctx.
-_LOCAL_CTX_CEILING_TOKENS = 14_000  # safe for llama-server -c 16384 (input only)
+_LOCAL_CTX_CEILING_TOKENS = 128_000  # safe for llama-server -c 131072 (input only); aligned with qwen3.6-35b on 127.0.0.1:9091
 
 
 def _is_local_openai_base_url(base_url: str) -> bool:

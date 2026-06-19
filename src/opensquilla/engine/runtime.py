@@ -3928,9 +3928,17 @@ class TurnRunner:
         # the global baseline and the legacy single-endpoint behavior.
         if turn.model and cloned_selector is not None:
             cloned_selector.override_model(turn.model)
-            tier_pc = self._build_tier_provider_config(turn, cloned_selector)
+            tier_pc, baseline_pc = self._build_tier_provider_config(turn, cloned_selector)
             if tier_pc is not None:
                 cloned_selector.override_primary_config(tier_pc)
+            elif baseline_pc is not None:
+                # No-op tier resolution, but the baseline may have
+                # absorbed a per-agent provider/base_url/api_key
+                # override via resolve_agent_endpoint. Re-apply the
+                # post-overlay baseline so the cloned selector picks
+                # up the agent's intended endpoint instead of the
+                # stale global one (see _build_tier_provider_config).
+                cloned_selector.override_primary_config(baseline_pc)
             provider = cloned_selector.resolve()
             # Audit the routing decision for /healthz + ops dashboards.
             # The lock-free tuple swap below lets healthz read a
@@ -3967,16 +3975,16 @@ class TurnRunner:
 
         router_cfg = getattr(self._config, "squilla_router", None)
         if router_cfg is None or not getattr(router_cfg, "enabled", False):
-            return None
+            return None, None
         routed = turn.metadata.get("routed_tier") if turn.metadata else None
         if not routed:
-            return None
+            return None, None
         if routed == IMAGE_TIER or normalize_text_tier(routed) is None:
-            return None
+            return None, None
         tiers = getattr(router_cfg, "tiers", {}) or {}
         tier_cfg = tiers.get(routed)
         if not tier_cfg:
-            return None
+            return None, None
 
         # Baseline = the global primary in the ModelSelector chain.
         baseline_pc = cloned_selector._chain[0]  # noqa: SLF001
@@ -4064,7 +4072,7 @@ class TurnRunner:
                         provider_routing=dict(baseline_pc.provider_routing or {}),
                     )
 
-        tier_pc = resolve_tier_provider_config(tier_cfg, baseline_pc)
+        tier_pc, baseline_pc = resolve_tier_provider_config(tier_cfg, baseline_pc)
 
         # Resolve api_key_env (tier-level env-var backing) AFTER
         # resolve_tier_provider_config so the env-var lookup doesn't get
@@ -4078,18 +4086,36 @@ class TurnRunner:
         if tier_api_key_env and not tier_explicit_api_key:
             env_value = os.environ.get(tier_api_key_env, "").strip()
             if env_value:
-                tier_pc = ProviderConfig(
-                    provider=tier_pc.provider,
-                    model=tier_pc.model,
-                    api_key=env_value,
-                    base_url=tier_pc.base_url,
-                    org_id=tier_pc.org_id,
-                    proxy=tier_pc.proxy,
-                    provider_routing=dict(tier_pc.provider_routing or {}),
+                # ``tier_pc`` is the (ProviderConfig, baseline_pc)
+                # tuple returned by ``resolve_tier_provider_config``.
+                # Unpack to rebuild the ProviderConfig with the
+                # resolved env-var api_key, then repack.
+                tier_pc_value, baseline_pc_value = tier_pc
+                tier_pc = (
+                    ProviderConfig(
+                        provider=tier_pc_value.provider,
+                        model=tier_pc_value.model,
+                        api_key=env_value,
+                        base_url=tier_pc_value.base_url,
+                        org_id=tier_pc_value.org_id,
+                        proxy=tier_pc_value.proxy,
+                        provider_routing=dict(tier_pc_value.provider_routing or {}),
+                    ),
+                    baseline_pc_value,
                 )
 
         # No-op short-circuit: if the resolved tier config is identical
-        # to the baseline, return None so the caller skips the override.
+        # to the post-overlay baseline, return
+        # ``(None, baseline_pc)`` — the caller applies the post-overlay
+        # baseline to the cloned selector and audits
+        # ``tier_override_applied=False`` (the tier itself did not
+        # override). The post-overlay baseline can differ from
+        # ``cloned_selector._chain[0]`` when a per-agent
+        # ``provider``/``base_url``/``api_key`` is configured — without
+        # this, the cloned selector would keep the global endpoint and
+        # the request would be misrouted (e.g. hack-deep with
+        # provider=openai / base_url=127.0.0.1:9091 still going to MiMo
+        # because ``override_model`` only swaps the model field).
         if (
             tier_pc.provider == baseline_pc.provider
             and tier_pc.model == baseline_pc.model
@@ -4097,8 +4123,8 @@ class TurnRunner:
             and tier_pc.base_url == baseline_pc.base_url
             and tier_pc.proxy == baseline_pc.proxy
         ):
-            return None
-        return tier_pc
+            return None, baseline_pc
+        return tier_pc, None
 
     @property
     def last_routing(self) -> dict[str, Any] | None:

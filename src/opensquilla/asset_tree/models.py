@@ -36,7 +36,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -489,3 +489,113 @@ def validate_parent_child(parent_type: AssetType, child_type: AssetType) -> None
             f"Invalid parent→child: {parent_type.value} → {child_type.value}. "
             f"Allowed children of {parent_type.value}: {[t.value for t in sorted(allowed, key=lambda t: t.value)]}"
         )
+
+
+# ── 攻击路径模型 (v6, 2026-06-19) ─────────────────────────────────────
+#
+# AttackPath = 资产树上一条从 L0 (ROOT_DOMAIN) 到 L7 (PARAMETER) 的完整
+# 边链。create-attack-path agent 用它把"树上的边"打包成"一次攻击输入";
+# hack-deep 按 path_id 接单, 跑完后回写 vulnerability / vuln_node_vulns
+# 实现反哺。
+#
+# AttackEdge 是组成 AttackPath 的原子 — 一对父子节点, 携带类型/值/状态
+# 三个字段, 给 specialist 当 scope 上下文拼 BriefContext 用。
+#
+# 路径 ID 的来源: 对 edge_chain 做 SHA1 取前 12 hex (与 AssetNode.id
+# 风格一致, 12 hex 字符), 相同拓扑 + 状态组合的两次枚举产生同一 id,
+# 写入 vuln_attack_paths 时靠 path_hash UNIQUE 约束做幂等。
+
+import hashlib
+
+AttackPathStatus = Literal[
+    "pending",
+    "in_progress",
+    "completed",
+    "failed",
+    "abandoned",
+]
+
+
+class AttackEdge(BaseModel):
+    """AttackPath 中的一条边 — L_n 节点 → L_{n+1} 节点。"""
+
+    edge_index: int = Field(..., ge=0, le=7, description="边在路径中的位置, 0..7")
+    from_node_id: str
+    to_node_id: str
+    from_type: AssetType
+    to_type: AssetType
+    from_value: str
+    to_value: str
+    edge_state: AssetState = Field(
+        default=AssetState.UNSEEN,
+        description="to_node 的当前状态",
+    )
+
+    def to_scope_part(self) -> str:
+        return f"{self.from_type.value}={self.from_value} -> {self.to_type.value}={self.to_value}"
+
+
+class AttackPath(BaseModel):
+    """一棵资产树上一条 L0..L7 的完整路径, 作为一次攻击输入。"""
+
+    path_id: str = Field(..., min_length=12, max_length=12)
+    tree_id: str
+    edges: list[AttackEdge] = Field(..., min_length=1)
+    leaf_node_id: str
+    leaf_type: AssetType
+    leaf_value: str
+    scope_string: str = Field(..., description="人读 scope 串, 给 LLM/human 看")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    status: AttackPathStatus = "pending"
+    created_at: datetime = Field(default_factory=_utcnow)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    vuln_count: int = 0
+    error: Optional[str] = None
+
+    @staticmethod
+    def compute_path_id(edges: list[AttackEdge]) -> str:
+        """由边链生成稳定的 12 hex id (与 AssetNode.id 风格一致)。"""
+        buf = "|".join(
+            f"{e.from_node_id}->{e.to_node_id}:{e.from_type.value}:{e.to_type.value}:{e.from_value}:{e.to_value}"
+            for e in edges
+        )
+        return hashlib.sha1(buf.encode("utf-8")).hexdigest()[:12]
+
+    def mark_started(self) -> None:
+        if self.started_at is None:
+            self.started_at = _utcnow()
+        self.status = "in_progress"
+
+    def mark_completed(self, vuln_count: int) -> None:
+        self.completed_at = _utcnow()
+        self.status = "completed"
+        self.vuln_count = vuln_count
+
+    def mark_failed(self, error: str) -> None:
+        self.completed_at = _utcnow()
+        self.status = "failed"
+        self.error = error
+
+    def mark_abandoned(self, reason: str) -> None:
+        self.completed_at = _utcnow()
+        self.status = "abandoned"
+        self.error = reason
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path_id": self.path_id,
+            "tree_id": self.tree_id,
+            "edges": [e.model_dump(mode="json") for e in self.edges],
+            "leaf_node_id": self.leaf_node_id,
+            "leaf_type": self.leaf_type.value,
+            "leaf_value": self.leaf_value,
+            "scope_string": self.scope_string,
+            "metadata": self.metadata,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "vuln_count": self.vuln_count,
+            "error": self.error,
+        }

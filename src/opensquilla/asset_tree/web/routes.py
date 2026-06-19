@@ -35,6 +35,7 @@ from opensquilla.asset_tree.models import (
 )
 from opensquilla.asset_tree.tree import AssetTree
 from opensquilla.asset_tree.web.store import DBUnavailableError, TreeStore
+from opensquilla.asset_tree.db import get_default_backend as _get_backend
 
 # ── Template loader ──────────────────────────────────────────────
 
@@ -357,6 +358,66 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
             return _json_error(f"Tree '{tree_id}' not found", status=404)
         return JSONResponse(_node_to_dict(node))
 
+    async def api_tree_vulnerabilities_summary(request: Request) -> Response:
+        """v6 (2026-06-19) — 资产树 web UI 用, 拿本树漏洞摘要。
+
+        返回 ``{"vulnerabilities": [...]}`` 列表, 严重度降序,
+        默认 limit=20 (UI 一次性展示够用)。
+        """
+        tree_id = request.path_params["tree_id"]
+        try:
+            tree = await store.get_tree(tree_id)
+        except KeyError:
+            return _json_error(f"Tree '{tree_id}' not found", status=404)
+        try:
+            be = _get_backend()
+            vulns = await be.list_vulnerabilities(
+                tree_id=tree_id, limit=20,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"vulnerabilities": [], "warning": str(e)},
+            )
+        # 序列化
+        out = []
+        for v in vulns:
+            out.append({
+                "id": v.get("id"),
+                "severity": v.get("severity"),
+                "title": v.get("title"),
+                "cve": v.get("cve"),
+                "cwe": v.get("cwe"),
+                "leaf_node_id": v.get("leaf_node_id"),
+                "discovered_by_wave": v.get("discovered_by_wave"),
+                "discovered_by_specialist": v.get("discovered_by_specialist"),
+            })
+        return JSONResponse({"vulnerabilities": out})
+
+    async def api_node_vulnerabilities(request: Request) -> Response:
+        """v6 (2026-06-19) — 列出挂在某 node 上的 vulnerability id 列表。
+
+        资产树 web UI 用这个 API 决定叶子节点是否变红 + 可点击跳转。
+        返回 ``{"node_id": ..., "vulnerability_ids": [...]}``。
+        """
+        tree_id = request.path_params["tree_id"]
+        node_id = request.path_params["node_id"]
+        try:
+            tree = await store.get_tree(tree_id)
+        except KeyError:
+            return _json_error(f"Tree '{tree_id}' not found", status=404)
+        if tree.get_node(node_id) is None:
+            return _json_error(f"Node '{node_id}' not found", status=404)
+        # 调 backend.list_node_vulnerability_ids (vuln 4 表)
+        try:
+            be = _get_backend()
+            vuln_ids = await be.list_node_vulnerability_ids(tree_id, node_id)
+        except Exception as e:
+            # backend 不可用 = 没有漏洞 (兼容 JSON 降级模式)
+            return JSONResponse({
+                "node_id": node_id, "vulnerability_ids": [], "warning": str(e),
+            })
+        return JSONResponse({"node_id": node_id, "vulnerability_ids": vuln_ids})
+
     async def api_delete_node(request: Request) -> Response:
         """DELETE /api/trees/{tree_id}/nodes/{node_id} — remove a node."""
         tree_id = request.path_params["tree_id"]
@@ -408,6 +469,10 @@ def create_asset_tree_routes(store: TreeStore | None = None) -> list[Route]:
         Route("/api/trees/{tree_id}/nodes", api_add_node, methods=["POST"]),
         Route("/api/trees/{tree_id}/nodes/{node_id}", api_update_node, methods=["PUT"]),
         Route("/api/trees/{tree_id}/nodes/{node_id}", api_delete_node, methods=["DELETE"]),
+        # v6 (2026-06-19) — 节点关联漏洞查询
+        Route("/api/trees/{tree_id}/nodes/{node_id}/vulnerabilities", api_node_vulnerabilities, methods=["GET"]),
+        # v6 (2026-06-19) — 资产页下方漏洞摘要
+        Route("/api/trees/{tree_id}/vulnerabilities-summary", api_tree_vulnerabilities_summary, methods=["GET"]),
         # Page route (must be last to avoid shadowing)
         Route("/", page_index, methods=["GET"]),
     ]

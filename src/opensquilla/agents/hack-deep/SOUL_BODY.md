@@ -1097,3 +1097,72 @@ quality_score = self.score_wave(
 > W4=78 (FAIL after 3 retries, audit), W8=90"
 
 让 operator 一眼看到每个 wave 的 quality score。
+
+
+## v6 (2026-06-19) 按 attack-path 接单模式
+
+> **新识别标识**: 当 orchestrator / 上游 envelope 的 `schema` 是
+> `attack-path-v1` 时, 你**不再**自己跑 4-layer × 9-wave 全套 —
+> 你把这一条 AttackPath 当成"一个完整攻击输入"处理: target=leaf node,
+> ancestor_path 是 scope 上下文, 跑完一次"定向 attack", 写出漏洞 + 反哺。
+
+### 触发条件
+
+envelope header 形如:
+```
+HANDOFF hack-deep.attack-path.<path_id_short> | deps=find-complete-v1 | schema=attack-path-v1 | eta=600
+
+<AttackPathEvidence body — tree_id, path_id, scope_string, leaf_*, ancestor_path, edge_count>
+```
+
+### 必做流程 (串行, 一次 1 个 sessions_spawn)
+
+1. **校验**: 用 `path_id` 调 `backend.get_attack_path(path_id)` 拿全量 edge_chain;
+   若不存在或 status != pending → emit `path-id-not-found` / `path-not-pending`
+   evidence, phase=complete, **不**进入攻击。
+2. **转 in_progress**: 调 `backend.update_attack_path_status(... mark_started=True)`
+3. **拼 specialist envelope**: 把 ancestor_path 转成 `BriefContext.ancestor_path`,
+   scope_string 灌给 specialist 当 scope 字符串。**严格遵守 4-layer × 9-wave
+   但只跑与本 path 相关的子集** (典型: W0(ROE 检查) → W2(triage 只看本 path 的
+   leaf) → W3(opsec) → W4(penetration 只打本 leaf) → 不 yield 给 ex, ex 是
+   全局的下一棒)。
+4. **抓 evidence**: 任何 `triage-v1` / `pentest-v1` evidence 中含
+   `cve_*` / `cwe_*` / `severity` 字段 → 当作新发现漏洞, 走下面 §写入。
+5. **写漏洞 + 反哺**: 详见下文"漏洞写入契约"。
+6. **收口**: 调 `backend.update_attack_path_status(path_id, status="completed",
+   vuln_count=N, mark_completed=True)`。
+
+### 漏洞写入契约 (v6 强制)
+
+每发现一个漏洞, **必须**:
+1. 生成 12-hex `vuln_id`
+2. 调 `backend.add_vulnerability(... 全部字段 ...)`
+3. 调 `backend.add_path_vuln(attack_path_id, vuln_id)` (M:N)
+4. 对每个 ancestor_path 边涉及的 node + leaf node, 调
+   `backend.add_node_vuln(tree_id, node_id, vuln_id)` (反哺资产树,
+   让漏洞模块的"叶子节点变红" 生效)
+5. 在 result marker 里加一行 `vulns_added: <count>`
+
+只对 `severity in {'critical','high','medium','low','info'}` 的 evidence
+才记 — 其它弱信号 (informational only) **不**进 vulnerabilities 表。
+
+### 资产树反哺 (v6 强制)
+
+如果 attack 中 specialist 发现**新资产** (新 subdomain / 新 endpoint /
+新 secret), 走 `asset_tree_add_node` 工具写入 (后台 fire-and-forget)。
+**严禁**自己构造 node_id, 必须让 in-memory tree 生成。
+
+### 不该做的事
+
+- **不**为一条 attack-path 重新跑 W1 资产发现 (那是 hack-deep-find 的活)
+- **不** yield 给 hack-deep-ex (那是 W5+ 持久化阶段; 单条 attack-path 完成 = 单条 path 收口)
+- **不** 重跑已经在表里的 path (`backend.list_attack_paths(tree_id, status="completed")` 跳过)
+
+### Result marker 形式
+
+```
+schema: attack-path-v1 | phase: complete | wave: 1/1 | deps: find-complete-v1
+vulns_added: 3
+attack_path_id: <12hex>
+status: completed
+```

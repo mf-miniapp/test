@@ -17,6 +17,8 @@ from opensquilla import __version__
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.asset_tree.web import create_asset_tree_routes
+from opensquilla.vulnerabilities.web import create_vulnerability_routes
+from opensquilla.attack_paths.web import create_attack_path_routes
 from opensquilla.gateway.control_ui import create_control_ui_routes
 from opensquilla.gateway.middleware import (
     AuthMiddleware,
@@ -537,6 +539,16 @@ def create_gateway_app(
     # ── Asset Tree Web UI ────────────────────────────────────────────────
     routes.append(
         Mount("/asset-tree", routes=create_asset_tree_routes())
+    )
+
+    # ── Vulnerabilities Web UI (v6, 2026-06-19) ──────────────────────
+    routes.append(
+        Mount("/vulnerabilities", routes=create_vulnerability_routes())
+    )
+
+    # ── Attack Paths Dashboard Web UI (v6, 2026-06-19) ──────────────
+    routes.append(
+        Mount("/attack-paths", routes=create_attack_path_routes())
     )
 
     # ── Middleware ───────────────────────────────────────────────────────────

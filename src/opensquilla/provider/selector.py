@@ -266,7 +266,7 @@ def build_provider(
 def resolve_tier_provider_config(
     tier_cfg: Mapping[str, Any] | dict | None,
     baseline: ProviderConfig,
-) -> ProviderConfig:
+) -> tuple[ProviderConfig, ProviderConfig]:
     """Resolve a per-tier ``ProviderConfig`` from router tier overrides.
 
     The model router can pin a tier to a different endpoint or API key by
@@ -290,7 +290,7 @@ def resolve_tier_provider_config(
     routing decision path).
     """
     if not tier_cfg:
-        return ProviderConfig(
+        empty = ProviderConfig(
             provider=baseline.provider,
             model=baseline.model,
             api_key=baseline.api_key,
@@ -299,6 +299,7 @@ def resolve_tier_provider_config(
             proxy=baseline.proxy,
             provider_routing=dict(baseline.provider_routing or {}),
         )
+        return empty, baseline
 
     # Accept both Mapping and a dict-like object.
     def _f(key: str, default: Any = "") -> Any:
@@ -316,7 +317,7 @@ def resolve_tier_provider_config(
     tier_routing_raw = _f("provider_routing", None)
     tier_routing = dict(tier_routing_raw) if isinstance(tier_routing_raw, Mapping) else {}
 
-    return ProviderConfig(
+    resolved = ProviderConfig(
         provider=tier_provider or baseline.provider,
         model=tier_model or baseline.model,
         api_key=tier_api_key if tier_api_key else baseline.api_key,
@@ -325,6 +326,7 @@ def resolve_tier_provider_config(
         proxy=tier_proxy or baseline.proxy,
         provider_routing=tier_routing or dict(baseline.provider_routing or {}),
     )
+    return resolved, baseline
 
 
 def _resolve_tier_api_key_env(tier_cfg: Any) -> str:

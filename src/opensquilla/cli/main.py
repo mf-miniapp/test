@@ -15,6 +15,7 @@ warn_if_proxy_ignored()
 
 from opensquilla.cli.agent_cmd import run_agent_command  # noqa: E402
 from opensquilla.cli.agents_cmd import agents_app  # noqa: E402
+from opensquilla.cli.attack_paths_cmd import attack_paths_app  # noqa: E402
 from opensquilla.cli.channels_cmd import channels_app  # noqa: E402
 from opensquilla.cli.config_cmd import app as config_app  # noqa: E402
 from opensquilla.cli.cost_cmd import app as cost_app  # noqa: E402
@@ -46,6 +47,7 @@ app = typer.Typer(
 
 app.add_typer(channels_app, name="channels")
 app.add_typer(agents_app, name="agents")
+app.add_typer(attack_paths_app, name="attack-paths")
 app.add_typer(config_app, name="config")
 app.add_typer(cost_app, name="cost")
 app.add_typer(diagnostics_app, name="diagnostics")

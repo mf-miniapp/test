@@ -77,14 +77,20 @@ class RpcClient {
     this._lastSeq = 0;
     this._lastFrameAt = Date.now();
     this._stopTickWatch();
+    // eslint-disable-next-line no-console
+    console.log('[rpc] _doConnect: creating new WebSocket(' + this._url + ')');
     try {
       this._ws = new WebSocket(this._url);
-    } catch {
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[rpc] new WebSocket threw synchronously', e);
       this._scheduleReconnect();
       return;
     }
 
     this._ws.onopen = () => {
+      // eslint-disable-next-line no-console
+      console.log('[rpc] onopen: socket is OPEN, waiting for connect.challenge');
       this._reconnectDelay = 800;
       // Don't send connect yet — wait for connect.challenge from server
     };
@@ -166,7 +172,24 @@ class RpcClient {
       }
     };
 
-    this._ws.onerror = () => {};
+    this._ws.onerror = (ev) => {
+      // The browser intentionally exposes almost nothing on the error
+      // event for security reasons — we can't read the status code or
+      // response body.  But the event itself is a useful signal that
+      // the WebSocket failed to *establish* (handshake refused, bad
+      // URL, mixed content, proxy stripping Upgrade, etc.).  Surface
+      // it loudly so a stuck DISCONNECTED pill doesn't leave the
+      // operator guessing.
+      const detail = {
+        url: this._url,
+        readyState: this._ws ? this._ws.readyState : null,
+        time: Date.now(),
+      };
+      // eslint-disable-next-line no-console
+      console.warn('[rpc] WebSocket error', detail);
+      const handlers = this._listeners.get('_error');
+      if (handlers) handlers.forEach((h) => h(detail));
+    };
   }
 
   _startPing() {
@@ -232,7 +255,10 @@ class RpcClient {
 
   _setState(s) {
     if (this._state === s) return;
+    const prev = this._state;
     this._state = s;
+    // eslint-disable-next-line no-console
+    console.log('[rpc] state', prev, '->', s, 'url=' + this._url);
     const handlers = this._listeners.get('_state');
     if (handlers) handlers.forEach(h => h(s));
   }

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vulnerabilities — 漏洞列表</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #c9d1d9; --text-dim: #8b949e;
+      --accent: #58a6ff; --accent-dim: #1f6feb;
+      --green: #3fb950; --orange: #d29922; --red: #f85149;
+      --purple: #bc8cff; --radius: 6px;
+      --crit: #f85149; --high: #ff7b72; --med: #d29922;
+      --low: #8b949e; --info: #58a6ff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+           background: var(--bg); color: var(--text); min-height: 100vh; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px;
+             padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    header h1 { font-size: 22px; font-weight: 600; flex: 1; }
+    .nav-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    .nav-link:hover { text-decoration: underline; }
+
+    .filters { background: var(--surface); border: 1px solid var(--border);
+               border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px;
+               display: flex; gap: 12px; align-items: center; }
+    .filters label { color: var(--text-dim); font-size: 13px; }
+    .filters input, .filters select {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 4px 8px; font-size: 13px;
+    }
+    .filters button { background: var(--accent-dim); color: white; border: none;
+                      border-radius: var(--radius); padding: 6px 12px;
+                      cursor: pointer; font-size: 13px; }
+    .filters button:hover { background: var(--accent); }
+
+    .banner { background: var(--surface); border: 1px solid var(--border);
+              border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px;
+              color: var(--text-dim); font-size: 13px; }
+    .banner.warn { border-color: var(--orange); }
+
+    .vuln-table { width: 100%; border-collapse: collapse; background: var(--surface);
+                  border: 1px solid var(--border); border-radius: var(--radius);
+                  overflow: hidden; }
+    .vuln-table th { background: var(--bg); text-align: left; padding: 12px 16px;
+                     font-size: 12px; color: var(--text-dim); text-transform: uppercase;
+                     border-bottom: 1px solid var(--border); }
+    .vuln-table td { padding: 12px 16px; font-size: 14px;
+                     border-bottom: 1px solid var(--border); }
+    .vuln-table tr:last-child td { border-bottom: none; }
+    .vuln-table tr:hover { background: rgba(88, 166, 255, 0.05); }
+    .vuln-table a { color: var(--accent); text-decoration: none; }
+    .vuln-table a:hover { text-decoration: underline; }
+
+    .severity { display: inline-block; padding: 2px 8px; border-radius: 12px;
+                font-size: 12px; font-weight: 600; text-transform: uppercase; }
+    .severity.critical { background: var(--crit); color: white; }
+    .severity.high { background: var(--high); color: white; }
+    .severity.medium { background: var(--med); color: black; }
+    .severity.low { background: var(--low); color: white; }
+    .severity.info { background: var(--info); color: black; }
+
+    .meta { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+    .empty { text-align: center; padding: 64px; color: var(--text-dim); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🛡️ Vulnerabilities</h1>
+      <a class="nav-link" href="/asset-tree/">← 资产树</a>
+    </header>
+
+    {% if db_status.mode == "db_unavailable" %}
+    <div class="banner warn">
+      ⚠️ {{ db_status.hint }}
+    </div>
+    {% endif %}
+
+    <form class="filters" method="get" action="/vulnerabilities/">
+      <label>Tree ID:
+        <input type="text" name="tree_id" value="{{ filter.tree_id or '' }}" placeholder="tree-...">
+      </label>
+      <label>Node ID:
+        <input type="text" name="node_id" value="{{ filter.node_id or '' }}" placeholder="12hex">
+      </label>
+      <label>Severity:
+        <select name="severity">
+          <option value="">— all —</option>
+          <option value="critical" {% if filter.severity == "critical" %}selected{% endif %}>critical</option>
+          <option value="high" {% if filter.severity == "high" %}selected{% endif %}>high</option>
+          <option value="medium" {% if filter.severity == "medium" %}selected{% endif %}>medium</option>
+          <option value="low" {% if filter.severity == "low" %}selected{% endif %}>low</option>
+          <option value="info" {% if filter.severity == "info" %}selected{% endif %}>info</option>
+        </select>
+      </label>
+      <button type="submit">Filter</button>
+    </form>
+
+    {% if vulnerabilities %}
+    <table class="vuln-table">
+      <thead>
+        <tr>
+          <th>Severity</th>
+          <th>Title</th>
+          <th>CWE / CVE</th>
+          <th>Tree / Node</th>
+          <th>Discovered</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in vulnerabilities %}
+        <tr>
+          <td><span class="severity {{ v.severity }}">{{ v.severity }}</span></td>
+          <td>
+            <a href="/vulnerabilities/{{ v.id }}">{{ v.title }}</a>
+            <div class="meta">{{ v.id[:8] }}…</div>
+          </td>
+          <td>
+            {% if v.cve %}<div><strong>CVE:</strong> {{ v.cve }}</div>{% endif %}
+            {% if v.cwe %}<div class="meta">CWE: {{ v.cwe }}</div>{% endif %}
+          </td>
+          <td>
+            <div class="meta">{{ v.tree_id or "—" }}</div>
+            <div class="meta">leaf: {{ v.leaf_node_id[:8] if v.leaf_node_id else "—" }}…</div>
+          </td>
+          <td>
+            <div class="meta">
+              {% if v.discovered_by_wave %}{{ v.discovered_by_wave }}{% endif %}
+              {% if v.discovered_by_specialist %} · {{ v.discovered_by_specialist }}{% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">
+      {% if filter.tree_id or filter.node_id or filter.severity %}
+        过滤条件下没有漏洞。换个条件试试。
+      {% else %}
+        还没有漏洞记录。<br>
+        <span class="meta">跑完一条 attack-path 后, hack-deep 会自动写入 vulnerabilities 表。</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</body>
+</html>

@@ -84,6 +84,24 @@
     }
     .tree-node-toggle.expanded { transform: rotate(90deg); }
     .tree-node-toggle.leaf { visibility: hidden; }
+    /* v6 (2026-06-19) 漏洞叶子节点: 红色 + 警告 badge + 鼠标变手 */
+    .tree-node.has-vuln > .tree-node-header {
+      background: rgba(248, 81, 73, 0.12);
+      border-left: 3px solid var(--red);
+    }
+    .tree-node.has-vuln > .tree-node-header:hover {
+      background: rgba(248, 81, 73, 0.25);
+      cursor: pointer;
+    }
+    .tree-node-vuln-badge {
+      background: var(--red);
+      color: white;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 10px;
+      margin-left: 6px;
+    }
     .tree-node-icon { font-size: 14px; width: 18px; text-align: center; }
     .tree-node-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tree-node-state {
@@ -99,6 +117,55 @@
     .tree-node-children.collapsed { display: none; }
 
     /* ── Empty state ────────────────────────── */
+    /* v6 (2026-06-19) 漏洞模块 — 资产树下方内嵌区块 */
+    .vuln-section {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 16px 24px 24px;
+    }
+    .vuln-section-header {
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 12px;
+    }
+    .vuln-section-header h2 {
+      font-size: 16px; font-weight: 600;
+      flex: 1; color: var(--text);
+    }
+    .vuln-section-body { width: 100%; }
+    .vuln-empty { color: var(--text-dim); font-size: 13px; padding: 12px 0; }
+    .vuln-mini-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 10px;
+    }
+    .vuln-mini-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .vuln-mini-card:hover {
+      border-color: var(--accent);
+      background: rgba(88, 166, 255, 0.05);
+    }
+    .vuln-mini-card .severity {
+      display: inline-block;
+      padding: 1px 8px; border-radius: 10px;
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase;
+      margin-right: 6px;
+    }
+    .vuln-mini-card .severity.critical { background: var(--red); color: white; }
+    .vuln-mini-card .severity.high { background: #ff7b72; color: white; }
+    .vuln-mini-card .severity.medium { background: var(--orange); color: black; }
+    .vuln-mini-card .severity.low { background: var(--text-dim); color: white; }
+    .vuln-mini-card .severity.info { background: var(--accent); color: black; }
+    .vuln-mini-title { font-size: 14px; font-weight: 500; margin-top: 6px; }
+    .vuln-mini-meta { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+    .vuln-mini-cve { color: var(--accent); font-family: monospace; font-size: 12px; }
+
     .empty-state {
       display: flex; flex-direction: column; align-items: center;
       justify-content: center; height: 100%; color: var(--text-dim);
@@ -374,6 +441,17 @@
         </div>
         <div class="detail-panel" id="detailPanel" style="display:none"></div>
       </div>
+
+      <!-- v6 (2026-06-19) 漏洞模块 — 资产树下方内嵌摘要 -->
+      <div class="vuln-section" id="vulnSection">
+        <div class="vuln-section-header">
+          <h2>🛡️ Vulnerabilities</h2>
+          <a class="nav-link" href="/vulnerabilities/" target="_blank">查看全部 →</a>
+        </div>
+        <div class="vuln-section-body" id="vulnSectionBody">
+          <div class="vuln-empty">选择左侧资产树后, 这里显示关联漏洞摘要。</div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -565,6 +643,69 @@
       renderTree(data.tree);
       document.getElementById('detailPanel').style.display = 'none';
       await loadTreeList();
+      // v6 (2026-06-19) 拉所有 leaf node 的漏洞 id, 决定红色 + 跳转
+      await loadVulnMap(treeId, data.tree);
+      await loadVulnSummary(treeId);
+    }
+
+    // v6 (2026-06-19) 加载本树的漏洞摘要 — 资产页下方区块
+    async function loadVulnSummary(treeId) {
+      const body = document.getElementById('vulnSectionBody');
+      body.innerHTML = '<div class="vuln-empty">加载中...</div>';
+      try {
+        const data = await api('GET', `/trees/${treeId}/vulnerabilities-summary`);
+        renderVulnSummary(body, data, treeId);
+      } catch (e) {
+        body.innerHTML = '<div class="vuln-empty">⚠️ 漏洞摘要不可用 (DB 未配置? )</div>';
+      }
+    }
+
+    function renderVulnSummary(container, data, treeId) {
+      const vulns = (data && data.vulnerabilities) || [];
+      if (vulns.length === 0) {
+        container.innerHTML = '<div class="vuln-empty">该树还没有漏洞。跑完 attack-path 后会在这里显示。</div>';
+        return;
+      }
+      // 最多显示 12 个, 多的看链接
+      const shown = vulns.slice(0, 12);
+      const items = shown.map(v => {
+        const cve = v.cve ? `<span class="vuln-mini-cve">${esc(v.cve)}</span>` : '';
+        return `<div class="vuln-mini-card" onclick="window.open('/vulnerabilities/${esc(v.id)}', '_blank')">
+          <span class="severity ${esc(v.severity)}">${esc(v.severity)}</span>
+          ${cve}
+          <div class="vuln-mini-title">${esc(v.title)}</div>
+          <div class="vuln-mini-meta">
+            leaf: ${esc((v.leaf_node_id || '').slice(0, 12))}…  ·  ${esc(v.discovered_by_wave || '')}
+          </div>
+        </div>`;
+      }).join('');
+      const more = vulns.length > 12
+        ? `<div class="vuln-mini-meta" style="margin-top:10px">还有 ${vulns.length - 12} 个 — <a class="nav-link" href="/vulnerabilities/?tree_id=${esc(treeId)}" target="_blank">查看全部 →</a></div>`
+        : '';
+      container.innerHTML = `<div class="vuln-mini-list">${items}</div>${more}`;
+    }
+
+    // v6 (2026-06-19) vulnerability map for leaves
+    // 缓存 {node_id: [vuln_id, ...]}, 渲染时读;
+    // 单次拉所有 leaf 节点的 vuln list, 避免每个 leaf 1 次 N+1。
+    let vulnMap = new Map();
+
+    async function loadVulnMap(treeId, tree) {
+      vulnMap = new Map();
+      if (!tree || !tree.nodes) return;
+      const leaves = tree.nodes.filter(n => !(n.children_ids || []).length);
+      await Promise.all(leaves.map(async (n) => {
+        try {
+          const resp = await api('GET', `/trees/${treeId}/nodes/${n.id}/vulnerabilities`);
+          if (resp && resp.vulnerability_ids && resp.vulnerability_ids.length > 0) {
+            vulnMap.set(n.id, resp.vulnerability_ids);
+          }
+        } catch (e) {
+          // 静默; 后端可能不可用
+        }
+      }));
+      // 重新渲染 (用最新的 vulnMap)
+      renderTree(tree);
     }
 
     function renderStats(data) {
@@ -606,12 +747,23 @@
       const isExpanded = expandedNodes.has(node.id);
       const isSelected = selectedNodeId === node.id;
 
-      let html = `<div class="tree-node ${isRoot ? 'tree-node-root' : ''}">`;
-      html += `<div class="tree-node-header ${isSelected ? 'selected' : ''}" onclick="selectNode('${node.id}')">`;
+      // v6 (2026-06-19) 叶子节点 + 有漏洞 = 红色 + 可点击跳漏洞
+      const vulnIds = vulnMap.get(node.id);
+      const hasVulns = Array.isArray(vulnIds) && vulnIds.length > 0;
+      const vulnClass = hasVulns ? 'has-vuln' : '';
+      const vulnAttr = hasVulns
+        ? ` data-vuln-ids="${vulnIds.join(',')}" onclick="onVulnNodeClick('${node.id}', event)"`
+        : ` onclick="selectNode('${node.id}')"`;
+      const vulnBadge = hasVulns
+        ? `<span class="tree-node-vuln-badge" title="${vulnIds.length} 个漏洞">⚠ ${vulnIds.length}</span>`
+        : '';
+      let html = `<div class="tree-node ${isRoot ? 'tree-node-root' : ''} ${vulnClass}">`;
+      html += `<div class="tree-node-header ${isSelected ? 'selected' : ''}"${vulnAttr}>`;
       html += `<span class="tree-node-toggle ${!hasChildren ? 'leaf' : ''} ${isExpanded ? 'expanded' : ''}" onclick="event.stopPropagation(); toggleNode('${node.id}')">▶</span>`;
       html += `<span class="tree-node-icon">${TYPE_ICONS[node.asset_type] || '📦'}</span>`;
       html += `<span class="tree-node-label">${esc(node.value)}</span>`;
       html += `<span class="tree-node-state state-${node.state}">${node.state}</span>`;
+      html += vulnBadge;
       html += `</div>`;
 
       if (hasChildren) {
@@ -626,6 +778,19 @@
     }
 
     // ── Node selection ─────────────────────
+    // v6 (2026-06-19) 漏洞叶子节点点击 — 1 个跳详情, N 个跳列表
+    function onVulnNodeClick(nodeId, ev) {
+      const vulnIds = vulnMap.get(nodeId) || [];
+      if (vulnIds.length === 1) {
+        window.location.href = `/vulnerabilities/${vulnIds[0]}`;
+      } else if (vulnIds.length > 1) {
+        const treeId = currentTreeId;
+        window.location.href = `/vulnerabilities/?tree_id=${treeId}&node_id=${nodeId}`;
+      } else {
+        selectNode(nodeId);
+      }
+    }
+
     function selectNode(nodeId) {
       selectedNodeId = nodeId;
       // Re-render to update selection highlight

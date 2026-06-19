@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Path — {{ path.path_id }}</title>
+  <style>
+    :root { --bg: #0d1117; --surface: #161b22; --surface-2: #1c2129; --border: #30363d;
+            --text: #c9d1d9; --text-dim: #8b949e; --text-bright: #f0f6fc;
+            --accent: #58a6ff; --accent-dim: #1f6feb;
+            --green: #3fb950; --orange: #d29922; --red: #f85149; --purple: #bc8cff;
+            --radius: 6px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+           background: var(--bg); color: var(--text); line-height: 1.5; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px;
+             padding-bottom: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+    header h1 { font-size: 20px; font-weight: 600; flex: 1; color: var(--text-bright); }
+    .nav-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    .nav-link:hover { text-decoration: underline; }
+    .btn { background: var(--accent-dim); color: white; border: none; border-radius: 4px;
+           padding: 7px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+           text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+    .btn:hover { background: var(--accent); }
+    .btn-success { background: var(--green); color: black; }
+    .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-ghost:hover { background: var(--surface-2); }
+
+    .status-pill { display: inline-block; padding: 4px 12px; border-radius: 12px;
+                   font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+    .status-pending { background: rgba(139, 148, 158, 0.2); color: var(--text-dim); }
+    .status-in_progress { background: rgba(210, 153, 34, 0.2); color: var(--orange); }
+    .status-completed { background: rgba(63, 185, 80, 0.2); color: var(--green); }
+    .status-failed, .status-abandoned { background: rgba(248, 81, 73, 0.2); color: var(--red); }
+
+    .card { background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 13px; font-weight: 600; margin-bottom: 12px;
+               color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.6px;
+               display: flex; align-items: center; gap: 8px; }
+    .card h2 .badge { background: var(--accent-dim); color: white; border-radius: 10px;
+                      padding: 1px 8px; font-size: 11px; }
+    .field { display: flex; padding: 6px 0; border-bottom: 1px solid var(--border); gap: 12px; }
+    .field:last-child { border-bottom: none; }
+    .field-label { width: 140px; color: var(--text-dim); font-size: 13px; flex-shrink: 0; }
+    .field-value { flex: 1; font-size: 13px; word-break: break-all; }
+    code { background: var(--bg); padding: 1px 6px; border-radius: 3px; font-size: 12px;
+           color: var(--accent); font-family: 'SF Mono', Menlo, Consolas, monospace; }
+    pre { background: var(--bg); padding: 12px; border-radius: 4px; overflow-x: auto;
+          font-size: 12px; max-height: 360px; overflow-y: auto; }
+
+    /* ── Edge chain timeline ────────────────────────── */
+    .edge-timeline { list-style: none; padding: 0; position: relative; }
+    .edge-timeline::before { content: ''; position: absolute; left: 22px; top: 12px;
+                              bottom: 12px; width: 2px; background: var(--border); }
+    .edge-item { position: relative; padding: 10px 12px 10px 56px; margin-bottom: 6px;
+                 background: var(--bg); border-radius: 4px; font-size: 13px; }
+    .edge-item .level { position: absolute; left: 0; top: 8px; width: 44px;
+                        text-align: center; font-weight: 600; color: var(--accent); font-size: 12px; }
+    .edge-item .level::after { content: ''; position: absolute; right: -7px; top: 7px;
+                                width: 12px; height: 12px; background: var(--accent);
+                                border-radius: 50%; border: 2px solid var(--bg); }
+    .edge-item.leaf .level::after { background: var(--red); }
+    .edge-item .from-to { color: var(--text-dim); }
+    .edge-item .edge-state { font-size: 11px; color: var(--text-dim); margin-left: 8px; }
+
+    /* ── Vuln cards ─────────────────────────────────── */
+    .vuln-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                 gap: 10px; }
+    .vuln-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+                 padding: 12px; position: relative; }
+    .vuln-card:hover { border-color: var(--accent); }
+    .vuln-card .severity { position: absolute; top: 8px; right: 8px; padding: 2px 8px;
+                            border-radius: 10px; font-size: 10px; font-weight: 600;
+                            text-transform: uppercase; }
+    .vuln-card .severity.critical { background: #7e1d1d; color: white; }
+    .vuln-card .severity.high { background: var(--red); color: white; }
+    .vuln-card .severity.medium { background: var(--orange); color: black; }
+    .vuln-card .severity.low { background: #4d8a2a; color: white; }
+    .vuln-card .severity.info { background: var(--accent-dim); color: white; }
+    .vuln-card .title { font-weight: 600; color: var(--text-bright); margin-bottom: 6px;
+                        padding-right: 70px; font-size: 14px; }
+    .vuln-card .meta { color: var(--text-dim); font-size: 12px; margin-bottom: 6px; }
+    .vuln-card .desc { font-size: 12px; color: var(--text-dim); line-height: 1.5;
+                       max-height: 60px; overflow: hidden; }
+    .vuln-card .ids { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .vuln-card .id-chip { background: var(--surface); border: 1px solid var(--border);
+                          padding: 1px 7px; border-radius: 3px; font-size: 11px;
+                          color: var(--accent); font-family: 'SF Mono', monospace; }
+
+    /* ── Tree 反哺 section ──────────────────────────── */
+    .feed-list { list-style: none; padding: 0; }
+    .feed-list li { padding: 10px 12px; background: var(--bg); border-radius: 4px;
+                    margin-bottom: 6px; font-size: 13px; display: flex; gap: 12px;
+                    align-items: center; }
+    .feed-list li .node { flex: 1; }
+    .feed-list li .count { background: var(--red); color: white; padding: 2px 8px;
+                           border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .feed-list li a { color: var(--accent); text-decoration: none; font-size: 12px; }
+    .feed-list li a:hover { text-decoration: underline; }
+
+    .empty-mini { color: var(--text-dim); font-size: 13px; padding: 20px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <header>
+      <h1>⚔️ {{ path.path_id }}</h1>
+      <span class="status-pill status-{{ path.status }}">{{ path.status }}</span>
+      <a class="nav-link" href="/attack-paths/?tree_id={{ path.tree_id }}">← 回到 dashboard</a>
+      <a class="nav-link" href="/vulnerabilities/?tree_id={{ path.tree_id }}">漏洞列表 →</a>
+      {% if path.status in ['pending', 'failed', 'abandoned'] %}
+      <button class="btn btn-success" onclick="runPath('{{ path.path_id }}', '{{ path.tree_id }}')">▶ Run in chat</button>
+      {% endif %}
+    </header>
+
+    <!-- ── Basic info ──────────────────────────────── -->
+    <div class="card">
+      <h2>基本信息</h2>
+      <div class="field"><div class="field-label">Path ID</div>
+        <div class="field-value"><code>{{ path.path_id }}</code></div></div>
+      <div class="field"><div class="field-label">Tree</div>
+        <div class="field-value"><code>{{ path.tree_id }}</code></div></div>
+      <div class="field"><div class="field-label">Leaf</div>
+        <div class="field-value">
+          <code>{{ path.leaf_type }}={{ path.leaf_value }}</code>
+          (<code>{{ path.leaf_node_id[:12] }}…</code>)
+        </div></div>
+      <div class="field"><div class="field-label">Vuln Count</div>
+        <div class="field-value"><strong style="color:var(--red)">{{ path.vuln_count or 0 }}</strong></div></div>
+      <div class="field"><div class="field-label">Scope</div>
+        <div class="field-value"><code>{{ path.scope_string }}</code></div></div>
+      <div class="field"><div class="field-label">Created</div>
+        <div class="field-value">{{ path.created_at }}</div></div>
+      {% if path.started_at %}
+      <div class="field"><div class="field-label">Started</div>
+        <div class="field-value">{{ path.started_at }}</div></div>
+      {% endif %}
+      {% if path.completed_at %}
+      <div class="field"><div class="field-label">Completed</div>
+        <div class="field-value">{{ path.completed_at }}</div></div>
+      {% endif %}
+      {% if path.error %}
+      <div class="field"><div class="field-label">Error</div>
+        <div class="field-value" style="color:var(--red)">{{ path.error }}</div></div>
+      {% endif %}
+    </div>
+
+    <!-- ── Edge chain ──────────────────────────────── -->
+    <div class="card">
+      <h2>边链 (Edge Chain) <span class="badge">{{ edges | length }} 边</span></h2>
+      {% if edges %}
+      <ul class="edge-timeline">
+        {% for e in edges %}
+        <li class="edge-item {% if loop.last %}leaf{% endif %}">
+          <div class="level">L{{ e.edge_index }}</div>
+          <code>{{ e.from_type }}={{ e.from_value }}</code>
+          <span class="from-to">→</span>
+          <code>{{ e.to_type }}={{ e.to_value }}</code>
+          <span class="edge-state">[{{ e.edge_state }}]</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <div class="empty-mini">无 edge_chain 数据 (可能尚未生成 path)。</div>
+      {% endif %}
+    </div>
+
+    <!-- ── Input envelope (per-path-v1) ────────────── -->
+    <div class="card">
+      <h2>📥 攻击输入 (Input Envelope)</h2>
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">
+        这是这条 path 跑给 hack-deep 的输入 envelope — 边链 + scope + 攻击目标。
+        实际执行由 <code>orchestrator.run_attack_paths</code> 串行分发。
+      </p>
+      <pre><code id="input-json"></code></pre>
+    </div>
+
+    <!-- ── Output evidence ─────────────────────────── -->
+    <div class="card">
+      <h2>📤 攻击输出 (Output / Evidence)
+        <span class="badge">{{ vulnerabilities | length }} findings</span>
+      </h2>
+      {% if vulnerabilities %}
+      <div class="vuln-grid">
+        {% for v in vulnerabilities %}
+        <div class="vuln-card">
+          <span class="severity {{ v.severity or 'info' }}">{{ v.severity or 'info' }}</span>
+          <div class="title">{{ v.title or '(no title)' }}</div>
+          <div class="meta">
+            <code>{{ v.leaf_node_id[:12] }}…</code>
+            {% if v.cve %}· CVE <code>{{ v.cve }}</code>{% endif %}
+            {% if v.cwe %}· CWE <code>{{ v.cwe }}</code>{% endif %}
+          </div>
+          <div class="desc">{{ v.description or '' }}</div>
+          <div class="ids">
+            <a class="id-chip" href="/vulnerabilities/{{ v.id }}">{{ v.id }}</a>
+            {% if v.discovered_by_specialist %}
+            <span class="id-chip" style="color:var(--text-dim);border-color:var(--border)">
+              by {{ v.discovered_by_specialist }}
+            </span>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-mini">暂无漏洞 (未执行 / 执行中 / 未发现)。</div>
+      {% endif %}
+    </div>
+
+    <!-- ── Tree 反哺 ───────────────────────────────── -->
+    <div class="card">
+      <h2>🌳 反哺到资产树 (Tree Feed-back)
+        <span class="badge">{{ node_feeds | length }} node(s)</span>
+      </h2>
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">
+        这次 attack 发现的漏洞反哺到资产树上的节点 (走 <code>vuln_node_vulns</code>
+        关联表)。这些节点在资产树上会变红可点击 → 跳到对应漏洞。
+      </p>
+      {% if node_feeds %}
+      <ul class="feed-list">
+        {% for f in node_feeds %}
+        <li>
+          <span class="node">
+            <code>{{ f.node_id }}</code>
+          </span>
+          <span class="count">{{ f.vuln_ids | length }} vuln</span>
+          <a href="/asset-tree/?tree_id={{ path.tree_id }}&focus_node={{ f.node_id }}" target="_blank">
+            资产树中查看 →
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <div class="empty-mini">本 path 暂无反哺记录 (未执行或未发现漏洞)。</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <script>
+    // 注入 input envelope 预览
+    const inputPayload = {
+      type: "attack-path-v1",
+      path_id: {{ path.path_id | tojson }},
+      tree_id: {{ path.tree_id | tojson }},
+      scope: {{ path.scope_string | tojson }},
+      leaf: {
+        id:   {{ path.leaf_node_id | tojson }},
+        type: {{ path.leaf_type | tojson }},
+        value: {{ path.leaf_value | tojson }}
+      },
+      edges: {{ edges | tojson }}
+    };
+    document.getElementById('input-json').textContent =
+      JSON.stringify(inputPayload, null, 2);
+
+    /**
+     * Hand off the run to the chat surface (same as the dashboard's
+     * ▶ Run button).  The chat view picks up ``?prefill=`` and
+     * auto-sends the slash command, so the user sees streaming
+     * progress and can interrupt / inspect mid-run.
+     */
+    function runPath(_pathId, treeId) {
+      if (!treeId) {
+        alert('Path has no tree_id — cannot hand off');
+        return;
+      }
+      const url = '/control/chat?prefill=' + encodeURIComponent(
+        '/attack-paths run ' + treeId
+      );
+      window.open(url, '_blank');
+    }
+  </script>
+</body>
+</html>

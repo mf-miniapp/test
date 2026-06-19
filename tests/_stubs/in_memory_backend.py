@@ -85,6 +85,10 @@ class InMemoryStubBackend:
     def __init__(self) -> None:
         self._trees: dict[str, dict[str, Any]] = {}
         self._nodes: dict[tuple[str, str], dict[str, Any]] = {}
+        self._attack_paths: dict[str, dict[str, Any]] = {}
+        self._vulnerabilities: dict[str, dict[str, Any]] = {}
+        self._path_vulns: dict[str, set[str]] = {}
+        self._node_vulns: dict[tuple[str, str], set[str]] = {}
         self._edges: dict[tuple[str, str], list[str]] = {}
 
     # ── SQL surface (raw text() path used by list_trees / get_tree) ──
@@ -200,6 +204,92 @@ class InMemoryStubBackend:
         else:
             raise KeyError(f"Node '{node_id}' not found in tree '{tree_id}'")
 
+
+
+    # ── v6 (2026-06-19) stub vuln 4-table methods (in-memory) ─────
+    async def upsert_attack_path(self, *, path_id, tree_id, path_hash, status,
+                                 scope_string, edge_chain_json, leaf_node_id,
+                                 leaf_type, leaf_value, metadata=None) -> None:
+        # v6 (2026-06-19) 幂等: 已存在 row 时保留 status / vuln_count /
+        # started_at / completed_at (匹配 production backend 的
+        # ``on_duplicate_key_update(path_id=path_id)`` 语义 — 那是个
+        # no-op, 原行不动; 我们也按这个语义实现)。
+        if path_id in self._attack_paths:
+            return  # already exists, keep all fields as-is
+        self._attack_paths[path_id] = {
+            "path_id": path_id, "tree_id": tree_id, "path_hash": path_hash,
+            "status": status, "scope_string": scope_string,
+            "edge_chain_json": edge_chain_json,
+            "leaf_node_id": leaf_node_id, "leaf_type": leaf_type,
+            "leaf_value": leaf_value, "metadata": metadata,
+            "vuln_count": 0, "error": None, "created_at": time.time(),
+            "started_at": None, "completed_at": None,
+        }
+
+    async def update_attack_path_status(self, *, path_id, status,
+                                        vuln_count=None, error=None,
+                                        mark_started=False, mark_completed=False) -> None:
+        ap = self._attack_paths.get(path_id)
+        if not ap:
+            return
+        ap["status"] = status
+        if mark_started:
+            ap["started_at"] = time.time()
+        if mark_completed:
+            ap["completed_at"] = time.time()
+        if vuln_count is not None:
+            ap["vuln_count"] = vuln_count
+        if error is not None:
+            ap["error"] = error
+
+    async def get_attack_path(self, path_id):
+        return dict(self._attack_paths.get(path_id, {}) or {}) or None
+
+    async def list_attack_paths(self, tree_id, status=None):
+        out = [dict(v) for v in self._attack_paths.values() if v["tree_id"] == tree_id]
+        if status is not None:
+            out = [v for v in out if v["status"] == status]
+        return out
+
+    async def add_vulnerability(self, *, vuln_id, tree_id, attack_path_id,
+                                leaf_node_id, cwe, cve, severity, title,
+                                description, evidence, request, response,
+                                payload, discovered_by_wave, discovered_by_specialist) -> None:
+        self._vulnerabilities[vuln_id] = {
+            "id": vuln_id, "tree_id": tree_id, "attack_path_id": attack_path_id,
+            "leaf_node_id": leaf_node_id, "cwe": cwe, "cve": cve,
+            "severity": severity, "title": title, "description": description,
+            "evidence_json": evidence, "request": request, "response": response,
+            "payload": payload, "discovered_by_wave": discovered_by_wave,
+            "discovered_by_specialist": discovered_by_specialist,
+            "created_at": time.time(),
+        }
+
+    async def add_path_vuln(self, *, attack_path_id, vulnerability_id) -> None:
+        self._path_vulns.setdefault(attack_path_id, set()).add(vulnerability_id)
+
+    async def add_node_vuln(self, *, tree_id, node_id, vulnerability_id) -> None:
+        self._node_vulns.setdefault((tree_id, node_id), set()).add(vulnerability_id)
+
+    async def list_vulnerabilities(self, tree_id, *, attack_path_id=None,
+                                   leaf_node_id=None, severity=None, limit=200):
+        out = [dict(v) for v in self._vulnerabilities.values() if v["tree_id"] == tree_id]
+        if attack_path_id is not None:
+            out = [v for v in out if v["attack_path_id"] == attack_path_id]
+        if leaf_node_id is not None:
+            out = [v for v in out if v["leaf_node_id"] == leaf_node_id]
+        if severity is not None:
+            out = [v for v in out if v["severity"] == severity]
+        _RANK = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 5}
+        out.sort(key=lambda r: _RANK.get(r.get("severity", "info"), 9))
+        return out[:limit]
+
+    async def get_vulnerability(self, vuln_id):
+        d = self._vulnerabilities.get(vuln_id)
+        return dict(d) if d else None
+
+    async def list_node_vulnerability_ids(self, tree_id, node_id):
+        return sorted(self._node_vulns.get((tree_id, node_id), set()))
 
 class _StubConn:
     """Minimal connection that returns rows from a callback."""

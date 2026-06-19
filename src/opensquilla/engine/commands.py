@@ -377,6 +377,31 @@ _COMMANDS: tuple[CommandDef, ...] = (
         execution={_T: _local("repl.exit"), _S: _local("repl.exit")},
         aliases=("/quit",),
     ),
+    # ---- OpenSquilla attack-path orchestrator (web + tui + channel) -------
+    # 串行按 L0..L7 attack-path 调 hack-deep (v6, 2026-06-19).
+    # 用法: /attack-paths run <tree_id> [--dry-run] [--max-depth N]
+    #                          [--include-states s1,s2,...] [--model M]
+    #                          [--provider P] [--vuln-extractor default]
+    #                          [--auto-approve/--no-auto-approve]
+    CommandDef(
+        name="/attack-paths",
+        usage="/attack-paths run <tree_id> [flags]",
+        description=(
+            "Run the v6 attack-path orchestrator on a single AssetTree: "
+            "enumerate root->leaf paths and dispatch hack-deep serially."
+        ),
+        # web 走 RPC 调 attack_paths.run, 传 user args (前端解析).
+        # channel 同样走 RPC; tui 在 handle_gateway_slash_command 里走
+        # build_and_run_attack_paths in-process.
+        execution={
+            _W: _rpc("attack_paths.run"),
+            _C: _rpc("attack_paths.run"),
+        },
+        aliases=("/attack_paths",),
+        argument_choices=(
+            ArgumentChoice("run", "Run the orchestrator on a tree (default)."),
+        ),
+    ),
     # ---- Channel only -----------------------------------------------------
     CommandDef(
         name="/abort",

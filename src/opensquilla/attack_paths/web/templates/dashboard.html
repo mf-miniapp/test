@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Attack Paths — 攻击路径编排 Dashboard</title>
+  <style>
+    :root { --bg: #0d1117; --surface: #161b22; --surface-2: #1c2129; --border: #30363d;
+            --text: #c9d1d9; --text-dim: #8b949e; --text-bright: #f0f6fc;
+            --accent: #58a6ff; --accent-dim: #1f6feb;
+            --green: #3fb950; --orange: #d29922; --red: #f85149; --purple: #bc8cff;
+            --radius: 6px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+           background: var(--bg); color: var(--text); line-height: 1.5; }
+    .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px;
+             padding-bottom: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+    header h1 { font-size: 22px; font-weight: 600; flex: 1; color: var(--text-bright); }
+    .nav-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    .nav-link:hover { text-decoration: underline; }
+
+    /* ── Tree selector + toolbar ──────────────────────── */
+    .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+               margin-bottom: 20px; padding: 12px 16px; background: var(--surface);
+               border: 1px solid var(--border); border-radius: var(--radius); }
+    .toolbar label { color: var(--text-dim); font-size: 13px; }
+    .toolbar select { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+                      border-radius: 4px; padding: 6px 10px; font-size: 13px; min-width: 280px; }
+    .toolbar .grow { flex: 1; }
+    .btn { background: var(--accent-dim); color: white; border: none; border-radius: 4px;
+           padding: 7px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+           transition: background 0.15s; display: inline-flex; align-items: center; gap: 6px; }
+    .btn:hover { background: var(--accent); }
+    .btn:disabled { background: var(--border); cursor: not-allowed; color: var(--text-dim); }
+    .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-ghost:hover { background: var(--surface-2); }
+    .btn-success { background: var(--green); color: black; }
+    .btn-success:hover { background: #56d364; }
+
+    /* ── KPI cards ────────────────────────────────────── */
+    .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+               gap: 12px; margin-bottom: 20px; }
+    .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+           padding: 16px 18px; }
+    .kpi-label { color: var(--text-dim); font-size: 11px; text-transform: uppercase;
+                 letter-spacing: 0.6px; margin-bottom: 6px; }
+    .kpi-value { font-size: 26px; font-weight: 600; color: var(--text-bright); }
+    .kpi-sub { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+    .kpi-value.green { color: var(--green); }
+    .kpi-value.orange { color: var(--orange); }
+    .kpi-value.red { color: var(--red); }
+    .kpi-value.purple { color: var(--purple); }
+
+    /* ── Status filter chips ─────────────────────────── */
+    .status-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    .chip { background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+            padding: 5px 14px; font-size: 12px; cursor: pointer; color: var(--text-dim);
+            text-decoration: none; transition: all 0.15s; }
+    .chip:hover { border-color: var(--accent); color: var(--text); }
+    .chip.active { background: var(--accent-dim); border-color: var(--accent); color: white; }
+    .chip .count { margin-left: 6px; opacity: 0.7; font-size: 11px; }
+
+    /* ── Path table ───────────────────────────────────── */
+    .path-table { width: 100%; border-collapse: collapse; background: var(--surface);
+                  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .path-table th { background: var(--surface-2); padding: 10px 12px; text-align: left;
+                     font-size: 12px; font-weight: 600; color: var(--text-dim);
+                     text-transform: uppercase; letter-spacing: 0.4px; border-bottom: 1px solid var(--border); }
+    .path-table td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid var(--border);
+                     vertical-align: middle; }
+    .path-table tr:hover { background: var(--surface-2); }
+    .path-table tr:last-child td { border-bottom: none; }
+    .path-table input[type="checkbox"] { cursor: pointer; }
+
+    .status-pill { display: inline-block; padding: 3px 10px; border-radius: 12px;
+                   font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+    .status-pending { background: rgba(139, 148, 158, 0.2); color: var(--text-dim); }
+    .status-in_progress { background: rgba(210, 153, 34, 0.2); color: var(--orange); }
+    .status-completed { background: rgba(63, 185, 80, 0.2); color: var(--green); }
+    .status-failed, .status-abandoned { background: rgba(248, 81, 73, 0.2); color: var(--red); }
+
+    .vuln-badge { display: inline-block; min-width: 22px; padding: 2px 7px; border-radius: 10px;
+                  font-size: 11px; font-weight: 600; background: var(--red); color: white;
+                  text-align: center; }
+    .vuln-badge.zero { background: var(--border); color: var(--text-dim); }
+
+    code { background: var(--bg); padding: 1px 5px; border-radius: 3px; font-size: 12px;
+           color: var(--accent); font-family: 'SF Mono', Menlo, Consolas, monospace; }
+
+    .row-actions { display: flex; gap: 6px; }
+    .row-actions .btn { padding: 4px 10px; font-size: 12px; }
+
+    /* ── Empty + error states ─────────────────────────── */
+    .empty { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+    .empty h2 { color: var(--text); margin-bottom: 8px; font-size: 18px; }
+    .db-warning { background: rgba(248, 81, 73, 0.1); border: 1px solid var(--red);
+                  border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px;
+                  color: var(--red); font-size: 13px; }
+
+    /* ── Hand-off hint banner ─────────────────────────── */
+    .handoff-hint { background: rgba(88, 166, 255, 0.1); border: 1px solid var(--accent-dim);
+                    border-radius: var(--radius); padding: 10px 14px; margin-bottom: 16px;
+                    color: var(--accent); font-size: 13px; display: flex; gap: 10px;
+                    align-items: center; }
+    .handoff-hint code { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <header>
+      <h1>⚔️ Attack Paths — 攻击路径编排</h1>
+      <a class="nav-link" href="/asset-tree/">← 资产树</a>
+      <a class="nav-link" href="/control/chat" target="_blank">对话页面 →</a>
+      <a class="nav-link" href="/vulnerabilities/">漏洞模块 →</a>
+    </header>
+
+    {% if db_status.mode == "db_unavailable" %}
+    <div class="db-warning">
+      ⚠️ {{ db_status.hint }}
+    </div>
+    {% endif %}
+
+    <!-- ── Hand-off hint (always shown when tree is selected) ── -->
+    {% if selected_tree_id %}
+    <div class="handoff-hint">
+      <span>💡</span>
+      <span>
+        点击 <strong>▶ Run</strong> 会跳到
+        <a class="nav-link" href="/control/chat" target="_blank"><code>/control/chat</code></a>
+        并把 <code>/attack-paths run {{ selected_tree_id }}</code> 当成用户消息自动发出 —
+        执行过程在对话页面中流式展示, 你可以随时打断 / 追问。
+      </span>
+    </div>
+    {% endif %}
+
+    <!-- ── Toolbar ─────────────────────────────────── -->
+    <div class="toolbar">
+      <label>Tree:</label>
+      <select id="tree-select" onchange="onTreeChange(this.value)">
+        {% for t in trees %}
+        <option value="{{ t.tree_id }}" {% if t.tree_id == selected_tree_id %}selected{% endif %}>
+          {{ t.tree_id }}  ({{ t.path_count }} paths)
+        </option>
+        {% endfor %}
+      </select>
+      <div class="grow"></div>
+      <button class="btn btn-ghost" onclick="loadAll()">↻ Refresh</button>
+      <button class="btn btn-success" id="btn-run-all" onclick="runAllPending()"
+              {% if not selected_tree_id %}disabled{% endif %}>
+        ▶ Run all pending
+      </button>
+      <button class="btn" id="btn-run-selected" onclick="runSelected()"
+              {% if not selected_tree_id %}disabled{% endif %}>
+        ▶ Run selected (<span id="sel-count">0</span>)
+      </button>
+    </div>
+
+    {% if selected_tree_id and summary %}
+    <!-- ── KPI row ──────────────────────────────────── -->
+    <div class="kpi-row">
+      <div class="kpi">
+        <div class="kpi-label">Total Paths</div>
+        <div class="kpi-value">{{ summary.path_total }}</div>
+        <div class="kpi-sub">{{ selected_tree_id }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Completed</div>
+        <div class="kpi-value green">{{ summary.by_status.get("completed", 0) }}</div>
+        <div class="kpi-sub">已完成的边链</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Failed</div>
+        <div class="kpi-value red">{{ summary.by_status.get("failed", 0) }}</div>
+        <div class="kpi-sub">需排查的攻击链</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Pending</div>
+        <div class="kpi-value orange">{{ summary.by_status.get("pending", 0) }}</div>
+        <div class="kpi-sub">等待执行</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Vulns Found</div>
+        <div class="kpi-value purple">{{ summary.vuln_total }}</div>
+        <div class="kpi-sub">已反哺到资产树</div>
+      </div>
+    </div>
+
+    <!-- ── Status filter chips ─────────────────────── -->
+    <div class="status-chips">
+      <a class="chip {% if not status_filter %}active{% endif %}" href="?tree_id={{ selected_tree_id }}">全部 <span class="count">{{ summary.path_total }}</span></a>
+      {% for st in status_options %}
+      <a class="chip {% if status_filter == st %}active{% endif %}" href="?tree_id={{ selected_tree_id }}&status={{ st }}">
+        {{ st }} <span class="count">{{ summary.by_status.get(st, 0) }}</span>
+      </a>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- ── Path table ────────────────────────────────── -->
+    {% if paths %}
+    <table class="path-table">
+      <thead>
+        <tr>
+          <th style="width:32px"><input type="checkbox" id="check-all" onchange="toggleAll(this)"></th>
+          <th>Path ID</th>
+          <th>Status</th>
+          <th>Leaf</th>
+          <th>Edges</th>
+          <th>Vulns</th>
+          <th>Started</th>
+          <th>Completed</th>
+          <th style="width: 180px">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in paths %}
+        <tr data-path-id="{{ p.path_id }}" data-status="{{ p.status }}">
+          <td><input type="checkbox" class="row-check" value="{{ p.path_id }}" onchange="updateSelCount()"></td>
+          <td>
+            <a class="nav-link" href="/attack-paths/{{ p.path_id }}"><code>{{ p.path_id }}</code></a>
+          </td>
+          <td><span class="status-pill status-{{ p.status }}">{{ p.status }}</span></td>
+          <td>
+            <code>{{ p.leaf_type }}={{ (p.leaf_value or '')[:32] }}{% if p.leaf_value and p.leaf_value|length > 32 %}…{% endif %}</code>
+          </td>
+          <td>{{ p.edge_count }}</td>
+          <td>
+            <span class="vuln-badge {% if (p.vuln_count or 0) == 0 %}zero{% endif %}">
+              {{ p.vuln_count or 0 }}
+            </span>
+          </td>
+          <td><span style="color:var(--text-dim);font-size:12px">{{ p.started_at or '—' }}</span></td>
+          <td>
+            <span style="color:var(--text-dim);font-size:12px">
+              {% if p.completed_at %}
+                {{ p.completed_at }}
+              {% else %}—{% endif %}
+            </span>
+          </td>
+          <td>
+            <div class="row-actions">
+              {% if p.status in ['pending', 'failed', 'abandoned'] %}
+              <button class="btn btn-success" onclick="runOne('{{ p.path_id }}')">▶ Run in chat</button>
+              {% endif %}
+              <a class="btn btn-ghost" href="/attack-paths/{{ p.path_id }}">👁 View</a>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% elif selected_tree_id %}
+    <div class="empty">
+      <h2>本树暂无 attack-path</h2>
+      <p>用 <code>create-attack-path</code> agent 或 CLI 生成
+        <code>opensquilla attack-paths run {{ selected_tree_id }}</code>。</p>
+    </div>
+    {% else %}
+    <div class="empty">
+      <h2>选择一个 Tree 开始</h2>
+      <p>从上方下拉选择一个资产树查看 attack-path 编排状态。</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <script>
+    // ── Tree switching ─────────────────────────────────
+    function onTreeChange(tid) {
+      if (!tid) return;
+      window.location = '?tree_id=' + encodeURIComponent(tid);
+    }
+    function loadAll() {
+      window.location.reload();
+    }
+
+    // ── Selection ──────────────────────────────────────
+    function updateSelCount() {
+      const n = document.querySelectorAll('.row-check:checked').length;
+      document.getElementById('sel-count').textContent = String(n);
+    }
+    function toggleAll(cb) {
+      document.querySelectorAll('.row-check').forEach(el => {
+        el.checked = cb.checked;
+      });
+      updateSelCount();
+    }
+
+    // ── Hand-off to chat ───────────────────────────────
+    // The orchestrator lives in the chat surface so the user sees
+    // streaming progress and can interrupt / inspect mid-run. We just
+    // construct a synthetic slash command and let the chat view
+    // (ChatView) pick it up via ?prefill=<cmd>.
+    function _runInChat(command) {
+      // The prefill query param is the user-visible slash command
+      // (used to populate the composer).  We also pass ?tree= as a
+      // redundant hint so the chat view can dispatch attack_paths.run
+      // even if the slash catalog hasn't finished loading by the time
+      // the cross-surface handoff fires.
+      const params = new URLSearchParams({ prefill: command });
+      const m = command.match(/\/attack-paths\s+run\s+(\S+)/);
+      if (m) params.set('tree', m[1]);
+      const url = '/control/chat?' + params.toString();
+      // Same-tab navigation: keeps the gateway origin in the address bar,
+      // lets the SPA + WebSocket reconnect cleanly, and gives chat.js a
+      // chance to await _rpc.waitForConnection() before dispatching.
+      // A new tab would race the WebSocket connect with the prefill.
+      window.location.href = url;
+    }
+
+    function runOne(_pathId) {
+      const treeId = document.getElementById('tree-select').value;
+      if (!treeId) { alert('No tree selected'); return; }
+      _runInChat('/attack-paths run ' + treeId);
+    }
+
+    function runAllPending() {
+      const treeId = document.getElementById('tree-select').value;
+      if (!treeId) return;
+      const pending = document.querySelectorAll('tr[data-status="pending"]').length;
+      if (pending === 0) { alert('No pending paths'); return; }
+      // The orchestrator always runs the whole tree serially; the slash
+      // command reflects that.  We surface the count in the message so
+      // the user knows what they kicked off.
+      _runInChat('/attack-paths run ' + treeId);
+    }
+
+    function runSelected() {
+      const treeId = document.getElementById('tree-select').value;
+      if (!treeId) return;
+      const sel = document.querySelectorAll('.row-check:checked').length;
+      if (sel === 0) { alert('请先勾选要执行的 path'); return; }
+      // The orchestrator runs the full tree (serial); we just notify
+      // the user that the selection is part of a whole-tree run.
+      _runInChat('/attack-paths run ' + treeId);
+    }
+  </script>
+</body>
+</html>

@@ -26,6 +26,10 @@ from opensquilla.asset_tree.db.schema import (
     asset_nodes,
     asset_state_transitions,
     asset_trees,
+    vuln_attack_paths,
+    vuln_node_vulns,
+    vuln_path_vulns,
+    vulnerabilities,
 )
 
 __all__ = [

@@ -30,6 +30,7 @@ _PATH_REMOTE_GATEWAY_MESSAGE = _input_bridge.PATH_REMOTE_GATEWAY_MESSAGE
 GATEWAY_SLASH_HANDLER_WORDS = frozenset(
     {
         "/approvals",
+        "/attack-paths",
         "/clear",
         "/compact",
         "/cost",
@@ -388,11 +389,118 @@ async def handle_gateway_slash_command(
         await _handle_forget_command(cmd, client)
         return True
 
+    if cmd == "/attack-paths" or cmd.startswith("/attack-paths "):
+        await _handle_attack_paths_command(cmd, client)
+        return True
+
     if cmd == "/approvals" or cmd.startswith("/approvals "):
         await _handle_approvals_command(cmd, client)
         return True
 
     return False
+
+
+async def _handle_attack_paths_command(cmd: str, client: GatewayClientLike) -> None:
+    """TUI bridge for ``/attack-paths run <tree_id> [flags]``.
+
+    The TUI runs alongside the gateway, so we call
+    :func:`build_and_run_attack_paths` in-process rather than going
+    back through the gateway RPC. Output uses the same compact summary
+    the CLI prints.
+    """
+    # Drop the ``/attack-paths`` head, then strip an optional leading ``run``.
+    body = cmd[len("/attack-paths"):].strip()
+    tokens = body.split()
+    if tokens and tokens[0].lower() == "run":
+        tokens = tokens[1:]
+    if not tokens:
+        console.print("[red]Usage: /attack-paths run <tree_id> [flags][/red]")
+        return
+    tree_id = tokens[0]
+    flags = tokens[1:]
+
+    dry_run = False
+    max_depth = 7
+    include_states = "unseen,discovered,triaged"
+    model: str | None = None
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    vuln_extractor = "default"
+    auto_approve = True
+    i = 0
+    while i < len(flags):
+        tok = flags[i]
+        if tok == "--dry-run":
+            dry_run = True
+        elif tok == "--auto-approve":
+            auto_approve = True
+        elif tok == "--no-auto-approve":
+            auto_approve = False
+        elif tok.startswith("--") and i + 1 < len(flags) and not flags[i + 1].startswith("--"):
+            key = tok[2:]
+            val = flags[i + 1]
+            if key == "max-depth":
+                try:
+                    max_depth = int(val)
+                except ValueError:
+                    console.print(f"[red]bad --max-depth: {val}[/red]")
+                    return
+            elif key == "include-states":
+                include_states = val
+            elif key == "vuln-extractor":
+                vuln_extractor = val
+            elif key == "model":
+                model = val
+            elif key == "provider":
+                provider = val
+            elif key == "base-url":
+                base_url = val
+            elif key == "api-key":
+                api_key = val
+            else:
+                console.print(f"[yellow]unknown flag: {tok} (ignored)[/yellow]")
+            i += 1
+        elif tok.startswith("--"):
+            console.print(f"[yellow]unknown flag (no value): {tok} (ignored)[/yellow]")
+        else:
+            console.print(f"[yellow]unexpected token: {tok} (ignored)[/yellow]")
+        i += 1
+
+    from opensquilla.orchestrator.run_attack_paths import (
+        BuildAndRunError,
+        BuildAndRunOptions,
+        build_and_run_attack_paths,
+    )
+
+    states = tuple(s.strip() for s in include_states.split(",") if s.strip())
+    console.print(
+        f"[{ACCENT_HEADER}]attack-paths[/] run on tree=[{ACCENT}]{tree_id}[/] "
+        f"dry_run={dry_run} max_depth={max_depth}"
+    )
+    try:
+        result = await build_and_run_attack_paths(BuildAndRunOptions(
+            tree_id=tree_id, dry_run=dry_run,
+            max_depth=max_depth, include_states=states,
+            model=model, provider=provider,
+            base_url=base_url, api_key=api_key,
+            vuln_extractor=vuln_extractor, auto_approve=auto_approve,
+        ))
+    except BuildAndRunError as exc:
+        msg = str(exc)
+        if msg.startswith("2:"):
+            console.print(f"[red]{msg[2:]}[/red]")
+        elif msg.startswith("3:"):
+            console.print(f"[red]{msg[2:]}[/red]")
+        elif msg.startswith("4:"):
+            console.print(f"[red]{msg[2:]}[/red]")
+        else:
+            console.print(f"[red]{msg}[/red]")
+        return
+    # Reuse the CLI's pretty printer.
+    from opensquilla.cli.attack_paths_cmd import _print_summary
+    _print_summary(result)
+
 
 
 async def _handle_tool_compress_command(

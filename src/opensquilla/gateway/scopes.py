@@ -149,6 +149,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
     "sessions.compact": WRITE_SCOPE,
+    "attack_paths.run": WRITE_SCOPE,  # OpenSquilla-only; triggers hack-deep dispatch.
     "sessions.truncate": WRITE_SCOPE,
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,

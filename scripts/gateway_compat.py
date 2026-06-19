@@ -399,30 +399,32 @@ if ENABLE_OPENAI:
         async def _sse() -> AsyncIterator[bytes]:
             # 1) Role + any text content (only if both are non-empty).
             if text_content:
-                yield f"data: {json.dumps({
-                    'id': chunk_id,
-                    'object': 'chat.completion.chunk',
-                    'created': chunk_created,
-                    'model': chunk_model,
-                    'choices': [{
-                        'index': choice_index,
-                        'delta': {'role': 'assistant', 'content': text_content},
-                        'finish_reason': None,
+                _first_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": chunk_created,
+                    "model": chunk_model,
+                    "choices": [{
+                        "index": choice_index,
+                        "delta": {"role": "assistant", "content": text_content},
+                        "finish_reason": None,
                     }],
-                }, ensure_ascii=False)}\n\n".encode("utf-8")
+                }
+                yield f"data: {json.dumps(_first_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
             elif not has_tool_calls:
                 # Plain text completion: collapse to a single chunk.
-                yield f"data: {json.dumps({
-                    'id': chunk_id,
-                    'object': 'chat.completion.chunk',
-                    'created': chunk_created,
-                    'model': chunk_model,
-                    'choices': [{
-                        'index': choice_index,
-                        'delta': message,
-                        'finish_reason': finish_reason,
+                _plain_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": chunk_created,
+                    "model": chunk_model,
+                    "choices": [{
+                        "index": choice_index,
+                        "delta": message,
+                        "finish_reason": finish_reason,
                     }],
-                }, ensure_ascii=False)}\n\n".encode("utf-8")
+                }
+                yield f"data: {json.dumps(_plain_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
             # 2) One chunk per tool call, each carrying its `index`.
             for i, tc in enumerate(tool_calls):
@@ -439,31 +441,33 @@ if ENABLE_OPENAI:
                         "arguments": (tc.get("function") or {}).get("arguments") or "",
                     },
                 }
-                yield f"data: {json.dumps({
-                    'id': chunk_id,
-                    'object': 'chat.completion.chunk',
-                    'created': chunk_created,
-                    'model': chunk_model,
-                    'choices': [{
-                        'index': choice_index,
-                        'delta': {'tool_calls': [delta_tc]},
-                        'finish_reason': None,
+                _tc_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": chunk_created,
+                    "model": chunk_model,
+                    "choices": [{
+                        "index": choice_index,
+                        "delta": {"tool_calls": [delta_tc]},
+                        "finish_reason": None,
                     }],
-                }, ensure_ascii=False)}\n\n".encode("utf-8")
+                }
+                yield f"data: {json.dumps(_tc_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
             # 3) Final chunk: empty delta, finish_reason set.
             if has_tool_calls or text_content:
-                yield f"data: {json.dumps({
-                    'id': chunk_id,
-                    'object': 'chat.completion.chunk',
-                    'created': chunk_created,
-                    'model': chunk_model,
-                    'choices': [{
-                        'index': choice_index,
-                        'delta': {},
-                        'finish_reason': finish_reason,
+                _final_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": chunk_created,
+                    "model": chunk_model,
+                    "choices": [{
+                        "index": choice_index,
+                        "delta": {},
+                        "finish_reason": finish_reason,
                     }],
-                }, ensure_ascii=False)}\n\n".encode("utf-8")
+                }
+                yield f"data: {json.dumps(_final_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
             yield b"data: [DONE]\n\n"
 

@@ -81,6 +81,8 @@ const App = (() => {
         <a class="nav-item" href="#" data-path="/usage">${icons.usage()} Usage</a>
         <a class="nav-item" href="#" data-path="/cron">${icons.cron()} Cron</a>
         <a class="nav-item" href="${basePath}/../asset-tree/" target="_blank" rel="noopener">${icons.monitor()} Asset Tree</a>
+        <a class="nav-item" href="${basePath}/../vulnerabilities/" target="_blank" rel="noopener" title="Vulnerabilities discovered across attack paths">${icons.shield()} Vulnerabilities</a>
+        <a class="nav-item" href="${basePath}/../attack-paths/" target="_blank" rel="noopener" title="Attack-path orchestrator dashboard (L0..L7 dispatch)">${icons.swords()} Attack Paths</a>
         <div class="nav-group-label">Settings</div>
         <a class="nav-item" href="#" data-path="/config">${icons.config()} Config</a>
         <a class="nav-item" href="#" data-path="/logs">${icons.logs()} Logs</a>
@@ -172,6 +174,8 @@ const App = (() => {
 
   function _bindConnectionState() {
     const VARIANT = { connected: 'ok', connecting: 'warn', disconnected: 'err' };
+    let _errorCount = 0;
+    let _lastError = null;
     rpc.on('_state', (state) => {
       const pill = document.getElementById('conn-pill');
       if (!pill) return;
@@ -179,13 +183,47 @@ const App = (() => {
       pill.className = `conn-pill ${variant}${variant === 'ok' ? ' compact' : ''}`;
       const label = state.charAt(0).toUpperCase() + state.slice(1);
       pill.textContent = label;
-      pill.title = label;
+      // Reset the error counter each time we successfully connect so
+      // a transient blip doesn't permanently lock the pill into
+      // "unreachable" mode.
+      if (state === 'connected') {
+        _errorCount = 0;
+        _lastError = null;
+        pill.title = label;
+        return;
+      }
+      // After 3 failed handshake attempts, surface the last WS error
+      // in the tooltip so the operator has something to act on.
+      if (_errorCount >= 3) {
+        const url = _lastError ? _lastError.url : '(unknown)';
+        pill.title = 'WebSocket unreachable (' + _errorCount + ' failed attempts) — URL: ' + url
+          + '. Check the Setup page or devtools console.';
+      } else {
+        pill.title = label;
+      }
+    });
+    rpc.on('_error', (detail) => {
+      _errorCount += 1;
+      _lastError = detail;
+      const pill = document.getElementById('conn-pill');
+      if (!pill) return;
+      // After 3 failures, rewrite the tooltip to point at setup.
+      if (_errorCount >= 3) {
+        pill.title = 'WebSocket unreachable (' + _errorCount + ' failed attempts) — URL: ' + detail.url
+          + '. Check the Setup page or devtools console.';
+      }
     });
   }
 
   function _autoConnect() {
     if (!rpc || rpc.state !== 'disconnected') return;
     const { url, token } = loadConnectionSettings();
+    // Surface the target URL so a stuck DISCONNECTED pill is easy to
+    // diagnose: open devtools, look for [app] autoConnect URL=... and
+    // compare to the gateway's actual listen address.
+    const tokenMasked = token ? token.slice(0, 4) + '***' + token.slice(-4) : '(none)';
+    // eslint-disable-next-line no-console
+    console.log('[app] autoConnect URL=' + url + ' token=' + tokenMasked);
     rpc.connect(url, token || undefined);
   }
 

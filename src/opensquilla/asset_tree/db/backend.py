@@ -235,6 +235,123 @@ class AssetTreeBackend(ABC):
     async def find_shared_ips(self, tree_id: str) -> dict[str, list[str]]:
         """{ip_value: [parent_id, ...]} — IPs shared by ≥2 sub_domains."""
 
+    # ── v6 (2026-06-19) 漏洞与攻击路径 ABC 接口 ─────────────────────
+    #
+    # 4 张新表 (vuln_attack_paths / vulnerabilities / vuln_path_vulns /
+    # vuln_node_vulns) 与 asset_tree 共享 connection pool; 这些方法
+    # 构成 attack-path 编排链路的持久化基础。
+
+    @abstractmethod
+    async def upsert_attack_path(
+        self,
+        *,
+        path_id: str,
+        tree_id: str,
+        path_hash: str,
+        status: str,
+        scope_string: str,
+        edge_chain_json: dict[str, Any],
+        leaf_node_id: str,
+        leaf_type: str,
+        leaf_value: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Create or no-op update on a vuln_attack_paths row.
+
+        ``path_hash`` is the SHA1 hex of the edge chain — the UNIQUE
+        constraint enforces idempotency: re-running the same topology
+        returns the same path_id (idempotent re-ingest).
+        """
+
+    @abstractmethod
+    async def update_attack_path_status(
+        self,
+        *,
+        path_id: str,
+        status: str,
+        vuln_count: int | None = None,
+        error: str | None = None,
+        mark_started: bool = False,
+        mark_completed: bool = False,
+    ) -> None:
+        """Update attack path status / counters / error.
+
+        Exactly one of mark_started / mark_completed should be True
+        when transitioning to in_progress / completed. If both False,
+        only the status + counters are updated (used for failed
+        transitions).
+        """
+
+    @abstractmethod
+    async def get_attack_path(
+        self, path_id: str,
+    ) -> dict[str, Any] | None:
+        """Fetch a single attack path row by id, or None."""
+
+    @abstractmethod
+    async def list_attack_paths(
+        self, tree_id: str, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List attack paths in a tree, optionally filtered by status."""
+
+    @abstractmethod
+    async def add_vulnerability(
+        self,
+        *,
+        vuln_id: str,
+        tree_id: str,
+        attack_path_id: str | None,
+        leaf_node_id: str,
+        cwe: str | None,
+        cve: str | None,
+        severity: str,
+        title: str,
+        description: str | None,
+        evidence: dict[str, Any] | None,
+        request: str | None,
+        response: str | None,
+        payload: str | None,
+        discovered_by_wave: str | None,
+        discovered_by_specialist: str | None,
+    ) -> None:
+        """Insert one vulnerability row."""
+
+    @abstractmethod
+    async def add_path_vuln(
+        self, *, attack_path_id: str, vulnerability_id: str,
+    ) -> None:
+        """Link a vulnerability to an attack path (M:N)."""
+
+    @abstractmethod
+    async def add_node_vuln(
+        self, *, tree_id: str, node_id: str, vulnerability_id: str,
+    ) -> None:
+        """Link a vulnerability to a node (反哺资产树)."""
+
+    @abstractmethod
+    async def list_vulnerabilities(
+        self,
+        tree_id: str,
+        *,
+        attack_path_id: str | None = None,
+        leaf_node_id: str | None = None,
+        severity: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """List vulnerabilities for a tree with optional filters."""
+
+    @abstractmethod
+    async def get_vulnerability(
+        self, vuln_id: str,
+    ) -> dict[str, Any] | None:
+        """Fetch a single vulnerability row, or None."""
+
+    @abstractmethod
+    async def list_node_vulnerability_ids(
+        self, tree_id: str, node_id: str,
+    ) -> list[str]:
+        """Return vulnerability ids associated with a node (反哺查询用)."""
+
     @abstractmethod
     async def close(self) -> None:
         """Release the connection pool."""
@@ -277,6 +394,10 @@ class _SqlAlchemyBackend(AssetTreeBackend):
             asset_nodes,
             asset_state_transitions,
             asset_trees,
+            vuln_attack_paths,
+            vuln_node_vulns,
+            vuln_path_vulns,
+            vulnerabilities,
         )
 
         metadata = all_metadata()
@@ -286,10 +407,13 @@ class _SqlAlchemyBackend(AssetTreeBackend):
         # MySQL post-creation: enforce InnoDB + utf8mb4 explicitly so a
         # CREATE TABLE emitted by SQLAlchemy that didn't specify the
         # engine still ends up with the right storage engine / charset.
+        # v6 (2026-06-19) 加 vuln_* 4 张表。
         if self._INSERT_DIALECT_ATTR == "mysql":
             async with self._engine.begin() as conn:
                 for tbl in (asset_trees, asset_nodes, asset_edges,
-                            asset_state_transitions, asset_evidence_refs):
+                            asset_state_transitions, asset_evidence_refs,
+                            vuln_attack_paths, vulnerabilities,
+                            vuln_path_vulns, vuln_node_vulns):
                     await conn.execute(text(
                         f"ALTER TABLE {tbl.name} "
                         "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 "
@@ -794,6 +918,246 @@ class _SqlAlchemyBackend(AssetTreeBackend):
             for value, parent_id in result:
                 ip_to_parents.setdefault(value, []).append(parent_id)
             return {ip: ps for ip, ps in ip_to_parents.items() if len(ps) > 1}
+
+    # ── v6 (2026-06-19) 漏洞与攻击路径 SQLAlchemy 实现 ─────────────
+
+    async def upsert_attack_path(
+        self,
+        *,
+        path_id: str,
+        tree_id: str,
+        path_hash: str,
+        status: str,
+        scope_string: str,
+        edge_chain_json: dict[str, Any],
+        leaf_node_id: str,
+        leaf_type: str,
+        leaf_value: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Insert vuln_attack_paths, no-op on (tree_id, path_hash) conflict."""
+        from sqlalchemy.dialects.mysql import insert as _mysql_insert
+        from opensquilla.asset_tree.db.schema import vuln_attack_paths as _tap
+        stmt = _mysql_insert(_tap).values(
+            path_id=path_id,
+            tree_id=tree_id,
+            path_hash=path_hash,
+            status=status,
+            scope_string=scope_string,
+            edge_chain_json=edge_chain_json,
+            leaf_node_id=leaf_node_id,
+            leaf_type=leaf_type,
+            leaf_value=leaf_value,
+            metadata=metadata,
+        )
+        # Idempotent: if the same (tree_id, path_hash) exists, keep
+        # the existing row (path_id, status, leaf_*, etc.) untouched.
+        stmt = stmt.on_duplicate_key_update(
+            path_id=_tap.c.path_id,  # no-op
+        )
+        async with self._session() as session:
+            await session.execute(stmt)
+            await session.commit()
+
+    async def update_attack_path_status(
+        self,
+        *,
+        path_id: str,
+        status: str,
+        vuln_count: int | None = None,
+        error: str | None = None,
+        mark_started: bool = False,
+        mark_completed: bool = False,
+    ) -> None:
+        from opensquilla.asset_tree.db.schema import vuln_attack_paths as _tap
+        values: dict[str, Any] = {"status": status}
+        if mark_started:
+            values["started_at"] = datetime.now(timezone.utc)
+        if mark_completed:
+            values["completed_at"] = datetime.now(timezone.utc)
+        if vuln_count is not None:
+            values["vuln_count"] = vuln_count
+        if error is not None:
+            values["error"] = error
+        async with self._session() as session:
+            await session.execute(
+                _tap.update().where(_tap.c.path_id == path_id).values(**values)
+            )
+            await session.commit()
+
+    async def get_attack_path(
+        self, path_id: str,
+    ) -> dict[str, Any] | None:
+        from opensquilla.asset_tree.db.schema import vuln_attack_paths as _tap
+        async with self._session() as session:
+            result = await session.execute(
+                select(_tap).where(_tap.c.path_id == path_id)
+            )
+            row = result.first()
+            if row is None:
+                return None
+            d = dict(row._mapping)
+            for json_col in ("edge_chain_json", "metadata"):
+                v = d.get(json_col)
+                if isinstance(v, str):
+                    try:
+                        d[json_col] = json.loads(v)
+                    except json.JSONDecodeError:
+                        d[json_col] = None
+            return d
+
+    async def list_attack_paths(
+        self, tree_id: str, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        from opensquilla.asset_tree.db.schema import vuln_attack_paths as _tap
+        async with self._session() as session:
+            stmt = select(_tap).where(_tap.c.tree_id == tree_id)
+            if status is not None:
+                stmt = stmt.where(_tap.c.status == status)
+            stmt = stmt.order_by(_tap.c.created_at.desc())
+            result = await session.execute(stmt)
+            out: list[dict[str, Any]] = []
+            for row in result:
+                d = dict(row._mapping)
+                for json_col in ("edge_chain_json", "metadata"):
+                    v = d.get(json_col)
+                    if isinstance(v, str):
+                        try:
+                            d[json_col] = json.loads(v)
+                        except json.JSONDecodeError:
+                            d[json_col] = None
+                out.append(d)
+            return out
+
+    async def add_vulnerability(
+        self,
+        *,
+        vuln_id: str,
+        tree_id: str,
+        attack_path_id: str | None,
+        leaf_node_id: str,
+        cwe: str | None,
+        cve: str | None,
+        severity: str,
+        title: str,
+        description: str | None,
+        evidence: dict[str, Any] | None,
+        request: str | None,
+        response: str | None,
+        payload: str | None,
+        discovered_by_wave: str | None,
+        discovered_by_specialist: str | None,
+    ) -> None:
+        from opensquilla.asset_tree.db.schema import vulnerabilities as _v
+        async with self._session() as session:
+            await session.execute(_v.insert().values(
+                id=vuln_id, tree_id=tree_id,
+                attack_path_id=attack_path_id, leaf_node_id=leaf_node_id,
+                cwe=cwe, cve=cve, severity=severity, title=title,
+                description=description, evidence_json=evidence,
+                request=request, response=response, payload=payload,
+                discovered_by_wave=discovered_by_wave,
+                discovered_by_specialist=discovered_by_specialist,
+            ))
+            await session.commit()
+
+    async def add_path_vuln(
+        self, *, attack_path_id: str, vulnerability_id: str,
+    ) -> None:
+        from sqlalchemy.dialects.mysql import insert as _mysql_insert
+        from opensquilla.asset_tree.db.schema import vuln_path_vulns as _vpv
+        stmt = _mysql_insert(_vpv).values(
+            attack_path_id=attack_path_id, vulnerability_id=vulnerability_id,
+        )
+        # Idempotent on duplicate (attack_path_id, vulnerability_id).
+        stmt = stmt.on_duplicate_key_update(
+            attack_path_id=_vpv.c.attack_path_id,
+        )
+        async with self._session() as session:
+            await session.execute(stmt)
+            await session.commit()
+
+    async def add_node_vuln(
+        self, *, tree_id: str, node_id: str, vulnerability_id: str,
+    ) -> None:
+        from sqlalchemy.dialects.mysql import insert as _mysql_insert
+        from opensquilla.asset_tree.db.schema import vuln_node_vulns as _vnv
+        stmt = _mysql_insert(_vnv).values(
+            tree_id=tree_id, node_id=node_id, vulnerability_id=vulnerability_id,
+        )
+        stmt = stmt.on_duplicate_key_update(
+            node_id=_vnv.c.node_id,
+        )
+        async with self._session() as session:
+            await session.execute(stmt)
+            await session.commit()
+
+    async def list_vulnerabilities(
+        self,
+        tree_id: str,
+        *,
+        attack_path_id: str | None = None,
+        leaf_node_id: str | None = None,
+        severity: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        from opensquilla.asset_tree.db.schema import vulnerabilities as _v
+        async with self._session() as session:
+            stmt = select(_v).where(_v.c.tree_id == tree_id)
+            if attack_path_id is not None:
+                stmt = stmt.where(_v.c.attack_path_id == attack_path_id)
+            if leaf_node_id is not None:
+                stmt = stmt.where(_v.c.leaf_node_id == leaf_node_id)
+            if severity is not None:
+                stmt = stmt.where(_v.c.severity == severity)
+            # severity desc by enum rank (critical=1 ... info=5)
+            _RANK = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 5}
+            stmt = stmt.order_by(_v.c.created_at.desc()).limit(limit)
+            result = await session.execute(stmt)
+            out: list[dict[str, Any]] = []
+            for row in result:
+                d = dict(row._mapping)
+                ev = d.get("evidence_json")
+                if isinstance(ev, str):
+                    try:
+                        d["evidence_json"] = json.loads(ev)
+                    except json.JSONDecodeError:
+                        d["evidence_json"] = None
+                out.append(d)
+            out.sort(key=lambda r: (_RANK.get(r.get("severity", "info"), 9),
+                                    r.get("created_at") or ""))
+            return out
+
+    async def get_vulnerability(
+        self, vuln_id: str,
+    ) -> dict[str, Any] | None:
+        from opensquilla.asset_tree.db.schema import vulnerabilities as _v
+        async with self._session() as session:
+            result = await session.execute(
+                select(_v).where(_v.c.id == vuln_id)
+            )
+            row = result.first()
+            if row is None:
+                return None
+            d = dict(row._mapping)
+            ev = d.get("evidence_json")
+            if isinstance(ev, str):
+                try:
+                    d["evidence_json"] = json.loads(ev)
+                except json.JSONDecodeError:
+                    d["evidence_json"] = None
+            return d
+
+    async def list_node_vulnerability_ids(
+        self, tree_id: str, node_id: str,
+    ) -> list[str]:
+        from opensquilla.asset_tree.db.schema import vuln_node_vulns as _vnv
+        async with self._session() as session:
+            result = await session.execute(
+                select(_vnv.c.vulnerability_id)
+                .where(_vnv.c.tree_id == tree_id, _vnv.c.node_id == node_id)
+            )
+            return [r[0] for r in result]
 
     # ── Helpers ────────────────────────────────────────────────
 

@@ -50,6 +50,7 @@ __all__ = [
 # tests/test_gateway/test_rpc_extended.py. These methods MUST NOT register
 # handlers at boot — the release surface is contracted to reject them with
 # METHOD_NOT_FOUND.
+import opensquilla.gateway.rpc_attack_paths  # noqa: E402, F401
 import opensquilla.gateway.rpc_agents  # noqa: E402, F401
 import opensquilla.gateway.rpc_approvals  # noqa: E402, F401
 import opensquilla.gateway.rpc_channels  # noqa: E402, F401

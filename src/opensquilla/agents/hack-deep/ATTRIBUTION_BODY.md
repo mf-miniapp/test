@@ -170,3 +170,22 @@ runtime `check_authorization` 强制: hack-deep 直接 spawn 这 9 个 specialis
   (so the parent never gets stuck again). 51ifind.com-style pressure
   test scenarios (IDOR / SSRF / RCE / chain exploitation) all
   construct cleanly under the new schema.
+
+
+## v6 (2026-06-19) 按 attack-path 接单 — evidence schema
+
+| agent_id | evidence_schema | 用途 |
+| --- | --- | --- |
+| create-attack-path | `attack-path-list-v1` | 输入: tree_id; 输出: 全树路径列表 (path_count + paths[]) |
+| hack-deep (attack-path mode) | `attack-path-v1` | 输入: 单条 path; 输出: 漏洞 + 反哺 |
+
+**v6 漏洞写入**:
+- hack-deep 跑完单条 `attack-path-v1` 后, 把 attack 中 evidence
+  含 `cve_*` / `cwe_*` / `severity` 字段的部分抽出来, 写
+  `vulnerabilities` + `vuln_path_vulns` + `vuln_node_vulns` 三表。
+- 反哺规则: 漏洞涉及的 leaf node + ancestor_path 全部节点都挂
+  `vuln_node_vulns`, 触发资产树叶子节点红色 + 可点击。
+
+**v6 终止条件**:
+- 收到 `attack-path-v1` envelope → 跑 1 次定向 attack → 写漏洞
+  → 标 path status=completed → emit result marker (含 `vulns_added: N`)。

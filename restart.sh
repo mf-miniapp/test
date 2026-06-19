@@ -247,6 +247,44 @@ fi
 # local-qwen path needs OPENAI_API_KEY so we keep that fallback too.
 export OPENAI_API_KEY="${OPENAI_API_KEY:-not-needed-for-llamacpp}"
 
+# ── libomp (OpenMP runtime) ──────────────────────────────────────────────
+# lightgbm and a few other scientific wheels link against libomp.dylib at
+# import time. macOS doesn't ship it, and `brew install libomp` is the
+# usual fix — but when brew is not available (or the user is offline),
+# the sklearn wheel bundles a working arm64 libomp inside
+# .dylibs/libomp.dylib. We probe for any installed libomp in priority
+# order and prepend it to DYLD_LIBRARY_PATH so the dynamic loader can
+# resolve @rpath/libomp.dylib references in lib_lightgbm.dylib.
+_LIBOMP_CANDIDATES=(
+  # Caller override wins.
+  "${DYLD_LIBRARY_PATH:-}"
+  # Hand-installed project-level symlink (created on first successful
+  # gateway boot when we found sklearn's libomp).
+  "${SCRIPT_DIR}/.venv/libomp"
+  # Sklearn bundled libomp — the most reliable out-of-the-box source.
+  "${SCRIPT_DIR}/.venv/lib/python3.12/site-packages/sklearn/.dylibs"
+  # System package managers (brew / MacPorts).
+  "/opt/homebrew/opt/libomp/lib"
+  "/usr/local/opt/libomp/lib"
+  "/opt/local/lib/libomp"
+)
+_libomp_path=""
+for c in "${_LIBOMP_CANDIDATES[@]}"; do
+  if [ -n "$c" ] && [ -f "$c/libomp.dylib" ]; then
+    _libomp_path="$c"
+    break
+  fi
+done
+if [ -n "$_libomp_path" ]; then
+  case ":${DYLD_LIBRARY_PATH:-}:" in
+    *":${_libomp_path}:"*) ;;  # already on the path
+    *) export DYLD_LIBRARY_PATH="${_libomp_path}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
+  esac
+  log "libomp resolved from ${_libomp_path}"
+else
+  log "libomp not found (lightgbm startup will warn but the gateway still works)"
+fi
+
 # nohup + disown so the gateway survives the script exiting.
 # shellcheck disable=SC2086
 nohup $LAUNCHER gateway run \

@@ -2686,6 +2686,83 @@ class DrillInRequestEvidence(EvidenceBase):
 
 
 # ---------------------------------------------------------------------------
+# v6 (2026-06-19) 按边攻击模型 — AttackPath envelope
+# ---------------------------------------------------------------------------
+
+
+class AttackPathListEvidence(EvidenceBase):
+    """create-attack-path 输出: 一棵树上所有 L0..L7 路径的摘要。
+
+    由 create-attack-path agent 写, 给 orchestrator 串行消费。
+    不直接给 specialist (specialist 只关心单条 path 的
+    ``attack-path-v1`` evidence)。
+    """
+
+    evidence_schema: Literal["attack-path-list-v1"] = "attack-path-list-v1"
+    tree_id: str = Field(..., description="源资产树 id")
+    path_count: int = Field(..., ge=0, description="路径总数")
+    leaf_type_histogram: dict[str, int] = Field(
+        default_factory=dict,
+        description="{AssetType.value: count} 分布",
+    )
+    paths: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "每条 path 的轻量摘要: {path_id, leaf_type, leaf_value, "
+            "scope_string, edge_count}。完整 edge_chain 在 vuln_attack_paths 表里。"
+        ),
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="非致命 warning (e.g. 'max_depth_reached<7', 'empty tree')",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_target(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "target" not in data:
+            data = {**data, "target": "attack-path-list"}
+        return data
+
+
+class AttackPathEvidence(EvidenceBase):
+    """hack-deep 单条 AttackPath 任务的输入 envelope。
+
+    orchestrator 把 AttackPathListEvidence 拆成 N 条 AttackPathEvidence,
+    逐条 sessions_spawn(agent_id='hack-deep', task=<typed-envelope>)。
+    hack-deep 拿这条 evidence:
+      - target = leaf node (PARAMETER / SECRET / ...)
+      - ancestor_path = edges[..-1] (L0..L_{n-1})
+      - scope = scope_string
+      - 跑完 W0..W4 attack wave, 写 vulnerabilities + 反哺 vuln_node_vulns
+    """
+
+    evidence_schema: Literal["attack-path-v1"] = "attack-path-v1"
+    tree_id: str
+    path_id: str = Field(..., min_length=12, max_length=12)
+    scope_string: str
+    leaf_node_id: str
+    leaf_type: str
+    leaf_value: str
+    ancestor_path: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "L0..L_{n-1} 的边列表, 元素 = {from_type, from_value, to_type, "
+            "to_value, edge_state}。leaf 节点不在这; 它是 attack target。"
+        ),
+    )
+    edge_count: int = Field(..., ge=1, le=8)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_target(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "target" not in data:
+            leaf = data.get("leaf_value") or data.get("leaf_node_id") or "?"
+            data = {**data, "target": f"attack-path:{leaf}"}
+        return data
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -2712,11 +2789,14 @@ EVIDENCE_SCHEMAS: dict[str, type[EvidenceBase]] = {
     "find-complete-v1": FindCompleteEvidence,  # 2026-06-14 hack-deep-find handoff
     "w2.5-dispatch-v1": W25DispatchEvidence,  # 2026-06-16 hack-deep-find v2 cross-owner
     "drill-in-request-v1": DrillInRequestEvidence,  # 2026-06-16 hack-deep-find v2 cross-owner
+    # v6 (2026-06-19) 按边攻击模型新增:
+    "attack-path-list-v1": AttackPathListEvidence,
+    "attack-path-v1": AttackPathEvidence,
 }
 
 EVIDENCE_SCHEMA_NAMES: tuple[str, ...] = tuple(EVIDENCE_SCHEMAS.keys())
-assert len(EVIDENCE_SCHEMA_NAMES) == 21, (
-    "expected 21 evidence schemas (19 + 2 cross-owner)"
+assert len(EVIDENCE_SCHEMA_NAMES) == 23, (
+    "expected 23 evidence schemas (19 + 2 cross-owner + 2 v6 attack-path)"
 )
 
 

@@ -55,4 +55,10 @@ icons.pencil = () => _svg15('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 
 // chevronDown — used by dropdown triggers / disclosure widgets.
 icons.chevronDown = () => _svg15('<polyline points="6 9 12 15 18 9"/>');
 
+// shield -- Vulnerabilities sidebar entry (defensive pentest metaphor).
+icons.shield = () => _svg15('<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>');
+// bug -- secondary vuln glyph (Lucide 1.5 stroke).
+icons.bug = () => _svg15('<rect x="8" y="6" width="8" height="14" rx="4"/><line x1="19" y1="7" x2="19" y2="7"/><line x1="5" y1="7" x2="5" y2="7"/><line x1="19" y1="13" x2="19" y2="13"/><line x1="5" y1="13" x2="5" y2="13"/><path d="M19 7l-3 2"/><path d="M5 7l3 2"/><path d="M19 13l-3 0"/><path d="M5 13l3 0"/><path d="M12 20v-6"/><path d="M9 2l3 3 3-3"/>');
+// swords -- Attack Paths dashboard sidebar entry (offense metaphor).
+icons.swords = () => _svg15('<polyline points="14.5 17.5 3 6 3 3 6 3 17.5 14.5"/><line x1="13" y1="19" x2="19" y2="13"/><line x1="16" y1="16" x2="20" y2="20"/><line x1="19" y1="21" x2="22" y2="18"/><polyline points="9.5 6.5 21 3 21 3"/>');
 window.icons = icons;

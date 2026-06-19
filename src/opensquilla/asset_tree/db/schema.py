@@ -448,6 +448,281 @@ DDL_STATEMENTS: tuple[str, ...] = (
             REFERENCES asset_nodes(tree_id, id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
+    """
+    CREATE TABLE IF NOT EXISTS vuln_attack_paths (
+        path_id         VARCHAR(12)  NOT NULL,
+        tree_id         VARCHAR(128) NOT NULL,
+        path_hash       CHAR(40)     NOT NULL,
+        status          VARCHAR(16)  NOT NULL DEFAULT 'pending',
+        scope_string    TEXT         NOT NULL,
+        edge_chain_json JSON         NOT NULL,
+        leaf_node_id    VARCHAR(12)  NOT NULL,
+        leaf_type       VARCHAR(32)  NOT NULL,
+        leaf_value      VARCHAR(2048) NOT NULL,
+        vuln_count      INT UNSIGNED NOT NULL DEFAULT 0,
+        metadata        JSON         NULL,
+        error           TEXT         NULL,
+        created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        started_at      DATETIME(6)  NULL,
+        completed_at    DATETIME(6)  NULL,
+        PRIMARY KEY (path_id),
+        CONSTRAINT fk_vuln_attack_paths_tree FOREIGN KEY (tree_id)
+            REFERENCES asset_trees(tree_id) ON DELETE CASCADE,
+        CONSTRAINT fk_vuln_attack_paths_leaf FOREIGN KEY (tree_id, leaf_node_id)
+            REFERENCES asset_nodes(tree_id, id) ON DELETE CASCADE,
+        CONSTRAINT ck_vuln_attack_paths_status CHECK (status IN
+            ('pending','in_progress','completed','failed','abandoned')),
+        UNIQUE KEY uq_vuln_attack_paths_hash (path_hash),
+        INDEX ix_vuln_attack_paths_tree_status (tree_id, status),
+        INDEX ix_vuln_attack_paths_leaf (tree_id, leaf_node_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS vulnerabilities (
+        id            VARCHAR(12)  NOT NULL,
+        tree_id       VARCHAR(128) NOT NULL,
+        attack_path_id VARCHAR(12) NULL,
+        leaf_node_id  VARCHAR(12)  NOT NULL,
+        cwe           VARCHAR(64)  NULL,
+        cve           VARCHAR(64)  NULL,
+        severity      VARCHAR(16)  NOT NULL,
+        title         VARCHAR(512) NOT NULL,
+        description   TEXT         NULL,
+        evidence_json JSON         NULL,
+        request       TEXT         NULL,
+        response      TEXT         NULL,
+        payload       TEXT         NULL,
+        discovered_by_wave       VARCHAR(64)  NULL,
+        discovered_by_specialist VARCHAR(64)  NULL,
+        created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (id),
+        CONSTRAINT fk_vulnerabilities_tree FOREIGN KEY (tree_id)
+            REFERENCES asset_trees(tree_id) ON DELETE CASCADE,
+        CONSTRAINT fk_vulnerabilities_leaf FOREIGN KEY (tree_id, leaf_node_id)
+            REFERENCES asset_nodes(tree_id, id) ON DELETE CASCADE,
+        CONSTRAINT fk_vulnerabilities_path FOREIGN KEY (attack_path_id)
+            REFERENCES vuln_attack_paths(path_id) ON DELETE SET NULL,
+        CONSTRAINT ck_vulnerabilities_severity CHECK (severity IN
+            ('critical','high','medium','low','info')),
+        INDEX ix_vulnerabilities_tree (tree_id),
+        INDEX ix_vulnerabilities_tree_path (tree_id, attack_path_id),
+        INDEX ix_vulnerabilities_leaf (tree_id, leaf_node_id),
+        INDEX ix_vulnerabilities_severity (tree_id, severity)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS vuln_path_vulns (
+        attack_path_id    VARCHAR(12)  NOT NULL,
+        vulnerability_id  VARCHAR(12)  NOT NULL,
+        created_at        DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (attack_path_id, vulnerability_id),
+        CONSTRAINT fk_vuln_path_vulns_path FOREIGN KEY (attack_path_id)
+            REFERENCES vuln_attack_paths(path_id) ON DELETE CASCADE,
+        CONSTRAINT fk_vuln_path_vulns_vuln FOREIGN KEY (vulnerability_id)
+            REFERENCES vulnerabilities(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS vuln_node_vulns (
+        tree_id          VARCHAR(128) NOT NULL,
+        node_id          VARCHAR(12)  NOT NULL,
+        vulnerability_id VARCHAR(12)  NOT NULL,
+        created_at       DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (tree_id, node_id, vulnerability_id),
+        CONSTRAINT fk_vuln_node_vulns_node FOREIGN KEY (tree_id, node_id)
+            REFERENCES asset_nodes(tree_id, id) ON DELETE CASCADE,
+        CONSTRAINT fk_vuln_node_vulns_vuln FOREIGN KEY (vulnerability_id)
+            REFERENCES vulnerabilities(id) ON DELETE CASCADE,
+        INDEX ix_vuln_node_vulns_vuln (vulnerability_id),
+        INDEX ix_vuln_node_vulns_node (tree_id, node_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+)
+
+
+# ── v6 漏洞与攻击路径 SQLAlchemy Table 对象 (2026-06-19) ──────────────
+# 与上面 DDL_STATEMENTS 的 raw DDL 保持一致; metadata.create_all 会
+# 拉这些 Table 一起创建。所有表 FOREIGN KEY 走 asset_trees /
+# asset_nodes / vuln_attack_paths / vulnerabilities, 与 SQL DDL 同步。
+
+vuln_attack_paths = Table(
+    "vuln_attack_paths",
+    _metadata,
+    Column("path_id", _NODE_ID_TYPE, primary_key=True, nullable=False),
+    Column("tree_id", String(128), nullable=False),
+    Column("path_hash", String(40), nullable=False),
+    Column("status", String(16), nullable=False, server_default="pending"),
+    Column("scope_string", Text, nullable=False),
+    Column("edge_chain_json", JSON, nullable=False),
+    Column("leaf_node_id", _NODE_ID_TYPE, nullable=False),
+    Column("leaf_type", String(32), nullable=False),
+    Column("leaf_value", String(2048), nullable=False),
+    Column(
+        "vuln_count",
+        Integer().with_variant(MYSQL_BIGINT(unsigned=True), "mysql"),
+        nullable=False,
+        server_default="0",
+    ),
+    Column("metadata", JSON, nullable=True),
+    Column("error", Text, nullable=True),
+    Column(
+        "created_at",
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    Column("started_at", DateTime(timezone=False), nullable=True),
+    Column("completed_at", DateTime(timezone=False), nullable=True),
+    ForeignKeyConstraint(
+        ["tree_id"],
+        ["asset_trees.tree_id"],
+        name="fk_vuln_attack_paths_tree",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["tree_id", "leaf_node_id"],
+        ["asset_nodes.tree_id", "asset_nodes.id"],
+        name="fk_vuln_attack_paths_leaf",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint(
+        "status IN ('pending','in_progress','completed','failed','abandoned')",
+        name="status_enum",
+    ),
+    UniqueConstraint("path_hash", name="uq_vuln_attack_paths_hash"),
+    Index("ix_vuln_attack_paths_tree_status", "tree_id", "status"),
+    Index("ix_vuln_attack_paths_leaf", "tree_id", "leaf_node_id"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+
+vulnerabilities = Table(
+    "vulnerabilities",
+    _metadata,
+    Column("id", _NODE_ID_TYPE, primary_key=True, nullable=False),
+    Column("tree_id", String(128), nullable=False),
+    Column("attack_path_id", _NODE_ID_TYPE, nullable=True),
+    Column("leaf_node_id", _NODE_ID_TYPE, nullable=False),
+    Column("cwe", String(64), nullable=True),
+    Column("cve", String(64), nullable=True),
+    Column("severity", String(16), nullable=False),
+    Column("title", String(512), nullable=False),
+    Column("description", Text, nullable=True),
+    Column("evidence_json", JSON, nullable=True),
+    Column("request", Text, nullable=True),
+    Column("response", Text, nullable=True),
+    Column("payload", Text, nullable=True),
+    Column("discovered_by_wave", String(64), nullable=True),
+    Column("discovered_by_specialist", String(64), nullable=True),
+    Column(
+        "created_at",
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    ForeignKeyConstraint(
+        ["tree_id"],
+        ["asset_trees.tree_id"],
+        name="fk_vulnerabilities_tree",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["tree_id", "leaf_node_id"],
+        ["asset_nodes.tree_id", "asset_nodes.id"],
+        name="fk_vulnerabilities_leaf",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["attack_path_id"],
+        ["vuln_attack_paths.path_id"],
+        name="fk_vulnerabilities_path",
+        ondelete="SET NULL",
+    ),
+    CheckConstraint(
+        "severity IN ('critical','high','medium','low','info')",
+        name="severity_enum",
+    ),
+    Index("ix_vulnerabilities_tree", "tree_id"),
+    Index("ix_vulnerabilities_tree_path", "tree_id", "attack_path_id"),
+    Index("ix_vulnerabilities_leaf", "tree_id", "leaf_node_id"),
+    Index("ix_vulnerabilities_severity", "tree_id", "severity"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+
+vuln_path_vulns = Table(
+    "vuln_path_vulns",
+    _metadata,
+    Column("attack_path_id", _NODE_ID_TYPE, nullable=False),
+    Column("vulnerability_id", _NODE_ID_TYPE, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    PrimaryKeyConstraint(
+        "attack_path_id",
+        "vulnerability_id",
+        name="pk_vuln_path_vulns",
+    ),
+    ForeignKeyConstraint(
+        ["attack_path_id"],
+        ["vuln_attack_paths.path_id"],
+        name="fk_vuln_path_vulns_path",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["vulnerability_id"],
+        ["vulnerabilities.id"],
+        name="fk_vuln_path_vulns_vuln",
+        ondelete="CASCADE",
+    ),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+
+vuln_node_vulns = Table(
+    "vuln_node_vulns",
+    _metadata,
+    Column("tree_id", String(128), nullable=False),
+    Column("node_id", _NODE_ID_TYPE, nullable=False),
+    Column("vulnerability_id", _NODE_ID_TYPE, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    PrimaryKeyConstraint(
+        "tree_id",
+        "node_id",
+        "vulnerability_id",
+        name="pk_vuln_node_vulns",
+    ),
+    ForeignKeyConstraint(
+        ["tree_id", "node_id"],
+        ["asset_nodes.tree_id", "asset_nodes.id"],
+        name="fk_vuln_node_vulns_node",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["vulnerability_id"],
+        ["vulnerabilities.id"],
+        name="fk_vuln_node_vulns_vuln",
+        ondelete="CASCADE",
+    ),
+    Index("ix_vuln_node_vulns_vuln", "vulnerability_id"),
+    Index("ix_vuln_node_vulns_node", "tree_id", "node_id"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
 )
 
 

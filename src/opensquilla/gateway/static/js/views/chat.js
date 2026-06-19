@@ -1183,6 +1183,43 @@ const ChatView = (() => {
     } catch { return ''; }
   }
 
+  function _readPrefillFromUrl() {
+    // Read ``?prefill=<text>`` (and optional ``?tree=<id>``) so other
+    // surfaces (e.g. the attack-paths dashboard) can drop the user into
+    // chat with a synthetic message pre-loaded.
+    //
+    // Returns the decoded slash command, or '' if absent.  When ``prefill``
+    // is missing but ``tree=`` is present (a dashboard fallback) we
+    // synthesize ``/attack-paths run <tree>`` so the chat view still has
+    // something to dispatch.
+    //
+    // The flag is consumed once: we rewrite the URL to drop ``prefill`` /
+    // ``tree`` so a browser back/forward doesn't re-fire the synthetic send.
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const raw = params.get('prefill');
+      const tree = params.get('tree');
+      // Strip the params so reloads / back-nav don't replay.
+      params.delete('prefill');
+      params.delete('tree');
+      const newSearch = params.toString();
+      const newUrl = window.location.pathname
+        + (newSearch ? '?' + newSearch : '')
+        + window.location.hash;
+      window.history.replaceState(null, '', newUrl);
+      if (raw) {
+        try { return decodeURIComponent(raw); } catch { return raw; }
+      }
+      if (tree) {
+        // Synthesize a slash command from the ?tree= fallback so the
+        // chat view can dispatch even when the original prefill is
+        // missing or corrupt.
+        return '/attack-paths run ' + tree;
+      }
+      return '';
+    } catch { return ''; }
+  }
+
   function _readAgentFromUrl() {
     try {
       const params = new URLSearchParams(window.location.search);
@@ -1337,6 +1374,20 @@ const ChatView = (() => {
       .finally(() => _loadHistory());
     _loadSlashCommands();
     _bindRouterConfigRefresh();
+
+    // Drop-in prefill from another surface (e.g. attack-paths
+    // dashboard's "▶ Run" button). Runs at the very end of render so
+    // _textarea / _sendBtn / slash catalog are all wired.
+    const _prefill = _readPrefillFromUrl();
+    console.log('[prefill] render tail — prefill =', JSON.stringify(_prefill),
+                'slashCatalogLoaded =', _slashCatalogLoaded,
+                'sessionKey =', _sessionKey,
+                'textarea =', !!_textarea);
+    if (_prefill) {
+      _consumePrefill(_prefill);
+    } else {
+      console.log('[prefill] no prefill in URL');
+    }
 
     // Keep desktop keyboard flow quick, but avoid opening the soft keyboard on
     // mobile/touch devices before the user asks to type.
@@ -2770,7 +2821,88 @@ const ChatView = (() => {
           .catch((err) => UI.toast('Usage failed: ' + err.message, 'err'));
         break;
       }
+      // ── OpenSquilla v6 attack-path orchestrator ───────────────────────
+      // /attack-paths run <tree_id> [--dry-run] [--max-depth N]
+      //                       [--include-states s1,s2,...] [--model M]
+      //                       [--provider P] [--auto-approve/--no-auto-approve]
+      case 'attack_paths.run':
+      case '/attack-paths': {
+        const parsed = _parseAttackPathsArgs(args);
+        if (!parsed.treeId) {
+          UI.toast('Usage: /attack-paths run <tree_id> [flags]', 'warn', 3500);
+          break;
+        }
+        UI.toast('Starting attack-path run: ' + parsed.treeId + ' (this can take a while)...', 'info', 5000);
+        _rpc.call('attack_paths.run', parsed.params)
+          .then((result) => {
+            const completed = Number(result?.completed ?? 0);
+            const failed = Number(result?.failed ?? 0);
+            const vulnTotal = Number(result?.vuln_total ?? 0);
+            const paths = Number(result?.path_count ?? 0);
+            const summary =
+              `Attack paths done for ${parsed.treeId}: ${paths} path(s), ` +
+              `completed=${completed}, failed=${failed}, vulns=${vulnTotal}`;
+            UI.toast(summary, failed > 0 ? 'warn' : 'info', 8000);
+          })
+          .catch((err) => UI.toast('Attack-paths run failed: ' + (err?.message || err), 'err', 8000));
+        break;
+      }
     }
+  }
+
+  /**
+   * Parse `/attack-paths run <tree_id> [--flag ...]` into a typed params
+   * object suitable for the gateway `attack_paths.run` RPC. Returns
+   * `{ treeId, params }`. Flags are mirrored from the CLI; values are
+   * coerced to the gateway's expected types.
+   */
+  function _parseAttackPathsArgs(args) {
+    const tokens = (args || '').trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return { treeId: '', params: {} };
+    // Drop optional `run` keyword
+    let start = 0;
+    if (tokens[0] && tokens[0].toLowerCase() === 'run') start = 1;
+    if (tokens.length <= start) return { treeId: '', params: {} };
+    const treeId = tokens[start];
+    const params = { tree_id: treeId };
+    for (let i = start + 1; i < tokens.length; i++) {
+      const tok = tokens[i];
+      const next = tokens[i + 1];
+      if (tok === '--dry-run') { params.dry_run = true; continue; }
+      if (tok === '--no-auto-approve') { params.auto_approve = false; continue; }
+      if (tok === '--auto-approve') { params.auto_approve = true; continue; }
+      if (tok.startsWith('--') && next && !next.startsWith('--')) {
+        const key = tok.slice(2).replace(/-/g, '_');
+        if (key === 'max-depth') {
+          const n = Number(next);
+          if (Number.isFinite(n)) params.max_depth = n;
+          i += 1;
+          continue;
+        }
+        if (key === 'include-states') {
+          params.include_states = next;
+          i += 1;
+          continue;
+        }
+        if (key === 'vuln-extractor') {
+          params.vuln_extractor = next;
+          i += 1;
+          continue;
+        }
+        if (key === 'model' || key === 'provider'
+            || key === 'base-url' || key === 'api-key') {
+          // Map dashed CLI flags to the snake_case keys the RPC expects.
+          const rpcKey = key === 'base-url' ? 'base_url'
+                       : key === 'api-key'  ? 'api_key'
+                       : key;
+          params[rpcKey] = next;
+          i += 1;
+          continue;
+        }
+      }
+      // unknown token — ignore
+    }
+    return { treeId, params };
   }
 
   async function _executeSlashCommand(text) {
@@ -2784,6 +2916,307 @@ const ChatView = (() => {
     }
     _selectSlashCmd(cmd, rest.join(' '));
     return true;
+  }
+
+  /**
+   * Synthetic-send entry point for cross-surface handoff.
+   *
+   * Used when another page (e.g. the attack-paths dashboard) navigates
+   * the user into chat with a pre-baked message such as
+   * ``/attack-paths run <tree_id>``.  We:
+   *
+   *   1. Open a fresh chat session (same path as ``/new`` slash) so
+   *      the orchestrator's output streams into a clean transcript
+   *      instead of mixing with whatever the user had open.
+   *   2. Wait for the slash catalog (or 800ms safety timer).
+   *   3. Populate the textarea and fire ``_onSend()`` so the existing
+   *      slash-command pipeline takes over.
+   *
+   * The whole flow is fire-and-forget from the dashboard's
+   * perspective: the chat tab takes ownership of the run.
+   */
+  /**
+   * Synthetic-send entry point for cross-surface handoff.
+   *
+   * When another page (e.g. the attack-paths dashboard) navigates
+   * the user into chat with ``?prefill=/attack-paths run <tree_id>``,
+   * we:
+   *
+   *   1. Open a fresh chat session so the run's output streams into a
+   *      clean transcript.
+   *   2. Surface the synthetic user message in the chat thread so the
+   *      user can see what got dispatched.
+   *   3. Call the ``attack_paths.run`` RPC **directly** (bypassing the
+   *      slash-command pipeline) so we don't depend on the slash
+   *      catalog loading or the textarea normalize / streaming checks.
+   *   4. Show the orchestrator's result as an assistant message.
+   *
+   * The chat transcript is the canonical "execution log" — everything
+   * shows up there, no hidden background work.
+   */
+  function _consumePrefill(text) {
+    console.log('[prefill] consume start, text =', JSON.stringify(text),
+                'textarea =', !!_textarea, 'sessionKey =', _sessionKey,
+                'rpcState =', _rpc ? _rpc.state : 'no-rpc');
+    if (!_textarea) {
+      console.warn('[prefill] ABORT: no textarea');
+      return;
+    }
+    // Parse the prefill text.  We support a single shape today:
+    //   "/attack-paths run <tree_id> [flags...]"
+    // Anything else is treated as a generic slash command sent through
+    // the normal _onSend pipeline (best-effort fallback).
+    const parsed = _parsePrefill(text);
+    console.log('[prefill] parsed =', JSON.stringify(parsed));
+
+    // Step 1: open a fresh session (mirrors /new slash reset).
+    // Even if reset fails, the dispatch below will still surface a clear
+    // error in the chat thread.
+    try {
+      _resetForNewSession();
+    } catch (e) {
+      console.error('[prefill] _resetForNewSession failed', e);
+    }
+
+    // Step 2: surface the user message in the chat thread so the user
+    // can see what was dispatched. _addUserMessageToThread is a no-op
+    // if _thread isn't attached.
+    _addUserMessageToThread(text);
+
+    if (parsed.kind === 'attack_paths.run') {
+      // Step 3: direct RPC dispatch — does NOT depend on slash catalog.
+      // _dispatchAttackPaths handles its own RPC wait + error UI.
+      _dispatchAttackPaths(parsed.params, parsed.label);
+    } else {
+      // Fallback: best-effort normal send
+      console.log('[prefill] not an attack-paths command; falling back to _onSend');
+      _textarea.value = text;
+      _autoResizeTextarea();
+      _onSend().catch((e) => console.error('[prefill] _onSend rejected', e));
+    }
+  }
+
+  /**
+   * Parse the prefill text into a structured command.
+   * Returns { kind, label, params }.
+   */
+  function _parsePrefill(text) {
+    const tokens = (text || '').trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return { kind: 'unknown', label: '', params: {} };
+    const cmd = tokens[0].toLowerCase();
+    if (cmd !== '/attack-paths' && cmd !== '/attack_paths') {
+      return { kind: 'unknown', label: text, params: {} };
+    }
+    // Drop optional "run" keyword
+    let i = 1;
+    if (tokens[i] && tokens[i].toLowerCase() === 'run') i += 1;
+    if (i >= tokens.length) {
+      return { kind: 'attack_paths.run',
+               label: 'attack-paths (missing tree_id)',
+               params: {} };
+    }
+    const treeId = tokens[i];
+    const params = { tree_id: treeId };
+    i += 1;
+    while (i < tokens.length) {
+      const tok = tokens[i];
+      const next = tokens[i + 1];
+      if (tok === '--dry-run') { params.dry_run = true; i += 1; continue; }
+      if (tok === '--no-auto-approve') { params.auto_approve = false; i += 1; continue; }
+      if (tok === '--auto-approve') { params.auto_approve = true; i += 1; continue; }
+      if (tok.startsWith('--') && next && !next.startsWith('--')) {
+        const key = tok.slice(2).replace(/-/g, '_');
+        if (key === 'max_depth' || key === 'max-depth') {
+          const n = Number(next);
+          if (Number.isFinite(n)) params.max_depth = n;
+          i += 2; continue;
+        }
+        if (key === 'include_states' || key === 'include-states') {
+          params.include_states = next;
+          i += 2; continue;
+        }
+        if (key === 'vuln_extractor' || key === 'vuln-extractor') {
+          params.vuln_extractor = next;
+          i += 2; continue;
+        }
+        if (key === 'model' || key === 'provider'
+            || key === 'base_url' || key === 'api_key'
+            || key === 'base-url' || key === 'api-key') {
+          const rpcKey = key.replace(/-/g, '_');
+          params[rpcKey] = next;
+          i += 2; continue;
+        }
+        // unknown flag — skip value if any
+        i += (next && !next.startsWith('--')) ? 2 : 1;
+        continue;
+      }
+      i += 1;
+    }
+    return {
+      kind: 'attack_paths.run',
+      label: 'attack-paths run ' + treeId,
+      params,
+    };
+  }
+
+  /**
+   * Add the synthetic user message to the chat thread so the user can
+   * see what got dispatched.
+   */
+  function _addUserMessageToThread(text) {
+    if (!_thread) return;
+    const now = new Date().toISOString();
+    _messages.push({ role: 'user', text, ts: now });
+    const div = _addMessage('user', '', now);
+    _stampHistoryElement(div, '', 'user', text);
+    const body = div.querySelector('.msg-body');
+    if (body) {
+      body.innerHTML = _esc(text);
+      _attachHoverActions(div, 'user');
+    }
+  }
+
+  /**
+   * Direct dispatch — no slash catalog, no _onSend.  Bypasses all
+   * the moving parts that can race with each other.
+   */
+  async function _dispatchAttackPaths(params, label) {
+    console.log('[prefill] dispatching attack_paths.run', JSON.stringify(params),
+                'rpcState =', _rpc ? _rpc.state : 'no-rpc');
+    if (!_rpc) {
+      const msg = 'RPC not available; cannot dispatch attack-paths run. '
+        + 'Reload the page to reconnect.';
+      console.error('[prefill] ' + msg);
+      _addAssistantErrorToThread(msg);
+      if (typeof UI !== 'undefined' && UI && UI.toast) UI.toast(msg, 'err', 6000);
+      return;
+    }
+    // Wait for the WebSocket to be open.  When the user lands here via a
+    // cross-surface handoff, app.js's _autoConnect may still be in
+    // 'connecting' state — bail out with a clear error if it never
+    // gets there within 10s rather than firing an RPC that will reject
+    // with "Not connected".
+    try {
+      await _rpc.waitForConnection();
+    } catch (e) {
+      const msg = 'attack-paths run aborted: WebSocket RPC not connected '
+        + '(state=' + _rpc.state + '). ' + (e?.message || '');
+      console.error('[prefill] ' + msg);
+      _addAssistantErrorToThread(msg);
+      if (typeof UI !== 'undefined' && UI && UI.toast) UI.toast(msg, 'err', 6000);
+      return;
+    }
+    try {
+      _showThinkingIndicator();
+      const result = await _rpc.call('attack_paths.run', params);
+      console.log('[prefill] result =', JSON.stringify(result));
+      _hideThinkingIndicator();
+      const pathCount = Number(result?.path_count ?? 0);
+      const completed = Number(result?.completed ?? 0);
+      const failed = Number(result?.failed ?? 0);
+      const vulnTotal = Number(result?.vuln_total ?? 0);
+      const summary =
+        '⚔️ attack-paths done for ' + (params?.tree_id || '?') + ': ' +
+        pathCount + ' path(s), ' +
+        'completed=' + completed + ', ' +
+        'failed=' + failed + ', ' +
+        'vulns=' + vulnTotal;
+      _addAssistantMessageToThread(summary);
+      if (result && result.errors && result.errors.length > 0) {
+        const errText = result.errors.slice(0, 5)
+          .map((e) => '- ' + e).join('\n');
+        _addAssistantMessageToThread('Errors:\n' + errText);
+      }
+    } catch (err) {
+      console.error('[prefill] attack_paths.run failed', err);
+      _hideThinkingIndicator();
+      const msg = 'attack-paths run failed: ' + (err?.message || String(err));
+      _addAssistantErrorToThread(msg);
+      if (typeof UI !== 'undefined' && UI && UI.toast) UI.toast(msg, 'err', 8000);
+    }
+  }
+
+  function _addAssistantMessageToThread(text) {
+    if (!_thread) return;
+    const now = new Date().toISOString();
+    _messages.push({ role: 'assistant', text, ts: now });
+    const div = _addMessage('assistant', '', now);
+    const body = div.querySelector('.msg-body');
+    if (body) {
+      // Render plain text safely (multi-line goes to a <pre>).
+      const pre = document.createElement('pre');
+      pre.style.margin = '0';
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.wordBreak = 'break-word';
+      pre.style.fontFamily = 'inherit';
+      pre.textContent = text;
+      body.innerHTML = '';
+      body.appendChild(pre);
+    }
+  }
+
+  function _addAssistantErrorToThread(text) {
+    if (!_thread) return;
+    const now = new Date().toISOString();
+    _messages.push({ role: 'assistant', text, ts: now });
+    const div = _addMessage('assistant', '', now);
+    div.classList.add('msg--error');
+    const body = div.querySelector('.msg-body');
+    if (body) {
+      body.innerHTML = '<span style="color:var(--red)">' + _esc(text) + '</span>';
+    }
+  }
+
+  /**
+   * Reset the chat view to a fresh session — mirrors the body of the
+   * ``/new`` slash case in ``_selectSlashCmd`` so cross-surface
+   * handoff doesn't have to reach into a private case.
+   *
+   * Returns the new session key.  All side effects match the slash
+   * ``/new`` flow: park the old stream, generate a fresh key, update
+   * the chip, persist, clear the transcript, and re-subscribe so the
+   * new thread streams live events into the empty state.
+   */
+  function _resetForNewSession() {
+    try {
+      _unsubscribeSession();
+    } catch (e) {
+      console.warn('[prefill] _unsubscribeSession failed (continuing)', e);
+    }
+    try {
+      _parkCurrentSessionStreamState('new_chat');
+    } catch (e) {
+      console.warn('[prefill] _parkCurrentSessionStreamState failed (continuing)', e);
+    }
+    const key = _genKey();
+    try { _updateSessionChip(key); } catch (e) { console.warn('[prefill] _updateSessionChip failed', e); }
+    try { _persistSession(key); } catch (e) { console.warn('[prefill] _persistSession failed', e); }
+    try { _clearPendingDrainAfterTerminalTimer(); } catch (e) { /* noop */ }
+    try { _setCompactInFlight(false); } catch (e) { /* noop */ }
+    try { _hideCompactionSeparator(); } catch (e) { /* noop */ }
+    _pendingSessionIntent = 'new_chat';
+    _pendingQueue = [];
+    if (_pendingArea) {
+      try { _renderPendingQueue(); } catch (e) { /* noop */ }
+    }
+    _messages = [];
+    try { _clearContextStatus(); } catch (e) { /* noop */ }
+    try { _resetHistoryPagingState(); } catch (e) { /* noop */ }
+    _lastHeaderRole = '';
+    _lastHeaderDay = '';
+    _usageAccum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, routedTurns: 0, sessionSaved: 0 };
+    _usageModel = '';
+    try { _viz.reset(); _resetSavingsPopupCooldown(); } catch (e) { /* noop */ }
+    if (_thread) {
+      _thread.innerHTML = _emptyStateHTML(); // safe: static string, no user data
+    }
+    // Re-subscribe so streaming events for the new session arrive
+    // (this also kicks the history loader for the fresh transcript).
+    try { _subscribeSession(); } catch (e) { console.warn('[prefill] _subscribeSession failed', e); }
+    if (typeof UI !== 'undefined' && UI && UI.toast) {
+      UI.toast('New chat session for attack-paths run: ' + key, 'info');
+    }
+    return key;
   }
 
   /* ── Session Message Subscription ───────────────────────────────────── */
